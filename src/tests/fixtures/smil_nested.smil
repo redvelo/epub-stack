@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<smil xmlns="http://www.w3.org/ns/SMIL" xmlns:epub="http://www.idpf.org/2007/ops" version="3.0" xml:lang="en">
+    <head>
+        <metadata>
+            <meta name="title" content="Nested" />
+        </metadata>
+    </head>
+    <body>
+        <seq id="seq-outer" epub:textref="chapter.xhtml">
+            <par id="par-outer">
+                <text src="chapter.xhtml#t1" />
+                <audio src="audio.mp3" clipBegin="0:00:00" clipEnd="0:00:05" />
+            </par>
+            <seq id="seq-inner" epub:textref="chapter.xhtml#t2">
+                <par id="par-inner">
+                    <text src="chapter.xhtml#t2" />
+                    <audio src="audio.mp3" clipBegin="0:00:05" clipEnd="0:00:10" />
+                </par>
+            </seq>
+        </seq>
+    </body>
+</smil>

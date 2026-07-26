@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all --check
+      - run: cargo check --all-targets
+      - run: cargo check --examples
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets
+      - run: cargo test --test alice_smoke -- --ignored
+      - run: cargo test --doc
+      - run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - run: cargo rustdoc --lib -- -D warnings
+      - run: cargo package
+      - run: cargo test --all-targets --manifest-path target/package/epub-stack-*/Cargo.toml
+
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - run: cargo check --target wasm32-unknown-unknown
+      - run: cargo package
+      - run: cargo check --target wasm32-unknown-unknown --manifest-path target/package/epub-stack-*/Cargo.toml
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - run: cargo check --all-targets
