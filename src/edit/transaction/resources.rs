@@ -209,13 +209,12 @@ impl<'a, R: ResourceProvider> EpubEdit<'a, R> {
     ) -> Result<Self> {
         let selector = selector.into();
         let staged_package = self.package_override.as_ref().unwrap_or(&self.epub.package);
-        let selected = unique_manifest_item(staged_package, &selector)?;
-        let selected_id = selected_manifest_item_id(selected)?;
+        let (selected_index, selected) = unique_manifest_item(staged_package, &selector)?;
         let resource_path = manifest_item_resource_path(selected, &self.epub.package_path)?;
         reject_manifest_resource_structural_removal(&self, selected, &resource_path)?;
         reject_shared_manifest_resource_path(
             staged_package,
-            selected_id.as_str(),
+            selected_index,
             &resource_path,
             &self.epub.package_path,
             false,
@@ -260,7 +259,7 @@ impl<'a, R: ResourceProvider> EpubEdit<'a, R> {
             .spine()
             .itemrefs()
             .iter()
-            .filter(|itemref| itemref.idref().is_some_and(|value| value.as_str() == idref))
+            .filter(|itemref| itemref.idref().is_some_and(|value| value == idref))
             .count();
         if refs > 1 {
             return Err(EditError::UnsupportedSemanticEdit {
@@ -579,7 +578,8 @@ mod tests {
             .id(EpubString::try_new("img").unwrap())
             .href(EpubHref::try_new("images/cover.jpg").unwrap())
             .media_type(EpubString::try_new("image/jpeg").unwrap().into())
-            .build();
+            .build()
+            .unwrap();
         epub.edit()
             .add_manifest_resource("EPUB/images/cover.jpg", b"jpeg".to_vec(), item)
             .unwrap()
@@ -603,7 +603,8 @@ mod tests {
             .id(EpubString::try_new("img").unwrap())
             .href(EpubHref::try_new("images/cover.jpg").unwrap())
             .media_type(EpubString::try_new("image/jpeg").unwrap().into())
-            .build();
+            .build()
+            .unwrap();
         let err = epub
             .edit()
             .add_manifest_resource("EPUB/images/other.jpg", b"jpeg".to_vec(), item)
@@ -656,7 +657,8 @@ mod tests {
             .id(EpubString::try_new("img").unwrap())
             .href(EpubHref::try_new("images/cover.jpg").unwrap())
             .media_type(EpubString::try_new("image/jpeg").unwrap().into())
-            .build();
+            .build()
+            .unwrap();
         epub.edit()
             .add_manifest_resource("EPUB/images/cover.jpg", b"jpeg".to_vec(), item)
             .unwrap()
@@ -681,7 +683,8 @@ mod tests {
             .id(EpubString::try_new("chap2").unwrap())
             .href(EpubHref::try_new("text/chapter2.xhtml").unwrap())
             .media_type(EpubString::try_new("application/xhtml+xml").unwrap().into())
-            .build();
+            .build()
+            .unwrap();
         epub.edit()
             .add_spine_resource(
                 "EPUB/text/chapter2.xhtml",
@@ -695,12 +698,7 @@ mod tests {
             .commit();
         assert!(epub.package().manifest_item_by_id("chap2").is_some());
         assert_eq!(epub.package().spine().itemrefs().len(), 2);
-        assert_eq!(
-            epub.package().spine().itemrefs()[1]
-                .idref()
-                .map(EpubString::as_str),
-            Some("chap2")
-        );
+        assert_eq!(epub.package().spine().itemrefs()[1].idref(), Some("chap2"));
         assert!(
             epub.resource(ResourceSelector::manifest_href("text/chapter2.xhtml").unwrap())
                 .unwrap()
@@ -1267,6 +1265,7 @@ mod tests {
             .href(EpubHref::try_new("extra.xhtml").unwrap())
             .media_type(EpubString::try_new("application/xhtml+xml").unwrap().into())
             .build()
+            .unwrap()
     }
 
     #[test]

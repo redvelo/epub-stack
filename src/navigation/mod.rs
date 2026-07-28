@@ -47,6 +47,12 @@ pub enum NavigationXhtmlError {
 
 /// A heading associated with a navigation list.
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct Heading {
     level: HeadingLevel,
     text: EpubString,
@@ -76,6 +82,12 @@ impl Heading {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash, Default)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 /// The selected navigation state for a publication.
 ///
 /// Ordinary opening retains zero or one document: EPUB NAV when usable, otherwise the
@@ -179,6 +191,12 @@ impl Navigation {
 /// Hrefs remain relative authored references; resolve them against [`Self::path`] when mapping
 /// navigation points to publication resources.
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct NavigationDocument {
     source: NavigationSource,
     path: EpubPath,
@@ -258,6 +276,12 @@ impl NavigationDocument {
 
 /// The syntax of a selected navigation document.
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "kebab-case")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub enum NavigationSource {
     /// EPUB 3 navigation XHTML.
     EpubNav,
@@ -266,6 +290,12 @@ pub enum NavigationSource {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 /// A normalized navigation list with separately retained authored semantics.
 pub struct NavigationList {
     semantic: Option<EpubStructuralSemantic>,
@@ -367,6 +397,12 @@ fn is_principal_list_semantic(semantic: Option<EpubStructuralSemantic>) -> bool 
 
 /// The authored attribute that supplied navigation semantic evidence.
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "kebab-case")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub enum NavigationSemanticSource {
     /// An EPUB `type` attribute token.
     EpubType,
@@ -378,6 +414,12 @@ pub enum NavigationSemanticSource {
 
 /// One retained authored navigation semantic token and its recognized meaning.
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct NavigationSemanticToken {
     source: NavigationSemanticSource,
     raw: String,
@@ -469,6 +511,12 @@ fn first_navigation_list_semantic(
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 /// A navigation point with normalized meaning and source-token evidence.
 ///
 /// Typed construction requires a nonempty label. Parsing can still recover authored points

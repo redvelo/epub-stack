@@ -6,8 +6,8 @@ use super::reference::{
 };
 use crate::media_overlay::MediaOverlayAssociationRef;
 use crate::resource::{
-    IndexKeyError, ManifestKey, ProviderPresence, ReadingOrderEntry, ReadingOrderTarget,
-    ResourceKey,
+    ManifestOrdinal, OrdinalOutOfBounds, ProviderPresence, ReadingOrderOccurrenceRef,
+    ReadingOrderTargetRow, ResourceOrdinal,
 };
 
 impl PublicationAnalysis {
@@ -26,31 +26,31 @@ impl PublicationAnalysis {
 
     pub(super) fn media_overlay_association<'a>(
         &'a self,
-        entry: &'a ReadingOrderEntry,
+        entry: ReadingOrderOccurrenceRef<'a>,
     ) -> Option<MediaOverlayAssociationRef<'a>> {
-        let ReadingOrderTarget::Declaration {
+        let ReadingOrderTargetRow::Declaration {
             declaration,
             resource,
-        } = entry.target()
+        } = entry.target_row()
         else {
             return None;
         };
-        let content_declaration = self.resources().declaration(*declaration).ok()?;
+        let content_declaration = self.resources().declaration((*declaration).into()).ok()?;
         content_declaration.media_overlay()?;
         let reference = match self
             .media_overlay_references
-            .get(declaration)
+            .get(&(*declaration).into())
             .and_then(|index| self.references.get(*index))?
         {
             AuthoredReference::Manifest(reference)
-                if reference.source() == *declaration
+                if reference.source() == (*declaration).into()
                     && reference.role() == ManifestRole::MediaOverlay =>
             {
                 reference
             }
             AuthoredReference::Href(_) | AuthoredReference::Manifest(_) => return None,
         };
-        let content_resource = resource.and_then(|key| self.resources().resource(key).ok());
+        let content_resource = resource.and_then(|key| self.resources().resource(key.into()).ok());
         let (overlay_declaration, overlay_resource) = match reference.target() {
             ManifestTarget::Declaration {
                 declaration,
@@ -62,7 +62,7 @@ impl PublicationAnalysis {
             ManifestTarget::Missing | ManifestTarget::Ambiguous { .. } => (None, None),
         };
         let overlay_resource_facts =
-            overlay_resource.and_then(|resource| self.facts_for(resource.key()).ok());
+            overlay_resource.and_then(|resource| self.facts_for_row(resource.row()).ok());
         Some(MediaOverlayAssociationRef::new(
             entry,
             content_declaration,
@@ -77,17 +77,18 @@ impl PublicationAnalysis {
 
     /// Iterates authored links and relationships originating in `source`.
     ///
-    /// `source` must be a resource key from this analysis snapshot.
+    /// `source` must be a resource ordinal from this analysis snapshot.
     ///
     /// # Errors
     ///
-    /// Returns [`IndexKeyError`] when `source` belongs to another resource index or does
-    /// not identify a resource in this snapshot.
+    /// Returns [`OrdinalOutOfBounds`] when `source` does not identify a resource in this snapshot.
     pub fn references_from_resource(
         &self,
-        source: ResourceKey,
-    ) -> Result<impl Iterator<Item = &HrefReference>, IndexKeyError> {
-        self.resources().resource(source)?;
+        source: ResourceOrdinal,
+    ) -> Result<impl Iterator<Item = &HrefReference>, OrdinalOutOfBounds> {
+        self.resources()
+            .resource(source)
+            .map_err(|_| OrdinalOutOfBounds)?;
         Ok(self.references().filter_map(move |reference| {
             let AuthoredReference::Href(reference) = reference else {
                 return None;
@@ -98,17 +99,18 @@ impl PublicationAnalysis {
 
     /// Iterates manifest relationships authored by `source`.
     ///
-    /// `source` must be a manifest-declaration key from this analysis snapshot.
+    /// `source` must be a manifest-declaration ordinal from this analysis snapshot.
     ///
     /// # Errors
     ///
-    /// Returns [`IndexKeyError`] when `source` belongs to another resource index or does
-    /// not identify a manifest declaration in this snapshot.
+    /// Returns [`OrdinalOutOfBounds`] when `source` does not identify a declaration in this snapshot.
     pub fn references_from_declaration(
         &self,
-        source: ManifestKey,
-    ) -> Result<impl Iterator<Item = &ManifestReference>, IndexKeyError> {
-        self.resources().declaration(source)?;
+        source: ManifestOrdinal,
+    ) -> Result<impl Iterator<Item = &ManifestReference>, OrdinalOutOfBounds> {
+        self.resources()
+            .declaration(source)
+            .map_err(|_| OrdinalOutOfBounds)?;
         Ok(self.references().filter_map(move |reference| {
             let AuthoredReference::Manifest(reference) = reference else {
                 return None;
@@ -121,17 +123,18 @@ impl PublicationAnalysis {
     ///
     /// This includes local resource and fragment hrefs, remote hrefs matched to a manifest
     /// declaration, and manifest ID references whose declaration resolves to the resource.
-    /// `target` must be a resource key from this analysis snapshot.
+    /// `target` must be a resource ordinal from this analysis snapshot.
     ///
     /// # Errors
     ///
-    /// Returns [`IndexKeyError`] when `target` belongs to another resource index or does
-    /// not identify a resource in this snapshot.
+    /// Returns [`OrdinalOutOfBounds`] when `target` does not identify a resource in this snapshot.
     pub fn references_to(
         &self,
-        target: ResourceKey,
-    ) -> Result<impl Iterator<Item = &AuthoredReference>, IndexKeyError> {
-        self.resources().resource(target)?;
+        target: ResourceOrdinal,
+    ) -> Result<impl Iterator<Item = &AuthoredReference>, OrdinalOutOfBounds> {
+        self.resources()
+            .resource(target)
+            .map_err(|_| OrdinalOutOfBounds)?;
         Ok(self.references().filter(move |reference| match reference {
             AuthoredReference::Href(reference) => match reference.target() {
                 HrefTarget::Resource { resource, .. } | HrefTarget::Fragment { resource, .. } => {
@@ -154,18 +157,19 @@ impl PublicationAnalysis {
 
     /// Iterates manifest relationships that resolve to declaration `target`.
     ///
-    /// `target` must be a manifest-declaration key from this analysis snapshot. Missing and
+    /// `target` must be a manifest-declaration ordinal from this analysis snapshot. Missing and
     /// ambiguous ID references do not match a declaration.
     ///
     /// # Errors
     ///
-    /// Returns [`IndexKeyError`] when `target` belongs to another resource index or does
-    /// not identify a manifest declaration in this snapshot.
+    /// Returns [`OrdinalOutOfBounds`] when `target` does not identify a declaration in this snapshot.
     pub fn references_to_declaration(
         &self,
-        target: ManifestKey,
-    ) -> Result<impl Iterator<Item = &ManifestReference>, IndexKeyError> {
-        self.resources().declaration(target)?;
+        target: ManifestOrdinal,
+    ) -> Result<impl Iterator<Item = &ManifestReference>, OrdinalOutOfBounds> {
+        self.resources()
+            .declaration(target)
+            .map_err(|_| OrdinalOutOfBounds)?;
         Ok(self.references().filter_map(move |reference| {
             let AuthoredReference::Manifest(reference) = reference else {
                 return None;

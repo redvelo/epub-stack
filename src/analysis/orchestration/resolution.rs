@@ -44,7 +44,7 @@ pub(super) fn push_xhtml_href_reference(
     resources: &ResourceIndex,
     facts: &[ResourceFacts],
     references: &mut Vec<AuthoredReference>,
-    source: ResourceKey,
+    source: ResourceRow,
     declared: &AuthoredHref,
     kind: HrefRole,
     source_path: &EpubPath,
@@ -126,7 +126,7 @@ pub(super) fn push_svg_href_reference(
     resources: &ResourceIndex,
     facts: &[ResourceFacts],
     references: &mut Vec<AuthoredReference>,
-    source: ResourceKey,
+    source: ResourceRow,
     declared: &AuthoredHref,
     authored_bases: &[AuthoredHref],
     kind: HrefRole,
@@ -154,7 +154,7 @@ pub(super) fn push_href_reference(
     resources: &ResourceIndex,
     facts: &[ResourceFacts],
     references: &mut Vec<AuthoredReference>,
-    source: ResourceKey,
+    source: ResourceRow,
     declared: &AuthoredHref,
     kind: HrefRole,
     source_path: &EpubPath,
@@ -184,7 +184,7 @@ fn href_target(
                 .resources_at(&address)
                 .next()
                 .map(|resource| HrefTarget::Resource {
-                    resource: resource.key(),
+                    resource: resource.ordinal(),
                     query,
                 })
                 .unwrap_or_else(|| HrefTarget::MissingLocal(path.clone())),
@@ -193,7 +193,7 @@ fn href_target(
                 declared_resource: resources
                     .resources_at(&address)
                     .next()
-                    .map(ResourceRecord::key),
+                    .map(ResourceRef::ordinal),
             },
             ResourceAddress::Data(value) => HrefTarget::Data(value.clone()),
             ResourceAddress::External(value) => HrefTarget::External(value.clone()),
@@ -219,7 +219,7 @@ fn href_target(
                 .resources_at(&address)
                 .next()
                 .map(|resource| HrefTarget::Fragment {
-                    resource: resource.key(),
+                    resource: resource.ordinal(),
                     query,
                     exists: fragment_exists(facts, resource.key(), &fragment),
                     fragment,
@@ -230,7 +230,7 @@ fn href_target(
                 declared_resource: resources
                     .resources_at(&address)
                     .next()
-                    .map(ResourceRecord::key),
+                    .map(ResourceRef::ordinal),
             },
             ResourceAddress::Data(value) => HrefTarget::Data(value.clone()),
             ResourceAddress::External(value) => HrefTarget::External(value.clone()),
@@ -240,7 +240,7 @@ fn href_target(
             declared_resource: resources
                 .resources_at(&ResourceAddress::Remote(href.clone()))
                 .next()
-                .map(ResourceRecord::key),
+                .map(ResourceRef::ordinal),
             href,
         },
         ResolvedHref::Data(value) => HrefTarget::Data(value),
@@ -260,10 +260,10 @@ fn authored_query(href: &AuthoredHref) -> Option<String> {
         .map(|(_, query)| query.to_string())
 }
 
-fn fragment_exists(facts: &[ResourceFacts], resource: ResourceKey, fragment: &str) -> Option<bool> {
+fn fragment_exists(facts: &[ResourceFacts], resource: ResourceRow, fragment: &str) -> Option<bool> {
     let outcome = facts
         .iter()
-        .find(|facts| facts.resource() == resource)?
+        .find(|facts| facts.resource_row() == resource)?
         .content();
     let fragments = match outcome.value()? {
         ContentFacts::Xhtml(content) => content.fragments(),

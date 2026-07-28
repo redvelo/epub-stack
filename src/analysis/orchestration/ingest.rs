@@ -4,15 +4,14 @@ use super::*;
 
 pub(super) fn ingest_analysis_resource<R: ResourceProvider>(
     publication: &Epub<R>,
-    record: &ResourceRecord,
+    record: ResourceRef<'_>,
     resources: &ResourceIndex,
     secondary_ncx: Option<EpubPath>,
     limits: &AnalysisLimits,
     analyzed_bytes: u64,
     fingerprint_bytes: u64,
 ) -> ResourceIngest {
-    let classification =
-        ResourceClassification::from_formats(semantic_formats_for(record, resources));
+    let classification = ResourceClassification::from_formats(semantic_formats_for(record));
     let css_candidate = css_candidate(record);
     if record.presence() != ProviderPresence::Present {
         let classification = classification_failure(classification, AnalysisIssue::Missing);
@@ -91,7 +90,7 @@ pub(super) fn ingest_analysis_resource<R: ResourceProvider>(
     });
     result.unwrap_or_else(|_| {
         let classification = classification_failure(
-            ResourceClassification::from_formats(semantic_formats_for(record, resources)),
+            ResourceClassification::from_formats(semantic_formats_for(record)),
             AnalysisIssue::Unreadable,
         );
         ResourceIngest {
@@ -110,14 +109,10 @@ pub(super) fn ingest_analysis_resource<R: ResourceProvider>(
     })
 }
 
-pub(super) fn semantic_formats_for(
-    record: &ResourceRecord,
-    resources: &ResourceIndex,
-) -> Vec<SemanticFormat> {
+pub(super) fn semantic_formats_for(record: ResourceRef<'_>) -> Vec<SemanticFormat> {
     record
         .declarations()
-        .iter()
-        .filter_map(|key| resources.declaration(*key).ok()?.media_type())
+        .filter_map(|declaration| declaration.media_type())
         .filter_map(|media_type| {
             if media_type.is_xhtml() {
                 Some(SemanticFormat::Xhtml)
@@ -134,8 +129,8 @@ pub(super) fn semantic_formats_for(
         .collect()
 }
 
-pub(super) fn css_candidate(record: &ResourceRecord) -> bool {
-    record.declarations().is_empty()
+pub(super) fn css_candidate(record: ResourceRef<'_>) -> bool {
+    record.declarations().next().is_none()
         && record
             .metadata()
             .file_extension()
@@ -143,19 +138,15 @@ pub(super) fn css_candidate(record: &ResourceRecord) -> bool {
 }
 
 fn inspection_hint_for(
-    record: &ResourceRecord,
+    record: ResourceRef<'_>,
     resources: &ResourceIndex,
 ) -> Option<MediaTypeClassification> {
-    if resources.package().key() == record.key() {
+    if resources.package() == record {
         return Some(MediaTypeClassification::GenericText);
     }
-    let mut hints = record.declarations().iter().filter_map(|key| {
-        resources
-            .declaration(*key)
-            .ok()?
-            .media_type()?
-            .classification()
-    });
+    let mut hints = record
+        .declarations()
+        .filter_map(|declaration| declaration.media_type()?.classification());
     let first = hints.next()?;
     hints.all(|hint| hint == first).then_some(first)
 }
@@ -564,9 +555,9 @@ pub(super) fn classification_failure(
 }
 
 pub(super) fn record_coverage<T>(
-    key: ResourceKey,
+    key: ResourceRow,
     outcome: &AnalysisOutcome<T>,
-    completed: &mut Vec<ResourceKey>,
+    completed: &mut Vec<ResourceRow>,
     partial: &mut Vec<IncompleteResource>,
     unavailable: &mut Vec<IncompleteResource>,
 ) {

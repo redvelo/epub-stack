@@ -1,7 +1,7 @@
 use crate::analysis::PublicationAnalysis;
 use crate::content::text::{TextRange, TextRangeError};
 use crate::resource::{
-    ProviderPresence, ResolvedHref, ResourceAddress, ResourceIndex, ResourceRecord,
+    ProviderPresence, ResolvedHref, ResourceAddress, ResourceIndex, ResourceRef,
 };
 
 use super::{AnnotationSelector, AnnotationTarget, FragmentConformsTo, FragmentSelector};
@@ -177,7 +177,7 @@ impl PublicationAnalysis {
 
     fn resolve_annotation_selector(
         &self,
-        source_record: &ResourceRecord,
+        source_record: ResourceRef<'_>,
         selector: &AnnotationSelector,
     ) -> AnnotationResolution {
         let source = source_record.address().clone();
@@ -208,7 +208,7 @@ impl PublicationAnalysis {
                 else {
                     return AnnotationResolution::InvalidSelector { source };
                 };
-                let Ok(Some(stream)) = self.text_stream_for(source_record.key()) else {
+                let Ok(Some(stream)) = self.text_stream_for_row(source_record.key()) else {
                     return AnnotationResolution::Unavailable { source };
                 };
                 match stream.text_for_range(range) {
@@ -229,11 +229,11 @@ impl PublicationAnalysis {
 
     fn resolve_fragment(
         &self,
-        source_record: &ResourceRecord,
+        source_record: ResourceRef<'_>,
         value: &str,
     ) -> AnnotationResolution {
         let source = source_record.address().clone();
-        let Ok(Some(facts)) = self.content_for(source_record.key()).map(|outcome| {
+        let Ok(Some(facts)) = self.content_for_row(source_record.key()).map(|outcome| {
             outcome
                 .value()
                 .and_then(crate::content::ContentFacts::as_xhtml)
@@ -266,7 +266,7 @@ impl PublicationAnalysis {
 fn resolve_target_source<'a>(
     resources: &'a ResourceIndex,
     source: &str,
-) -> Result<&'a ResourceRecord, AnnotationSourceState> {
+) -> Result<ResourceRef<'a>, AnnotationSourceState> {
     if source.is_empty() {
         return Err(AnnotationSourceState::Missing);
     }
@@ -297,7 +297,7 @@ enum SelectorValidationError {
 
 fn selector_requirement(
     selector: &AnnotationSelector,
-    source: &ResourceRecord,
+    source: ResourceRef<'_>,
 ) -> Result<HostRequirement, SelectorValidationError> {
     if matches!(
         selector,
@@ -371,7 +371,7 @@ fn selector_requirement(
 
 fn fragment_requirement(
     selector: &FragmentSelector,
-    source: &ResourceRecord,
+    source: ResourceRef<'_>,
 ) -> Result<HostRequirement, SelectorValidationError> {
     if selector.value().trim().is_empty() {
         return Err(SelectorValidationError::Invalid);

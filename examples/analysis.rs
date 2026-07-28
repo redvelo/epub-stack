@@ -55,7 +55,7 @@ fn print_xhtml_resources(analysis: &PublicationAnalysis) -> Result<(), Box<dyn s
                 matches!(
                     observation,
                     AccessibilityObservationRef::Content { resource, .. }
-                        if resource.key() == key
+                        if resource.ordinal() == key
                 )
             })
             .count();
@@ -491,7 +491,7 @@ fn print_svg_resources(analysis: &PublicationAnalysis) -> Result<(), Box<dyn std
             else {
                 continue;
             };
-            if source.key() != key {
+            if source.ordinal() != key {
                 continue;
             }
             match fact {

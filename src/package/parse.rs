@@ -476,7 +476,7 @@ fn parse_spine_attrs<R>(reader: &NsReader<R>, event: &BytesStart<'_>) -> Spine {
         attrs
             .value(PAGE_PROGRESSION_DIRECTION.as_bytes())
             .and_then(|value| PageProgressionDirection::from_str(&value).ok()),
-        attrs.epub_string(TOC.as_bytes()),
+        attrs.value(TOC.as_bytes()),
     )
 }
 
@@ -627,13 +627,13 @@ fn parse_manifest_item_event<R>(
     _index: usize,
 ) -> Result<ManifestItem> {
     let attrs = PackageEventAttrs::new(reader, event);
-    let fallback = attrs.epub_string(FALLBACK.as_bytes());
+    let fallback = attrs.value(FALLBACK.as_bytes());
     let href = attrs.value(HREF.as_bytes()).map(AuthoredHref::new);
     let media_type = attrs
         .epub_string(MEDIA_TYPE.as_bytes())
         .map(MediaType::from_epub_string);
-    let media_overlay = attrs.epub_string(MEDIA_OVERLAY.as_bytes());
-    let id = attrs.epub_string(ID.as_bytes());
+    let media_overlay = attrs.value(MEDIA_OVERLAY.as_bytes());
+    let id = attrs.value(ID.as_bytes());
     let properties = attrs
         .value(PROPERTIES.as_bytes())
         .map(|value| parse_manifest_properties(&value))
@@ -668,7 +668,7 @@ fn parse_itemref_event<R>(
     _index: usize,
 ) -> Result<ItemRef> {
     let attrs = PackageEventAttrs::new(reader, event);
-    let idref = attrs.epub_string(IDREF.as_bytes());
+    let idref = attrs.value(IDREF.as_bytes());
     let id = attrs.epub_string(ID.as_bytes());
     let linear = attrs
         .value(LINEAR.as_bytes())
@@ -822,7 +822,7 @@ fn build_meta_from_attrs(
 }
 
 fn build_opf2_meta(attrs: &PackageEventAttrs, name: Option<EpubString>) -> Option<Opf2Meta> {
-    let content = attrs.epub_string(CONTENT.as_bytes());
+    let content = attrs.value(CONTENT.as_bytes());
     if name.is_some() || content.is_some() {
         Some(Opf2Meta::from_parsed(name, content))
     } else {
@@ -964,7 +964,6 @@ mod tests {
                 .items()
                 .iter()
                 .filter_map(ManifestItem::id)
-                .map(EpubString::as_str)
                 .collect::<Vec<_>>(),
             vec!["one", "two"]
         );
@@ -1021,7 +1020,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_required_whitespace_attrs_are_missing() {
+    fn invalid_manifest_id_source_remains_present() {
         let package = Package::parse(
             r#"<package xmlns="http://www.idpf.org/2007/opf"><manifest>
                 <item id="   " href="   " media-type="   "/>
@@ -1030,7 +1029,7 @@ mod tests {
         .unwrap();
         let item = package.manifest().items().first().unwrap();
 
-        assert_eq!(item.id(), None);
+        assert_eq!(item.id(), Some("   "));
         assert_eq!(item.href(), None);
         assert_eq!(item.authored_href().map(AuthoredHref::as_str), Some("   "));
         assert_eq!(item.media_type(), None);

@@ -2,11 +2,12 @@
 //!
 //! [`Manifest`] stores [`ManifestItem`] values in package order. Use [`EpubHref`] for a usable
 //! href and [`AuthoredHref`](crate::resource::AuthoredHref) when inspecting parsed source
-//! evidence. [`ManifestPropertyToken`](crate::package::manifest::ManifestPropertyToken) keeps
+//! evidence. Manifest item IDs, fallback IDREFs, and media-overlay IDREFs retain exact decoded
+//! source text. [`ManifestPropertyToken`](crate::package::manifest::ManifestPropertyToken) keeps
 //! token spelling after surrounding Unicode whitespace is trimmed and exposes recognized values
 //! through [`KnownManifestProperty`].
 
-use super::{PackageError, Result, required_package_string};
+use super::{PackageError, Result, normalize_manifest_id, required_package_string};
 use crate::media_type::MediaType;
 use crate::resource::{AuthoredHref, EpubHref};
 use crate::string::{EpubString, EpubStringEmpty};
@@ -36,6 +37,12 @@ fn dedup_manifest_properties(properties: &mut Vec<ManifestPropertyToken>) {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 /// An owned OPF manifest and its items in modeled source order.
 ///
 /// Parsed manifests can contain missing or duplicate authored fields. Programmatic mutations
@@ -95,7 +102,14 @@ impl Manifest {
     /// Returns a duplicate-ID or duplicate-authored-href error. Failure leaves the manifest
     /// unchanged.
     pub fn add_item(&mut self, mut item: ManifestItem) -> Result<()> {
-        if self.items.iter().any(|existing| existing.id() == item.id()) {
+        if item.id().is_some_and(|id| {
+            self.items.iter().any(|existing| {
+                existing
+                    .id()
+                    .and_then(|value| normalize_manifest_id(value).ok())
+                    == Some(id)
+            })
+        }) {
             return Err(PackageError::ManifestIdDuplicate {
                 id: item.id().map(ToString::to_string).unwrap_or_default(),
             });
@@ -127,14 +141,21 @@ impl Manifest {
     ///
     /// Returns [`PackageError::ManifestItemMissing`] without mutation if no item matches.
     pub fn remove_item(&mut self, id: impl AsRef<str>) -> Result<()> {
-        let id = id.as_ref();
+        let id = normalize_manifest_id(id.as_ref())?;
         let len = self.items.len();
-        self.items
-            .retain(|item| !item.id().is_some_and(|item_id| item_id == id));
+        self.items.retain(|item| {
+            item.id()
+                .and_then(|item_id| normalize_manifest_id(item_id).ok())
+                != Some(id)
+        });
         if self.items.len() == len {
             return Err(PackageError::ManifestItemMissing { id: id.to_string() });
         }
         Ok(())
+    }
+
+    pub(super) fn remove_item_at(&mut self, index: usize) -> Option<ManifestItem> {
+        (index < self.items.len()).then(|| self.items.remove(index))
     }
 
     /// Replaces the first item with `id`, preserving its list position.
@@ -147,16 +168,72 @@ impl Manifest {
     /// Returns a missing-item, duplicate-ID, or duplicate-authored-href error. Failure leaves the
     /// manifest unchanged.
     pub fn replace_item(&mut self, id: impl AsRef<str>, mut item: ManifestItem) -> Result<()> {
-        let id = id.as_ref();
-        let Some(index) = self
-            .items
-            .iter()
-            .position(|existing| existing.id().is_some_and(|item_id| item_id == id))
-        else {
+        let id = normalize_manifest_id(id.as_ref())?;
+        let Some(index) = self.items.iter().position(|existing| {
+            existing
+                .id()
+                .and_then(|item_id| normalize_manifest_id(item_id).ok())
+                == Some(id)
+        }) else {
             return Err(PackageError::ManifestItemMissing { id: id.to_string() });
         };
         if item.id().is_some_and(|item_id| item_id != id)
-            && self.items.iter().any(|existing| existing.id() == item.id())
+            && self.items.iter().any(|existing| {
+                existing
+                    .id()
+                    .and_then(|value| normalize_manifest_id(value).ok())
+                    == item.id()
+            })
+        {
+            return Err(PackageError::ManifestIdDuplicate {
+                id: item.id().map(ToString::to_string).unwrap_or_default(),
+            });
+        }
+        if item.authored_href().is_some()
+            && self
+                .items
+                .iter()
+                .enumerate()
+                .any(|(candidate_index, existing)| {
+                    candidate_index != index && existing.authored_href() == item.authored_href()
+                })
+        {
+            return Err(PackageError::ManifestHrefDuplicate {
+                href: item
+                    .authored_href()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+            });
+        }
+        item.normalize();
+        self.items[index] = item;
+        Ok(())
+    }
+
+    pub(super) fn replace_item_at(&mut self, index: usize, mut item: ManifestItem) -> Result<()> {
+        if index >= self.items.len() {
+            return Err(PackageError::ManifestItemMissing {
+                id: index.to_string(),
+            });
+        }
+        let selected_id = self.items[index]
+            .id()
+            .and_then(|id| normalize_manifest_id(id).ok());
+        if item
+            .id()
+            .is_some_and(|item_id| Some(item_id) != selected_id)
+            && item.id().is_some_and(|item_id| {
+                self.items
+                    .iter()
+                    .enumerate()
+                    .any(|(candidate_index, existing)| {
+                        candidate_index != index
+                            && existing
+                                .id()
+                                .and_then(|value| normalize_manifest_id(value).ok())
+                                == Some(item_id)
+                    })
+            })
         {
             return Err(PackageError::ManifestIdDuplicate {
                 id: item.id().map(ToString::to_string).unwrap_or_default(),
@@ -185,27 +262,33 @@ impl Manifest {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 /// An owned semantic OPF manifest item.
 ///
-/// Parsed instances may omit required OPF attributes. Authored href text and vocabulary token
-/// spellings are retained where represented; unknown attributes and XML formatting are not.
+/// Parsed instances may omit required OPF attributes. Relationship IDs, authored href text, and
+/// vocabulary token spellings are retained where represented; unknown attributes and XML
+/// formatting are not.
 pub struct ManifestItem {
-    fallback: Option<EpubString>,
+    fallback: Option<String>,
     href: Option<AuthoredHref>,
     media_type: Option<MediaType>,
-    media_overlay: Option<EpubString>,
-    id: Option<EpubString>,
+    media_overlay: Option<String>,
+    id: Option<String>,
     properties: Vec<ManifestPropertyToken>,
 }
 
-#[bon::bon]
 impl ManifestItem {
     pub(super) fn from_parsed(
-        fallback: Option<EpubString>,
+        fallback: Option<String>,
         href: Option<AuthoredHref>,
         media_type: Option<MediaType>,
-        media_overlay: Option<EpubString>,
-        id: Option<EpubString>,
+        media_overlay: Option<String>,
+        id: Option<String>,
         properties: Vec<ManifestPropertyToken>,
     ) -> Self {
         Self {
@@ -218,34 +301,40 @@ impl ManifestItem {
         }
     }
 
-    #[builder]
-    /// Creates a complete manifest item from owned typed fields.
-    ///
-    /// The href is converted to an authored representation without changing its spelling.
-    /// Property duplicates are removed by semantic known value or exact unknown spelling,
-    /// preserving first occurrence order.
-    pub fn new(
-        id: EpubString,
+    /// Starts construction of a complete manifest item.
+    pub fn builder() -> ManifestItemBuilder {
+        ManifestItemBuilder::default()
+    }
+
+    fn new(
+        id: String,
         href: EpubHref,
         media_type: MediaType,
-        fallback: Option<EpubString>,
-        media_overlay: Option<EpubString>,
-        #[builder(default)] mut properties: Vec<ManifestPropertyToken>,
-    ) -> Self {
+        fallback: Option<String>,
+        media_overlay: Option<String>,
+        mut properties: Vec<ManifestPropertyToken>,
+    ) -> Result<Self> {
+        let id = normalize_manifest_id(&id)?.to_string();
+        let fallback = fallback
+            .map(|value| normalize_manifest_id(&value).map(str::to_string))
+            .transpose()?;
+        let media_overlay = media_overlay
+            .map(|value| normalize_manifest_id(&value).map(str::to_string))
+            .transpose()?;
         dedup_manifest_properties(&mut properties);
-        Self {
+        Ok(Self {
             id: Some(id),
             href: Some(AuthoredHref::from(href)),
             media_type: Some(media_type),
             fallback,
             media_overlay,
             properties,
-        }
+        })
     }
 
     /// Borrows the optional item ID.
-    pub fn id(&self) -> Option<&EpubString> {
-        self.id.as_ref()
+    pub fn id(&self) -> Option<&str> {
+        self.id.as_deref()
     }
     /// Returns an owned usable EPUB href projection.
     ///
@@ -263,12 +352,12 @@ impl ManifestItem {
         self.media_type.as_ref()
     }
     /// Borrows the fallback manifest ID.
-    pub fn fallback(&self) -> Option<&EpubString> {
-        self.fallback.as_ref()
+    pub fn fallback(&self) -> Option<&str> {
+        self.fallback.as_deref()
     }
     /// Borrows the media-overlay manifest ID.
-    pub fn media_overlay(&self) -> Option<&EpubString> {
-        self.media_overlay.as_ref()
+    pub fn media_overlay(&self) -> Option<&str> {
+        self.media_overlay.as_deref()
     }
     /// Borrows property tokens in authored order after any programmatic deduplication.
     pub fn properties(&self) -> &[ManifestPropertyToken] {
@@ -289,7 +378,83 @@ impl ManifestItem {
     }
 }
 
+#[derive(Debug, Default)]
+/// Builder for a validated programmatic [`ManifestItem`].
+pub struct ManifestItemBuilder {
+    id: Option<String>,
+    href: Option<EpubHref>,
+    media_type: Option<MediaType>,
+    fallback: Option<String>,
+    media_overlay: Option<String>,
+    properties: Vec<ManifestPropertyToken>,
+}
+
+impl ManifestItemBuilder {
+    /// Sets the manifest ID from untrimmed caller text.
+    pub fn id(mut self, id: impl AsRef<str>) -> Self {
+        self.id = Some(id.as_ref().to_string());
+        self
+    }
+
+    /// Sets the authored href.
+    pub fn href(mut self, href: EpubHref) -> Self {
+        self.href = Some(href);
+        self
+    }
+
+    /// Sets the declared media type.
+    pub fn media_type(mut self, media_type: MediaType) -> Self {
+        self.media_type = Some(media_type);
+        self
+    }
+
+    /// Sets the fallback manifest IDREF from untrimmed caller text.
+    pub fn fallback(mut self, fallback: impl AsRef<str>) -> Self {
+        self.fallback = Some(fallback.as_ref().to_string());
+        self
+    }
+
+    /// Sets the media-overlay manifest IDREF from untrimmed caller text.
+    pub fn media_overlay(mut self, media_overlay: impl AsRef<str>) -> Self {
+        self.media_overlay = Some(media_overlay.as_ref().to_string());
+        self
+    }
+
+    /// Sets manifest property tokens.
+    pub fn properties(mut self, properties: Vec<ManifestPropertyToken>) -> Self {
+        self.properties = properties;
+        self
+    }
+
+    /// Validates relationship IDs and finishes the manifest item.
+    pub fn build(self) -> Result<ManifestItem> {
+        let id = self.id.ok_or(PackageError::EmptyField {
+            field: "manifest item id",
+        })?;
+        let href = self.href.ok_or(PackageError::EmptyField {
+            field: "manifest item href",
+        })?;
+        let media_type = self.media_type.ok_or(PackageError::EmptyField {
+            field: "manifest item media-type",
+        })?;
+        ManifestItem::new(
+            id,
+            href,
+            media_type,
+            self.fallback,
+            self.media_overlay,
+            self.properties,
+        )
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 /// A manifest property token retaining its authored spelling and optional known projection.
 pub struct ManifestPropertyToken {
     raw: EpubString,
@@ -356,6 +521,12 @@ impl From<KnownManifestProperty> for ManifestPropertyToken {
 #[derive(
     Debug, PartialEq, Eq, Clone, Copy, strum_macros::Display, strum_macros::EnumString, Hash,
 )]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "kebab-case")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[strum(serialize_all = "kebab-case", ascii_case_insensitive)]
 /// A recognized EPUB manifest `properties` token.
 pub enum KnownManifestProperty {
@@ -379,6 +550,31 @@ pub enum KnownManifestProperty {
 mod tests {
     use super::*;
 
+    #[test]
+    fn programmatic_relationship_ids_reject_invalid_ncname_values() {
+        assert!(matches!(
+            ManifestItem::builder()
+                .id("1bad")
+                .href(EpubHref::try_new("chapter.xhtml").unwrap())
+                .media_type(MediaType::from(
+                    EpubString::try_new("application/xhtml+xml").unwrap(),
+                ))
+                .build(),
+            Err(PackageError::InvalidManifestId(_))
+        ));
+        assert!(matches!(
+            ManifestItem::builder()
+                .id("chapter")
+                .href(EpubHref::try_new("chapter.xhtml").unwrap())
+                .media_type(MediaType::from(
+                    EpubString::try_new("application/xhtml+xml").unwrap(),
+                ))
+                .fallback("\u{a0}fallback")
+                .build(),
+            Err(PackageError::InvalidManifestId(_))
+        ));
+    }
+
     fn item(id: &str, href: &str) -> ManifestItem {
         ManifestItem::builder()
             .id(EpubString::try_new(id).unwrap())
@@ -387,6 +583,7 @@ mod tests {
                 EpubString::try_new("application/xhtml+xml").unwrap(),
             ))
             .build()
+            .unwrap()
     }
 
     #[test]
@@ -482,7 +679,8 @@ mod tests {
                 KnownManifestProperty::Scripted.into(),
                 KnownManifestProperty::Scripted.into(),
             ])
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(
             item.properties()
@@ -506,7 +704,8 @@ mod tests {
                 KnownManifestProperty::Nav.into(),
                 ManifestPropertyToken::raw("custom:foo").unwrap(),
             ])
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(
             item.properties()

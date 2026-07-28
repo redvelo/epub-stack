@@ -14,6 +14,8 @@ use std::str::FromStr;
 
 /// A constrained HTML heading level from 1 through 6.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize), serde(transparent))]
+#[cfg_attr(feature = "specta", derive(specta::Type), specta(transparent))]
 pub struct HeadingLevel(u8);
 
 impl HeadingLevel {
@@ -31,6 +33,12 @@ impl HeadingLevel {
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, strum_macros::Display, strum_macros::EnumString,
 )]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "lowercase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[strum(serialize_all = "lowercase", ascii_case_insensitive)]
 /// Text direction accepted by EPUB `dir` attributes.
 pub enum TextDirection {
@@ -50,9 +58,13 @@ macro_rules! vocabulary {
         }
     ) => {
         $(#[$meta])*
+        #[cfg_attr(feature = "serde", derive(serde::Serialize), serde(rename_all = "kebab-case"))]
+        #[cfg_attr(feature = "specta", derive(specta::Type))]
         pub enum $name {
             $(
-                #[doc = concat!("The canonical `", $token, "` token.")]
+                #[cfg_attr(not(feature = "specta"), doc = concat!("The canonical `", $token, "` token."))]
+                #[cfg_attr(feature = "specta", doc = "A recognized canonical vocabulary token.")]
+                #[cfg_attr(feature = "serde", serde(rename = $token))]
                 $variant
             ),+
         }

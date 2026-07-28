@@ -8,7 +8,8 @@ use super::{PublicationAnalysis, ResourceFacts};
 use crate::content::ContentFacts;
 use crate::content::text::{TextChunk, TextRangeError};
 use crate::resource::{
-    ManifestDeclaration, ReadingOrderEntry, ReadingOrderTarget, ResourceIndex, ResourceRecord,
+    ManifestDeclarationRef, ReadingOrderOccurrenceRef, ReadingOrderTargetRow, ResourceIndex,
+    ResourceRef,
 };
 
 /// One extracted text chunk with its resource and publication context.
@@ -17,7 +18,7 @@ use crate::resource::{
 #[derive(Debug, Clone, Copy)]
 pub struct Entry<'a> {
     resources: &'a ResourceIndex,
-    resource: &'a ResourceRecord,
+    resource: ResourceRef<'a>,
     facts: &'a ResourceFacts,
     chunk: &'a TextChunk,
 }
@@ -25,7 +26,7 @@ pub struct Entry<'a> {
 impl<'a> Entry<'a> {
     pub(crate) fn new(
         resources: &'a ResourceIndex,
-        resource: &'a ResourceRecord,
+        resource: ResourceRef<'a>,
         facts: &'a ResourceFacts,
         chunk: &'a TextChunk,
     ) -> Self {
@@ -38,7 +39,7 @@ impl<'a> Entry<'a> {
     }
 
     /// Returns the chunk's snapshot resource record.
-    pub fn resource(&self) -> &ResourceRecord {
+    pub fn resource(&self) -> ResourceRef<'a> {
         self.resource
     }
 
@@ -65,20 +66,17 @@ impl<'a> Entry<'a> {
     }
 
     /// Iterates manifest declarations associated with the resource.
-    pub fn declarations(&self) -> impl Iterator<Item = &ManifestDeclaration> {
-        self.resource
-            .declarations()
-            .iter()
-            .filter_map(|key| self.resources.declaration(*key).ok())
+    pub fn declarations(&self) -> impl Iterator<Item = ManifestDeclarationRef<'a>> {
+        self.resource.declarations()
     }
 
     /// Iterates reading-order occurrences that resolve to the resource.
-    pub fn reading_order_entries(&self) -> impl Iterator<Item = &ReadingOrderEntry> {
+    pub fn reading_order_entries(&self) -> impl Iterator<Item = ReadingOrderOccurrenceRef<'a>> {
         let resource = self.resource.key();
         self.resources.reading_order().filter(move |entry| {
             matches!(
-                entry.target(),
-                ReadingOrderTarget::Declaration {
+                entry.target_row(),
+                ReadingOrderTargetRow::Declaration {
                     resource: Some(key),
                     ..
                 } if *key == resource
@@ -96,7 +94,7 @@ impl PublicationAnalysis {
             let resource = self
                 .resources()
                 .resource(facts.resource())
-                .expect("analysis facts use resource-index keys");
+                .expect("analysis facts use resource-index ordinals");
             facts
                 .content()
                 .value()

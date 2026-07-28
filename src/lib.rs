@@ -86,6 +86,8 @@ pub use container::EpubZip;
 pub use edit::{EditReport, EpubEdit, EpubEditPreview};
 pub use publication::{
     Epub, EpubCreateError, EpubOpenError, EpubOpenFailure, EpubOpenLimits, EpubOpenLimitsError,
+    NavigationHrefTargetFacts, NavigationLoadingFacts, NavigationLoadingOutcome,
+    NavigationTargetFacts, NavigationTargetOutcomeFacts, PublicationFacts, PublicationFactsError,
 };
 pub use resource::provider::{MemoryResourceProvider, ResourceProvider};
 pub use resource::{EpubPath, ResourceIndex, ResourceSelector};

@@ -117,7 +117,6 @@ fn snapshot<R: ResourceProvider>(book: &Epub<R>) -> PublicationSnapshot {
     let resources = book
         .resources()
         .resources()
-        .iter()
         .map(|resource| {
             (
                 resource.address().display_value().to_string(),
@@ -133,7 +132,7 @@ fn snapshot<R: ResourceProvider>(book: &Epub<R>) -> PublicationSnapshot {
                 ..
             } => book
                 .resources()
-                .resource(*key)
+                .resource(key)
                 .unwrap()
                 .address()
                 .display_value()
@@ -155,12 +154,23 @@ fn assert_opf2_migration_state<R: ResourceProvider>(book: &Epub<R>) {
     assert_eq!(book.package().version(), Some(EpubVersion::Three));
     assert!(book.package().guide().is_none());
     assert!(book.package().spine().toc().is_none());
-    assert!(book.package().manifest_item_by_id("ncx").is_none());
+    assert!(
+        book.package()
+            .manifest_items_by_id("ncx")
+            .unwrap()
+            .next()
+            .is_none()
+    );
 
-    let nav_item = book.package().nav_item().unwrap();
-    assert_eq!(nav_item.id().unwrap().as_str(), "nav");
+    let nav_item = book
+        .package()
+        .manifest_items_by_id("nav")
+        .unwrap()
+        .next()
+        .unwrap();
+    assert_eq!(nav_item.id().unwrap(), "nav");
     assert_eq!(nav_item.authored_href().unwrap().as_str(), "nav.xhtml");
-    assert!(book.package().ncx_item().is_none());
+    assert!(book.resources().ncx().is_none());
 
     let nav = book.navigation().epub_nav().unwrap();
     assert_eq!(nav.path().as_str(), "OPS/nav.xhtml");
@@ -210,7 +220,7 @@ fn assert_opf2_migration_state<R: ResourceProvider>(book: &Epub<R>) {
                     ..
                 } => book
                     .resources()
-                    .resource(*key)
+                    .resource(key)
                     .unwrap()
                     .address()
                     .display_value(),
@@ -512,12 +522,14 @@ fn repeated_package_edits_report_one_final_structural_rewrite() {
         .id(EpubString::try_new("first").unwrap())
         .href(EpubHref::try_new("first.bin").unwrap())
         .media_type(MediaType::try_from("application/octet-stream").unwrap())
-        .build();
+        .build()
+        .unwrap();
     let second = ManifestItem::builder()
         .id(EpubString::try_new("second").unwrap())
         .href(EpubHref::try_new("second.bin").unwrap())
         .media_type(MediaType::try_from("application/octet-stream").unwrap())
-        .build();
+        .build()
+        .unwrap();
 
     let preview = book
         .edit()
@@ -594,12 +606,14 @@ fn consecutive_semantic_commits_read_prior_structural_overlay_bytes() {
         .id(EpubString::try_new("first").unwrap())
         .href(EpubHref::try_new("first.bin").unwrap())
         .media_type(MediaType::try_from("application/octet-stream").unwrap())
-        .build();
+        .build()
+        .unwrap();
     let second = ManifestItem::builder()
         .id(EpubString::try_new("second").unwrap())
         .href(EpubHref::try_new("second.bin").unwrap())
         .media_type(MediaType::try_from("application/octet-stream").unwrap())
-        .build();
+        .build()
+        .unwrap();
 
     book.edit()
         .add_manifest_item(first)
@@ -637,8 +651,22 @@ fn consecutive_semantic_commits_read_prior_structural_overlay_bytes() {
         .unwrap()
         .default_rendition()
         .unwrap();
-    assert!(reopened.package().manifest_item_by_id("first").is_some());
-    assert!(reopened.package().manifest_item_by_id("second").is_some());
+    assert!(
+        reopened
+            .package()
+            .manifest_items_by_id("first")
+            .unwrap()
+            .next()
+            .is_some()
+    );
+    assert!(
+        reopened
+            .package()
+            .manifest_items_by_id("second")
+            .unwrap()
+            .next()
+            .is_some()
+    );
     let point = &reopened
         .navigation()
         .epub_nav()
@@ -662,7 +690,6 @@ fn successful_preview_is_isolated_until_commit() {
     let replacement = b"<html><body>Preview only</body></html>".to_vec();
     let bytes_before = resources_before
         .resources()
-        .iter()
         .map(|resource| {
             let path = resource.address().local_path().unwrap().clone();
             let bytes = book.resource(path.clone()).unwrap().bytes().unwrap();
@@ -724,7 +751,14 @@ fn opf2_migration_preview_commit_export_reopen_preserves_semantics() {
         "OPS/nav.xhtml"
     );
     assert!(preview.navigation().ncx().is_none());
-    assert!(preview.package().manifest_item_by_id("ncx").is_none());
+    assert!(
+        preview
+            .package()
+            .manifest_items_by_id("ncx")
+            .unwrap()
+            .next()
+            .is_none()
+    );
     assert!(
         preview
             .resources()

@@ -5,7 +5,7 @@
 //! to the fingerprint budget in [`super::AnalysisLimits`].
 
 use super::PublicationAnalysis;
-use crate::resource::{ResourceIndex, ResourceKey, ResourceRecord};
+use crate::resource::{ResourceIndex, ResourceRef, ResourceRow};
 use std::fmt;
 
 /// A BLAKE3 digest of one resource's complete analyzed bytes.
@@ -45,7 +45,7 @@ impl fmt::Display for Blake3Hash {
 pub struct DuplicateGroup<'a> {
     hash: Blake3Hash,
     resources: &'a ResourceIndex,
-    keys: &'a [ResourceKey],
+    keys: &'a [ResourceRow],
 }
 
 impl DuplicateGroup<'_> {
@@ -55,21 +55,21 @@ impl DuplicateGroup<'_> {
     }
 
     /// Iterates the matching resource records.
-    pub fn resources(&self) -> impl Iterator<Item = &ResourceRecord> {
+    pub fn resources(&self) -> impl Iterator<Item = ResourceRef<'_>> {
         self.keys
             .iter()
-            .filter_map(|key| self.resources.resource(*key).ok())
+            .filter_map(|key| self.resources.resource((*key).into()).ok())
     }
 }
 
 impl PublicationAnalysis {
     /// Iterates resources with the requested complete BLAKE3 fingerprint.
-    pub fn resources_by_blake3(&self, hash: Blake3Hash) -> impl Iterator<Item = &ResourceRecord> {
+    pub fn resources_by_blake3(&self, hash: Blake3Hash) -> impl Iterator<Item = ResourceRef<'_>> {
         self.fingerprint_index
             .get(&hash)
             .into_iter()
             .flatten()
-            .filter_map(|key| self.resources.resource(*key).ok())
+            .filter_map(|key| self.resources.resource((*key).into()).ok())
     }
 
     /// Iterates groups of at least two byte-identical resources.

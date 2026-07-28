@@ -6,30 +6,44 @@
 //! [`ReferenceType`](crate::package::legacy::ReferenceType).
 
 use crate::resource::{AuthoredHref, EpubHref};
-use crate::string::EpubString;
+use crate::{package::normalize_manifest_id, string::EpubString};
 
-#[derive(Debug, PartialEq, Eq, Clone, Hash, bon::Builder)]
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 /// An owned EPUB 2 `meta` name/content pair.
 ///
 /// Parsed instances may represent a missing side of the pair; [`Self::new`] requires both.
 pub struct Opf2Meta {
-    #[builder(required, with = Some)]
     name: Option<EpubString>,
-    #[builder(required, with = Some)]
-    content: Option<EpubString>,
+    content: Option<String>,
 }
 
 impl Opf2Meta {
-    pub(super) fn from_parsed(name: Option<EpubString>, content: Option<EpubString>) -> Self {
+    pub(super) fn from_parsed(name: Option<EpubString>, content: Option<String>) -> Self {
         Self { name, content }
     }
 
     /// Creates a complete EPUB 2 metadata pair from owned non-empty strings.
-    pub fn new(name: EpubString, content: EpubString) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::package::PackageError::InvalidManifestId`] when a `cover` pair has invalid
+    /// manifest ID content.
+    pub fn new(name: EpubString, content: impl AsRef<str>) -> crate::package::Result<Self> {
+        let content = if name.eq_ignore_ascii_case("cover") {
+            normalize_manifest_id(content.as_ref())?.to_string()
+        } else {
+            content.as_ref().to_string()
+        };
+        Ok(Self {
             name: Some(name),
             content: Some(content),
-        }
+        })
     }
 
     /// Borrows the authored `name`, if modeled.
@@ -37,12 +51,18 @@ impl Opf2Meta {
         self.name.as_ref()
     }
     /// Borrows the authored `content`, if modeled.
-    pub fn content(&self) -> Option<&EpubString> {
-        self.content.as_ref()
+    pub fn content(&self) -> Option<&str> {
+        self.content.as_deref()
     }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 /// An owned EPUB 2 guide preserving reference order.
 ///
 /// The semantic model does not retain unknown guide XML or lexical formatting.
@@ -72,6 +92,12 @@ impl Guide {
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 /// A modeled EPUB 2 guide reference.
 ///
 /// The authored href spelling is retained separately from its usable [`EpubHref`] projection.
@@ -118,6 +144,12 @@ impl Reference {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, strum_macros::Display, strum_macros::EnumString, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "kebab-case")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[strum(serialize_all = "kebab-case", ascii_case_insensitive)]
 /// A recognized EPUB 2 guide reference type, or an owned unknown token.
 pub enum ReferenceType {

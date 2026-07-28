@@ -20,6 +20,12 @@ use crate::string::{EpubString, EpubStringEmpty};
 use std::str::FromStr;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "kebab-case")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 /// An owned supported Dublin Core element tagged with its OPF local name.
 pub enum MetadataElement {
     /// A `dc:identifier` element.
@@ -143,6 +149,12 @@ macro_rules! vec_adder {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 /// Owned modeled contents of an OPF `metadata` block.
 ///
 /// Each node kind preserves its own source order, but interleaving between kinds, unknown XML,
@@ -385,7 +397,7 @@ impl Metadata {
     /// Borrows the first EPUB 2 cover manifest ID from modeled `meta` pairs.
     ///
     /// Name matching is ASCII case-insensitive.
-    pub fn opf2_cover_id(&self) -> Option<&EpubString> {
+    pub fn opf2_cover_id(&self) -> Option<&str> {
         self.opf2meta.iter().find_map(|meta| {
             meta.name()
                 .is_some_and(|name| name.eq_ignore_ascii_case("cover"))
@@ -621,6 +633,12 @@ impl Metadata {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash, bon::Builder)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 /// An owned Dublin Core metadata element shared by supported DC local names.
 ///
 /// Parsed instances may have no content and preserve modeled EPUB 2 OPF attributes. Unknown
@@ -701,6 +719,12 @@ impl Element {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash, bon::Builder)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 /// An owned EPUB 3 property-based `meta` element.
 ///
 /// Property tokens preserve authored spelling and an optional known projection. Parsed nodes
@@ -848,6 +872,12 @@ impl Meta {
 #[derive(
     Debug, PartialEq, Eq, Clone, Copy, strum_macros::Display, strum_macros::EnumString, Hash,
 )]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "kebab-case")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[strum(serialize_all = "kebab-case", ascii_case_insensitive)]
 /// Recognized EPUB metadata property vocabulary terms.
 pub enum KnownMetaProperty {
@@ -875,24 +905,30 @@ pub enum KnownMetaProperty {
         serialize = "rendition:align-x-center",
         to_string = "rendition:align-x-center"
     )]
+    #[cfg_attr(feature = "serde", serde(rename = "rendition:align-x-center"))]
     /// Centers content on the horizontal axis.
     RenditionAlignXCenter,
     #[strum(serialize = "rendition:flow", to_string = "rendition:flow")]
+    #[cfg_attr(feature = "serde", serde(rename = "rendition:flow"))]
     /// Declares rendition flow behavior.
     RenditionFlow,
     #[strum(serialize = "rendition:layout", to_string = "rendition:layout")]
+    #[cfg_attr(feature = "serde", serde(rename = "rendition:layout"))]
     /// Declares rendition layout behavior.
     RenditionLayout,
     #[strum(
         serialize = "rendition:orientation",
         to_string = "rendition:orientation"
     )]
+    #[cfg_attr(feature = "serde", serde(rename = "rendition:orientation"))]
     /// Declares rendition orientation behavior.
     RenditionOrientation,
     #[strum(serialize = "rendition:spread", to_string = "rendition:spread")]
+    #[cfg_attr(feature = "serde", serde(rename = "rendition:spread"))]
     /// Declares rendition spread behavior.
     RenditionSpread,
     #[strum(serialize = "rendition:viewport", to_string = "rendition:viewport")]
+    #[cfg_attr(feature = "serde", serde(rename = "rendition:viewport"))]
     /// Declares rendition viewport dimensions.
     RenditionViewport,
     /// Identifies the source of a resource.
@@ -902,11 +938,18 @@ pub enum KnownMetaProperty {
     /// Identifies a title type.
     TitleType,
     #[strum(to_string = "dcterms:modified")]
+    #[cfg_attr(feature = "serde", serde(rename = "dcterms:modified"))]
     /// Records the package modification timestamp.
     Dctermsmodified,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 /// A metadata property token retaining authored spelling and an optional known projection.
 pub struct MetaPropertyToken {
     raw: EpubString,
@@ -971,6 +1014,12 @@ impl From<KnownMetaProperty> for MetaPropertyToken {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 /// An OPF metadata `link`, preserving authored href and vocabulary tokens.
 ///
 /// Parsed instances can retain an unusable authored href. Unknown attributes and XML lexical
@@ -1069,6 +1118,12 @@ impl MetadataLink {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 /// A metadata link relationship token with authored spelling and known projection.
 pub struct LinkRelToken {
     raw: EpubString,
@@ -1134,6 +1189,12 @@ impl From<KnownLinkRel> for LinkRelToken {
 #[derive(
     Debug, PartialEq, Eq, Clone, Copy, strum_macros::Display, strum_macros::EnumString, Hash,
 )]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "kebab-case")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[strum(serialize_all = "kebab-case", ascii_case_insensitive)]
 /// A recognized OPF metadata link relationship.
 pub enum KnownLinkRel {
@@ -1161,6 +1222,12 @@ pub enum KnownLinkRel {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 /// A metadata link property token with authored spelling and known projection.
 pub struct LinkPropertyToken {
     raw: EpubString,
@@ -1226,6 +1293,12 @@ impl From<KnownLinkProperty> for LinkPropertyToken {
 #[derive(
     Debug, PartialEq, Eq, Clone, Copy, strum_macros::Display, strum_macros::EnumString, Hash,
 )]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "lowercase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[strum(serialize_all = "lowercase", ascii_case_insensitive)]
 /// A recognized OPF metadata link `properties` token.
 pub enum KnownLinkProperty {

@@ -29,7 +29,7 @@ impl<'a, R: ResourceProvider> EpubEdit<'a, R> {
             .clone()
             .unwrap_or_else(|| self.epub.navigation.clone());
         let resources =
-            ResourceIndex::new(&staged_package, &self.epub.package_path, &provider_index);
+            ResourceIndex::new(&staged_package, &self.epub.package_path, &provider_index)?;
         let annotations_path = annotation_epub_path("META-INF/annotations.json")?;
         let annotations_json_upserted = matches!(
             self.changes.entry(annotations_path.as_path()),
@@ -198,12 +198,18 @@ impl<'a, R: ResourceProvider> EpubEdit<'a, R> {
 
     pub(super) fn unique_manifest_id_for_edit(&self, base: &str) -> String {
         let staged_package = self.package_override.as_ref().unwrap_or(&self.epub.package);
-        if staged_package.manifest_item_by_id(base).is_none() {
+        let occupied = |candidate: &str| {
+            staged_package.manifest().items().iter().any(|item| {
+                item.id()
+                    .is_some_and(|id| manifest_ids_equal(id, candidate))
+            })
+        };
+        if !occupied(base) {
             return base.to_string();
         }
         (1usize..)
             .map(|idx| format!("{base}-{idx}"))
-            .find(|id| staged_package.manifest_item_by_id(id).is_none())
+            .find(|id| !occupied(id))
             .expect("unbounded id generator")
     }
 
@@ -404,11 +410,11 @@ mod tests {
             .unwrap()
             .preview()
             .unwrap();
-        let key = preview
+        let ordinal = preview
             .resources()
             .select(&ResourceSelector::path("EPUB/extra.xhtml").unwrap())
             .unwrap()
-            .key();
+            .ordinal();
         let calls_before_commit = (
             preview.epub.container.index_calls.get(),
             preview.epub.container.read_calls.get(),
@@ -417,7 +423,7 @@ mod tests {
 
         preview.commit();
 
-        assert!(epub.resources().resource(key).is_ok());
+        assert!(epub.resources().resource(ordinal).is_ok());
         assert!(
             epub.resource(ResourceSelector::path("EPUB/extra.xhtml").unwrap())
                 .is_ok()

@@ -20,6 +20,13 @@ impl<'a, R: ResourceProvider> EpubEdit<'a, R> {
             });
         }
 
+        let ncx_index = staged_package.ncx_item().and_then(|selected| {
+            staged_package
+                .manifest()
+                .items()
+                .iter()
+                .position(|item| std::ptr::eq(item, selected))
+        });
         let ncx_item = staged_package.ncx_item().cloned();
         let ncx_path = if let Some(ncx_item) = &ncx_item {
             let path = structural_manifest_href_path(ncx_item, &self.epub.package_path)
@@ -75,14 +82,14 @@ impl<'a, R: ResourceProvider> EpubEdit<'a, R> {
                     }
                 })?)
                 .properties(vec![KnownManifestProperty::Nav.into()])
-                .build();
+                .build()?;
             (path, Some(item))
         };
 
-        if let (Some(ncx_id), Some(ncx_path)) = (&ncx_id, &ncx_path) {
+        if let (Some(_), Some(ncx_path)) = (&ncx_id, &ncx_path) {
             reject_shared_manifest_resource_path(
                 staged_package,
-                ncx_id,
+                ncx_index.expect("selected NCX belongs to the staged manifest"),
                 ncx_path,
                 &self.epub.package_path,
                 ncx_path == &nav_path,
@@ -554,6 +561,40 @@ mod tests {
     }
 
     #[test]
+    fn migrate_opf2_to_epub3_avoids_ambiguous_duplicate_nav_ids() {
+        let provider = opf2_migration_provider(
+            r#"<package xmlns="http://www.idpf.org/2007/opf" xmlns:dc="http://purl.org/dc/elements/1.1/" version="2.0" unique-identifier="uid">
+  <metadata><dc:title>T</dc:title><dc:identifier id="uid">id</dc:identifier><dc:language>en</dc:language></metadata>
+  <manifest>
+    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml" />
+    <item id="nav" href="reserved-a.xhtml" media-type="application/xhtml+xml" />
+    <item id="nav" href="reserved-b.xhtml" media-type="application/xhtml+xml" />
+    <item id="chap" href="text/chapter.xhtml" media-type="application/xhtml+xml" />
+  </manifest>
+  <spine toc="ncx"><itemref idref="chap" /></spine>
+</package>"#,
+        );
+        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+
+        let preview = epub
+            .edit()
+            .migrate_opf2_to_epub3()
+            .unwrap()
+            .preview()
+            .unwrap();
+
+        assert_eq!(preview.package().nav_item().unwrap().id(), Some("nav-1"));
+        assert_eq!(
+            preview
+                .package()
+                .manifest_items_by_id("nav")
+                .unwrap()
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn migrate_opf2_to_epub3_rejects_shared_selected_ncx_transactionally() {
         let package = r#"<package xmlns="http://www.idpf.org/2007/opf" xmlns:dc="http://purl.org/dc/elements/1.1/" version="2.0" unique-identifier="uid">
   <metadata><dc:title>T</dc:title><dc:identifier id="uid">id</dc:identifier><dc:language>en</dc:language></metadata>
@@ -591,7 +632,8 @@ mod tests {
             .href(EpubHref::try_new("./toc.ncx").unwrap())
             .media_type(MediaType::try_from("application/xhtml+xml").unwrap())
             .properties(vec![KnownManifestProperty::Nav.into()])
-            .build();
+            .build()
+            .unwrap();
         let mut edit = epub.edit();
         let package_path = edit.epub.package_path.clone();
         let package_path_for_mutate = package_path.clone();

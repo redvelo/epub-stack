@@ -6,7 +6,13 @@
 //! Committed edits affect publication reads and exports but do not modify the underlying provider.
 pub(crate) mod annotation;
 mod cfi;
+mod facts;
 pub(crate) mod persistence;
+
+pub use facts::{
+    NavigationHrefTargetFacts, NavigationLoadingFacts, NavigationLoadingOutcome,
+    NavigationTargetFacts, NavigationTargetOutcomeFacts, PublicationFacts, PublicationFactsError,
+};
 
 #[cfg(test)]
 use crate::analysis::orchestration::{
@@ -47,9 +53,9 @@ use crate::{
         ResourceProviderIndexError, ResourceProviderIndexLimits,
     },
     resource::{
-        EpubPath, EpubPathError, ProviderPresence, ReadingOrderEntry, ResourceAddress,
-        ResourceIndex, ResourceKey, ResourceLookupError, ResourceReadError, ResourceRecord,
-        ResourceSelector, resolve_local_href_from_source,
+        EpubPath, EpubPathError, ProviderPresence, ReadingOrderOccurrenceRef, ResourceAddress,
+        ResourceIndex, ResourceIndexError, ResourceLookupError, ResourceReadError, ResourceRef,
+        ResourceRow, ResourceSelector, resolve_local_href_from_source,
     },
     semantics::EpubStructuralSemantic,
     string::EpubString,
@@ -155,6 +161,12 @@ impl Default for EpubOpenLimits {
 /// it and returns ownership of the provider to the caller. The enum is non-exhaustive so callers
 /// must include a fallback arm.
 pub enum EpubOpenFailure {
+    /// The publication topology cannot be represented by public ordinals.
+    #[error("Could not index publication resources: {source}")]
+    ResourceIndex {
+        /// The topology overflow.
+        source: ResourceIndexError,
+    },
     /// The requested package path was not a canonical local EPUB path.
     #[error("Invalid package path {path}: {source}")]
     InvalidPackagePath {
@@ -273,8 +285,8 @@ impl<R> std::error::Error for EpubOpenError<R> {
 /// A loaded EPUB rendition for reading, analysis, editing, and export.
 ///
 /// Resource bytes are read from the owned provider on demand. Committing an edit replaces the
-/// current package, navigation, and resource index, so cloned keys and detached analyses can
-/// become stale.
+/// current package, navigation, and resource index, so detached analyses and ordinals can become
+/// stale.
 ///
 /// Parsing and normalized models preserve supported authored values and unknown vocabulary data
 /// where documented by their modules, but [`Self::export`] rebuilds ZIP structure and is not a
@@ -287,6 +299,7 @@ pub struct Epub<R: ResourceProvider> {
 
     pub(crate) package: Package,
     pub(crate) navigation: Navigation,
+    pub(crate) navigation_loading: NavigationLoadingFacts,
 
     pub(crate) resources: ResourceIndex,
     pub(crate) open_limits: EpubOpenLimits,
@@ -301,6 +314,13 @@ pub struct Epub<R: ResourceProvider> {
 /// Construction is transactional: no partial [`Epub`] is returned. The enum is non-exhaustive so
 /// callers must include a fallback arm.
 pub enum EpubCreateError {
+    /// The generated topology cannot be represented by public ordinals.
+    #[error("Could not index generated EPUB topology: {source}")]
+    ResourceIndex {
+        /// The topology overflow.
+        #[from]
+        source: ResourceIndexError,
+    },
     /// The required package metadata could not be constructed or generated.
     #[error("Could not construct the package document: {source}")]
     Package {
@@ -411,13 +431,17 @@ impl Epub<MemoryResourceProvider> {
         .expect("generated EPUB paths are valid");
         let package_path = EpubPath::new(PACKAGE_PATH).expect("static package path is valid");
         let provider_index = provider.index(open_limits.provider_index_limits())?;
-        let resources = ResourceIndex::new(&package, &package_path, &provider_index);
+        let resources = ResourceIndex::new(&package, &package_path, &provider_index)?;
 
         Ok(Self {
             container: provider,
             package_path,
             package,
             navigation: Navigation::new(navigation),
+            navigation_loading: NavigationLoadingFacts {
+                epub_nav: NavigationLoadingOutcome::Loaded,
+                ncx: NavigationLoadingOutcome::NotAttempted,
+            },
             resources,
             open_limits,
             provider_index,
@@ -432,16 +456,16 @@ impl Epub<MemoryResourceProvider> {
 /// read can perform provider I/O.
 pub struct Resource<'a, R: ResourceProvider> {
     epub: &'a Epub<R>,
-    key: ResourceKey,
+    key: ResourceRow,
 }
 
 impl<R: ResourceProvider> Resource<'_, R> {
     /// Returns metadata and declaration information for this resource.
-    pub fn record(&self) -> &ResourceRecord {
+    pub fn record(&self) -> ResourceRef<'_> {
         self.epub
             .resources
-            .resource(self.key)
-            .expect("resource key belongs to the live index")
+            .resource(self.key.into())
+            .expect("resource row belongs to the live index")
     }
 
     /// Returns the record's canonical local path or remote URL address.
@@ -532,6 +556,25 @@ impl<R: ResourceProvider> Resource<'_, R> {
 }
 
 impl<R: ResourceProvider> Epub<R> {
+    /// Captures the current committed package, navigation, and resource topology as one snapshot.
+    ///
+    /// The snapshot owns all data and contains portable ordinals instead of borrowed graph views.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PublicationFactsError`] if navigation list or point positions exceed portable
+    /// `u32` facts indices.
+    pub fn facts(&self) -> std::result::Result<PublicationFacts, PublicationFactsError> {
+        Ok(PublicationFacts {
+            package_path: self.package_path.clone(),
+            package: self.package.clone(),
+            navigation: self.navigation.clone(),
+            resource_index: self.resources.facts(),
+            navigation_loading: self.navigation_loading,
+            navigation_targets: facts::navigation_target_facts(&self.navigation, &self.resources)?,
+        })
+    }
+
     /// Opens one package rendition from application-provided storage with default limits.
     ///
     /// This consumes `provider`. Opening indexes all provider paths, reads and parses the package,
@@ -604,29 +647,45 @@ impl<R: ResourceProvider> Epub<R> {
                     source,
                 }
             })?;
+            let resources = ResourceIndex::new(&package, &package_epub_path, &provider_index)
+                .map_err(|source| EpubOpenFailure::ResourceIndex { source })?;
             let mut navigation = Navigation::empty();
-            let nav_document = match package.nav_item() {
-                Some(nav_item) => try_load_navigation(
-                    &provider,
-                    nav_item,
-                    &package_epub_path,
-                    NavigationSource::EpubNav,
-                    &open_limits,
-                )?,
+            let mut navigation_loading = NavigationLoadingFacts {
+                epub_nav: NavigationLoadingOutcome::NotAttempted,
+                ncx: NavigationLoadingOutcome::NotAttempted,
+            };
+            let nav_document = match resources.epub_nav_declaration() {
+                Some(ordinal) => {
+                    let nav_item = &package.manifest().items()[ordinal.index()];
+                    let (document, outcome) = try_load_navigation(
+                        &provider,
+                        nav_item,
+                        &package_epub_path,
+                        NavigationSource::EpubNav,
+                        &open_limits,
+                    )?;
+                    navigation_loading.epub_nav = outcome;
+                    document
+                }
                 None => None,
             };
             if let Some(document) = nav_document {
                 navigation = Navigation::new(document);
             }
             if navigation.is_empty() {
-                let ncx_document = match package.ncx_item() {
-                    Some(ncx_item) => try_load_navigation(
-                        &provider,
-                        ncx_item,
-                        &package_epub_path,
-                        NavigationSource::Ncx,
-                        &open_limits,
-                    )?,
+                let ncx_document = match resources.ncx_declaration() {
+                    Some(ordinal) => {
+                        let ncx_item = &package.manifest().items()[ordinal.index()];
+                        let (document, outcome) = try_load_navigation(
+                            &provider,
+                            ncx_item,
+                            &package_epub_path,
+                            NavigationSource::Ncx,
+                            &open_limits,
+                        )?;
+                        navigation_loading.ncx = outcome;
+                        document
+                    }
                     None => None,
                 };
                 if let Some(document) = ncx_document {
@@ -634,26 +693,28 @@ impl<R: ResourceProvider> Epub<R> {
                 }
             }
 
-            let resources = ResourceIndex::new(&package, &package_epub_path, &provider_index);
             Ok((
                 package_epub_path,
                 package,
                 navigation,
+                navigation_loading,
                 resources,
                 provider_index,
             ))
         })();
 
-        let (package_path, package, navigation, resources, provider_index) = match prepared {
-            Ok(prepared) => prepared,
-            Err(error) => return Err(EpubOpenError::new(error, provider)),
-        };
+        let (package_path, package, navigation, navigation_loading, resources, provider_index) =
+            match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => return Err(EpubOpenError::new(error, provider)),
+            };
 
         Ok(Self {
             container: provider,
             package_path,
             package,
             navigation,
+            navigation_loading,
             resources,
             open_limits,
             provider_index,
@@ -663,7 +724,8 @@ impl<R: ResourceProvider> Epub<R> {
 
     /// Returns the current resource inventory for browsing and lookup.
     ///
-    /// Keys cloned from this index can become stale after a committed edit rebuilds it.
+    /// Borrowed views end before an edit, while copied ordinals must be interpreted against the
+    /// topology that produced them.
     pub fn resources(&self) -> &ResourceIndex {
         &self.resources
     }
@@ -690,14 +752,14 @@ impl<R: ResourceProvider> Epub<R> {
     ///
     /// Entries can represent unresolved or ambiguous declarations. Iteration does not read
     /// resource bytes, and borrowed entries cannot be retained across a mutable edit.
-    pub fn reading_order(&self) -> impl Iterator<Item = &ReadingOrderEntry> {
+    pub fn reading_order(&self) -> impl Iterator<Item = ReadingOrderOccurrenceRef<'_>> {
         self.resources.reading_order()
     }
 
     fn resource_record(
         &self,
         selector: impl Into<ResourceSelector>,
-    ) -> std::result::Result<&ResourceRecord, ResourceLookupError> {
+    ) -> std::result::Result<ResourceRef<'_>, ResourceLookupError> {
         let selector = selector.into();
         self.resources.select(&selector)
     }
@@ -719,7 +781,7 @@ impl<R: ResourceProvider> Epub<R> {
         let record = self.resource_record(selector)?;
         Ok(Resource {
             epub: self,
-            key: record.key(),
+            key: record.row(),
         })
     }
 
@@ -811,8 +873,29 @@ impl<R: ResourceProvider> Epub<R> {
         resource_changes: ResourceChanges,
         resources: ResourceIndex,
     ) {
+        let previous_source = self.navigation.document().map(NavigationDocument::source);
+        let next_source = navigation.document().map(NavigationDocument::source);
+        let navigation_loading = if previous_source == next_source {
+            self.navigation_loading
+        } else {
+            match next_source {
+                Some(NavigationSource::EpubNav) => NavigationLoadingFacts {
+                    epub_nav: NavigationLoadingOutcome::Loaded,
+                    ncx: NavigationLoadingOutcome::NotAttempted,
+                },
+                Some(NavigationSource::Ncx) => NavigationLoadingFacts {
+                    epub_nav: NavigationLoadingOutcome::NotAttempted,
+                    ncx: NavigationLoadingOutcome::Loaded,
+                },
+                None => NavigationLoadingFacts {
+                    epub_nav: NavigationLoadingOutcome::NotAttempted,
+                    ncx: NavigationLoadingOutcome::NotAttempted,
+                },
+            }
+        };
         self.package = package;
         self.navigation = navigation;
+        self.navigation_loading = navigation_loading;
         self.resource_changes = resource_changes;
         self.resources = resources;
     }
@@ -846,15 +929,10 @@ impl<R: ResourceProvider> Epub<R> {
         if path == &self.package_path {
             return Some(StructuralResourceKind::Package);
         }
-        if self
-            .resources
-            .epub_nav()
-            .and_then(ResourceRecord::local_path)
-            == Some(path)
-        {
+        if self.resources.epub_nav().and_then(ResourceRef::local_path) == Some(path) {
             return Some(StructuralResourceKind::Navigation);
         }
-        (self.resources.ncx().and_then(ResourceRecord::local_path) == Some(path))
+        (self.resources.ncx().and_then(ResourceRef::local_path) == Some(path))
             .then_some(StructuralResourceKind::Ncx)
     }
 }
@@ -865,9 +943,9 @@ fn try_load_navigation<R: ResourceProvider>(
     package_path: &EpubPath,
     source: NavigationSource,
     options: &EpubOpenLimits,
-) -> std::result::Result<Option<NavigationDocument>, EpubOpenFailure> {
+) -> std::result::Result<(Option<NavigationDocument>, NavigationLoadingOutcome), EpubOpenFailure> {
     let Some(epub_path) = structural_manifest_href_path(item, package_path) else {
-        return Ok(None);
+        return Ok((None, NavigationLoadingOutcome::NotAttempted));
     };
     let bytes =
         match provider_bytes_bounded(provider, &epub_path, options.max_selected_navigation_bytes) {
@@ -878,17 +956,25 @@ fn try_load_navigation<R: ResourceProvider>(
                     limit: options.max_selected_navigation_bytes,
                 });
             }
-            Err(BoundedReadError::Provider(_)) => return Ok(None),
+            Err(BoundedReadError::Provider(ProviderReadError::MissingResource { .. })) => {
+                return Ok((None, NavigationLoadingOutcome::MissingResource));
+            }
+            Err(BoundedReadError::Provider(_)) => {
+                return Ok((None, NavigationLoadingOutcome::ReadFailed));
+            }
         };
     let xml = match decode_xml(&bytes) {
         Ok(xml) => xml,
-        Err(_) => return Ok(None),
+        Err(_) => return Ok((None, NavigationLoadingOutcome::InvalidEncoding)),
     };
     let parsed = match source {
         NavigationSource::EpubNav => parse::epub_nav(epub_path, &xml),
         NavigationSource::Ncx => parse::ncx(epub_path, &xml),
     };
-    Ok(parsed.ok())
+    Ok(match parsed {
+        Ok(document) => (Some(document), NavigationLoadingOutcome::Loaded),
+        Err(_) => (None, NavigationLoadingOutcome::Malformed),
+    })
 }
 
 fn provider_bytes_bounded<R: ResourceProvider>(
@@ -996,7 +1082,6 @@ mod test {
     use crate::cfi::Cfi;
     use crate::container::EpubZip;
     use crate::media_overlay::SmilFacts;
-    use crate::resource::IndexKeyError;
     use crate::resource::provider::{
         MemoryResourceProvider, ProviderReadError, ResourceProvider, ResourceProviderEntry,
         ResourceProviderIndex,
@@ -1525,30 +1610,29 @@ mod test {
         let provider_css = analysis
             .resources()
             .resources()
-            .iter()
             .find(|resource| resource.local_path() == Some(&provider_css_path))
             .unwrap();
         assert!(
             analysis
-                .content_for(style.key())
+                .content_for(style.ordinal())
                 .unwrap()
                 .is_not_applicable()
         );
         assert!(analysis
-            .references_from_resource(style.key())
+            .references_from_resource(style.ordinal())
             .unwrap()
             .any(|reference| {
                 reference.role() == HrefRole::CssUrl
-                    && matches!(reference.target(), HrefTarget::Resource { resource, .. } if *resource == image.key())
+                    && matches!(reference.target(), HrefTarget::Resource { resource, .. } if *resource == image.ordinal())
             }));
         let inspection = analysis
-            .inspection_for(image.key())
+            .inspection_for(image.ordinal())
             .unwrap()
             .value()
             .unwrap();
         assert!(matches!(
             analysis
-                .facts_for(image.key())
+                .facts_for(image.ordinal())
                 .unwrap()
                 .classification()
                 .value(),
@@ -1556,25 +1640,25 @@ mod test {
         ));
         assert!(
             !analysis
-                .content_for(image.key())
+                .content_for(image.ordinal())
                 .unwrap()
                 .is_not_applicable()
         );
         assert!(
             analysis
-                .content_for(provider_css.key())
+                .content_for(provider_css.ordinal())
                 .unwrap()
                 .is_not_applicable()
         );
         assert!(
             analysis
-                .content_for(not_css.key())
+                .content_for(not_css.ordinal())
                 .unwrap()
                 .is_not_applicable()
         );
         assert!(
             analysis
-                .inspection_for(provider_css.key())
+                .inspection_for(provider_css.ordinal())
                 .unwrap()
                 .value()
                 .unwrap()
@@ -1583,7 +1667,7 @@ mod test {
         );
         assert!(matches!(
             analysis
-                .inspection_for(provider_css.key())
+                .inspection_for(provider_css.ordinal())
                 .unwrap()
                 .value()
                 .unwrap()
@@ -1646,16 +1730,16 @@ mod test {
         let declaration = analysis.resources().find_unique_by_id("chapter").unwrap();
 
         let resource_closure = analysis
-            .dependency_closure(Root::Resource(chapter.key()))
+            .dependency_closure(Root::Resource(chapter.ordinal()))
             .unwrap();
-        assert!(!resource_closure.resources().contains(&fallback.key()));
-        assert!(!resource_closure.resources().contains(&other.key()));
+        assert!(!resource_closure.resources().contains(&fallback.ordinal()));
+        assert!(!resource_closure.resources().contains(&other.ordinal()));
         assert_eq!(resource_closure.unresolved().len(), 1);
         assert!(!resource_closure.is_complete());
         assert_eq!(
             resource_closure,
             analysis
-                .dependency_closure(Root::Resource(chapter.key()))
+                .dependency_closure(Root::Resource(chapter.ordinal()))
                 .unwrap()
         );
         assert!(resource_closure.resources().iter().any(|key| {
@@ -1670,16 +1754,20 @@ mod test {
         );
 
         let declaration_closure = analysis
-            .dependency_closure(Root::Declaration(declaration.key()))
+            .dependency_closure(Root::Declaration(declaration.ordinal()))
             .unwrap();
-        assert!(declaration_closure.resources().contains(&fallback.key()));
+        assert!(
+            declaration_closure
+                .resources()
+                .contains(&fallback.ordinal())
+        );
 
-        let removal = analysis.impact_of_removal(chapter.key()).unwrap();
+        let removal = analysis.impact_of_removal(chapter.ordinal()).unwrap();
         assert_eq!(removal.incoming().len(), 2);
         assert!(removal.outgoing_rebased().is_empty());
         assert!(removal.structural_changes().iter().any(|impact| matches!(
             impact,
-            StructuralChange::ManifestDeclaration(key) if *key == declaration.key()
+            StructuralChange::ManifestDeclaration(key) if *key == declaration.ordinal()
         )));
         assert!(
             removal
@@ -1696,7 +1784,7 @@ mod test {
 
         let movement = analysis
             .impact_of_move(
-                chapter.key(),
+                chapter.ordinal(),
                 &EpubPath::new("EPUB/chapters/chapter.xhtml").unwrap(),
             )
             .unwrap();
@@ -1716,7 +1804,7 @@ mod test {
             .find_unique_resource_by_id("chapter")
             .unwrap();
         let closure = limited
-            .dependency_closure(Root::Resource(limited_chapter.key()))
+            .dependency_closure(Root::Resource(limited_chapter.ordinal()))
             .unwrap();
         assert!(!closure.incomplete_sources().is_empty());
         assert!(!closure.is_complete());
@@ -1736,15 +1824,15 @@ mod test {
         let entries = analysis.resources().reading_order().collect::<Vec<_>>();
 
         assert!(matches!(
-            analysis.dependency_closure(Root::ReadingOrderOccurrence(entries[0].key())),
+            analysis.dependency_closure(Root::ReadingOrderOccurrence(entries[0].ordinal())),
             Err(RootError::MissingReadingOrderIdref(_))
         ));
         assert!(matches!(
-            analysis.dependency_closure(Root::ReadingOrderOccurrence(entries[1].key())),
+            analysis.dependency_closure(Root::ReadingOrderOccurrence(entries[1].ordinal())),
             Err(RootError::MissingManifestId { .. })
         ));
         assert!(matches!(
-            analysis.dependency_closure(Root::ReadingOrderOccurrence(entries[2].key())),
+            analysis.dependency_closure(Root::ReadingOrderOccurrence(entries[2].ordinal())),
             Err(RootError::AmbiguousManifestId { .. })
         ));
 
@@ -1755,16 +1843,14 @@ mod test {
             .resources()
             .find_unique_resource_by_id("chap")
             .unwrap()
-            .key();
-        assert!(matches!(
-            analysis.dependency_closure(Root::Resource(foreign_key)),
-            Err(RootError::Index(IndexKeyError::ForeignIndex))
-        ));
-        assert_eq!(
-            analysis.impact_of_removal(foreign_key),
-            Err(ImpactError::Index(IndexKeyError::ForeignIndex))
+            .ordinal();
+        assert!(
+            analysis
+                .dependency_closure(Root::Resource(foreign_key))
+                .is_ok()
         );
-        let package = analysis.resources().package().key();
+        assert!(analysis.impact_of_removal(foreign_key).is_ok());
+        let package = analysis.resources().package().ordinal();
         assert_eq!(
             analysis.impact_of_removal(package),
             Err(ImpactError::PackageDocument(package))
@@ -1797,7 +1883,7 @@ mod test {
         let broken = analysis.resources().find_unique_by_id("broken").unwrap();
 
         let figure_closure = analysis
-            .dependency_closure(Root::Resource(figure.key()))
+            .dependency_closure(Root::Resource(figure.ordinal()))
             .unwrap();
         assert_eq!(figure_closure.unresolved().len(), 1);
         assert!(matches!(
@@ -1808,22 +1894,22 @@ mod test {
         assert!(!figure_closure.is_complete());
 
         let declaration_closure = analysis
-            .dependency_closure(Root::Declaration(broken.key()))
+            .dependency_closure(Root::Declaration(broken.ordinal()))
             .unwrap();
         assert!(declaration_closure.resources().is_empty());
         assert_eq!(
             declaration_closure.incomplete_sources(),
-            &[ReferenceSource::Declaration(broken.key())]
+            &[ReferenceSource::Declaration(broken.ordinal())]
         );
         assert!(!declaration_closure.is_complete());
 
         let reading_order = analysis.resources().reading_order().next().unwrap();
         let reading_order_closure = analysis
-            .dependency_closure(Root::ReadingOrderOccurrence(reading_order.key()))
+            .dependency_closure(Root::ReadingOrderOccurrence(reading_order.ordinal()))
             .unwrap();
         assert_eq!(
             reading_order_closure.incomplete_sources(),
-            &[ReferenceSource::Declaration(broken.key())]
+            &[ReferenceSource::Declaration(broken.ordinal())]
         );
         assert!(!reading_order_closure.is_complete());
     }
@@ -1849,7 +1935,7 @@ mod test {
             .unwrap();
         let impact = analysis
             .impact_of_move(
-                chapter.key(),
+                chapter.ordinal(),
                 &EpubPath::new("EPUB/chapters/chapter.xhtml").unwrap(),
             )
             .unwrap();
@@ -1864,7 +1950,7 @@ mod test {
             AuthoredReference::Href(reference) if reference.declared().as_str() == "?view"
         )));
         assert!(impact.incoming().iter().all(|reference| {
-            !matches!(reference, AuthoredReference::Href(reference) if reference.source() == chapter.key())
+            !matches!(reference, AuthoredReference::Href(reference) if reference.source() == chapter.ordinal())
         }));
     }
 
@@ -1885,7 +1971,7 @@ mod test {
             .unwrap();
 
         let references = analysis
-            .references_from_resource(chapter.key())
+            .references_from_resource(chapter.ordinal())
             .unwrap()
             .collect::<Vec<_>>();
         assert_eq!(references.len(), 2);
@@ -1918,20 +2004,20 @@ mod test {
             .unwrap();
 
         let references = analysis
-            .references_from_resource(figure.key())
+            .references_from_resource(figure.ordinal())
             .unwrap()
             .collect::<Vec<_>>();
         assert!(matches!(
             references.as_slice(),
             [reference]
                 if reference.role() == HrefRole::Script
-                    && matches!(reference.target(), HrefTarget::Resource { resource, .. } if *resource == script.key())
+                    && matches!(reference.target(), HrefTarget::Resource { resource, .. } if *resource == script.ordinal())
                     && matches!(reference.context(), ReferenceContext::Svg(context) if context.element() == "script" && context.attribute() == "href")
         ));
         let closure = analysis
-            .dependency_closure(Root::Resource(figure.key()))
+            .dependency_closure(Root::Resource(figure.ordinal()))
             .unwrap();
-        assert!(closure.resources().contains(&script.key()));
+        assert!(closure.resources().contains(&script.ordinal()));
     }
 
     #[test]
@@ -1961,13 +2047,13 @@ mod test {
             .find_unique_resource_by_id("remote")
             .unwrap();
         let closure = analysis
-            .dependency_closure(Root::Resource(chapter.key()))
+            .dependency_closure(Root::Resource(chapter.ordinal()))
             .unwrap();
-        assert!(closure.resources().contains(&remote.key()));
+        assert!(closure.resources().contains(&remote.ordinal()));
         assert!(
             closure
                 .incomplete_sources()
-                .contains(&ReferenceSource::Resource(remote.key()))
+                .contains(&ReferenceSource::Resource(remote.ordinal()))
         );
 
         let one = analysis.resources().find_unique_by_id("one").unwrap();
@@ -1981,17 +2067,17 @@ mod test {
             .find_unique_resource_by_id("b")
             .unwrap();
         let one_closure = analysis
-            .dependency_closure(Root::Declaration(one.key()))
+            .dependency_closure(Root::Declaration(one.ordinal()))
             .unwrap();
         let two_closure = analysis
-            .dependency_closure(Root::Declaration(two.key()))
+            .dependency_closure(Root::Declaration(two.ordinal()))
             .unwrap();
-        assert!(one_closure.resources().contains(&a.key()));
-        assert!(!one_closure.resources().contains(&b.key()));
-        assert!(two_closure.resources().contains(&b.key()));
-        assert!(!two_closure.resources().contains(&a.key()));
+        assert!(one_closure.resources().contains(&a.ordinal()));
+        assert!(!one_closure.resources().contains(&b.ordinal()));
+        assert!(two_closure.resources().contains(&b.ordinal()));
+        assert!(!two_closure.resources().contains(&a.ordinal()));
 
-        let removal = analysis.impact_of_removal(a.key()).unwrap();
+        let removal = analysis.impact_of_removal(a.ordinal()).unwrap();
         assert!(removal.incoming().iter().any(|reference| matches!(
             reference,
             AuthoredReference::Manifest(reference)
@@ -2000,20 +2086,20 @@ mod test {
         assert!(
             removal
                 .incomplete_sources()
-                .contains(&ReferenceSource::Resource(remote.key()))
+                .contains(&ReferenceSource::Resource(remote.ordinal()))
         );
         assert!(!removal.is_complete());
 
         let remote_move = analysis
             .impact_of_move(
-                remote.key(),
+                remote.ordinal(),
                 &EpubPath::new("EPUB/styles/book.css").unwrap(),
             )
             .unwrap();
         assert!(
             remote_move
                 .incomplete_sources()
-                .contains(&ReferenceSource::Resource(remote.key()))
+                .contains(&ReferenceSource::Resource(remote.ordinal()))
         );
         assert!(!remote_move.is_complete());
     }
@@ -2074,11 +2160,10 @@ mod test {
         let provider_figure = analysis
             .resources()
             .resources()
-            .iter()
             .find(|resource| resource.local_path() == Some(&provider_path))
             .unwrap();
         let figure_facts = analysis
-            .content_for(figure.key())
+            .content_for(figure.ordinal())
             .unwrap()
             .value()
             .and_then(ContentFacts::as_svg)
@@ -2091,7 +2176,7 @@ mod test {
         );
         assert!(
             analysis
-                .content_for(provider_figure.key())
+                .content_for(provider_figure.ordinal())
                 .unwrap()
                 .value()
                 .and_then(ContentFacts::as_svg)
@@ -2099,14 +2184,14 @@ mod test {
         );
         assert!(matches!(
             analysis
-                .facts_for(provider_figure.key())
+                .facts_for(provider_figure.ordinal())
                 .unwrap()
                 .classification()
                 .value(),
             Some(ResourceClassification::Identified(SemanticFormat::Svg))
         ));
         let inspection = analysis
-            .inspection_for(figure.key())
+            .inspection_for(figure.ordinal())
             .unwrap()
             .value()
             .unwrap();
@@ -2116,7 +2201,7 @@ mod test {
         assert_eq!(inspection.title(), Some("Figure title"));
         assert_eq!(inspection.description(), Some("Figure description"));
         let svg_references = analysis
-            .references_from_resource(figure.key())
+            .references_from_resource(figure.ordinal())
             .unwrap()
             .collect::<Vec<_>>();
         assert_eq!(svg_references.len(), 4);
@@ -2133,7 +2218,7 @@ mod test {
                         resource,
                         exists: Some(true),
                         ..
-                    } if *resource == chapter.key()
+                    } if *resource == chapter.ordinal()
                 )
         }));
         assert!(svg_references.iter().any(|reference| {
@@ -2148,7 +2233,7 @@ mod test {
         }));
         assert!(svg_references.iter().any(|reference| {
             reference.declared().as_str() == "#"
-                && matches!(reference.target(), HrefTarget::Resource { resource, .. } if *resource == figure.key())
+                && matches!(reference.target(), HrefTarget::Resource { resource, .. } if *resource == figure.ordinal())
         }));
         let svg_coverage = analysis
             .coverage()
@@ -2199,7 +2284,7 @@ mod test {
                     AccessibilityObservationRef::Content {
                         resource,
                         fact: AccessibilityFact::SvgTitle(_),
-                    } if resource.key() == figure.key()
+                    } if resource.ordinal() == figure.ordinal()
                 )
             })
             .unwrap();
@@ -2251,7 +2336,7 @@ mod test {
             .resources()
             .find_unique_resource_by_id("figure")
             .unwrap()
-            .key();
+            .ordinal();
         assert!(matches!(
             analysis.content_for(figure).unwrap(),
             AnalysisOutcome::Unavailable(AnalysisIssue::Missing)
@@ -2305,7 +2390,7 @@ mod test {
             .resources()
             .find_unique_resource_by_id("image")
             .unwrap()
-            .key();
+            .ordinal();
 
         let AnalysisOutcome::Partial { value, issue } = analysis.inspection_for(image).unwrap()
         else {
@@ -2344,7 +2429,7 @@ mod test {
             .resources()
             .find_unique_resource_by_id("empty")
             .unwrap()
-            .key();
+            .ordinal();
 
         assert!(matches!(
             analysis.facts_for(empty).unwrap().classification(),
@@ -2453,12 +2538,17 @@ mod test {
             .resources()
             .find_unique_resource_by_id("overlay")
             .unwrap()
-            .key();
-        let reading_order = analysis.resources().reading_order().next().unwrap().key();
+            .ordinal();
+        let reading_order = analysis
+            .resources()
+            .reading_order()
+            .next()
+            .unwrap()
+            .ordinal();
         assert_eq!(
             analysis
                 .media_overlay_associations()
-                .find(|association| association.reading_order().key() == reading_order)
+                .find(|association| association.reading_order().ordinal() == reading_order)
                 .unwrap()
                 .reference()
                 .declared()
@@ -2531,7 +2621,7 @@ mod test {
                 .resources()
                 .find_unique_resource_by_id(id)
                 .unwrap()
-                .key();
+                .ordinal();
             let root = analysis
                 .smil_roots_for(resource)
                 .unwrap()
@@ -3421,7 +3511,7 @@ mod test {
             .resources()
             .find_unique_resource_by_id("overlay")
             .unwrap()
-            .key();
+            .ordinal();
 
         assert!(analysis.coverage().relationships().iter().any(|coverage| {
             matches!(
@@ -3447,13 +3537,12 @@ mod test {
         let overlay = resources
             .find_unique_resource_by_id("overlay")
             .unwrap()
-            .key();
+            .ordinal();
         let issue = AnalysisIssue::PerResourceAnalysisLimit;
         let mut facts = resources
             .resources()
-            .iter()
             .map(|resource| {
-                let content = if resource.key() == overlay {
+                let content = if resource.ordinal() == overlay {
                     AnalysisOutcome::Partial {
                         value: ContentFacts::Smil(SmilFacts::new(
                             Vec::new(),
@@ -3476,14 +3565,14 @@ mod test {
             })
             .collect::<Vec<_>>();
         let mut pending = HashMap::new();
-        pending.insert(overlay, Vec::new());
+        pending.insert(overlay.into(), Vec::new());
         let mut references = Vec::new();
         let mut coverage = Vec::new();
 
         collect_smil_references(
             &resources,
             &mut facts,
-            &HashSet::from([overlay]),
+            &HashSet::from([overlay.into()]),
             pending,
             &mut references,
             &mut coverage,

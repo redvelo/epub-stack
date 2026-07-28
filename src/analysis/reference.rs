@@ -2,13 +2,14 @@
 //!
 //! References retain the authored href or ID-reference text and show whether it resolves to a
 //! local resource, fragment, remote declaration, missing target, or ambiguous declaration.
-//! Resource and declaration keys belong to the analysis snapshot and must not be reused with a
+//! Resource and declaration ordinals belong to the analysis snapshot and must not be reused with a
 //! later analysis.
 
 use super::PublicationAnalysis;
 use crate::content::{ContentFacts, FormFact, MediaFact, ScriptFact};
 use crate::resource::{
-    AuthoredHref, AuthoredIdRef, EpubPath, IndexKeyError, ManifestKey, ResourceKey,
+    AuthoredHref, AuthoredIdRef, EpubPath, ManifestOrdinal, OrdinalOutOfBounds, ResourceOrdinal,
+    ResourceRow,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -28,9 +29,9 @@ impl ReferenceSlot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReferenceSource {
     /// A resource containing an authored href.
-    Resource(ResourceKey),
+    Resource(ResourceOrdinal),
     /// A manifest declaration containing an authored ID reference.
-    Declaration(ManifestKey),
+    Declaration(ManifestOrdinal),
 }
 
 /// The semantic use of an authored href.
@@ -104,15 +105,15 @@ pub enum ManifestRole {
 pub enum HrefTarget {
     /// A local resource, with any authored query retained.
     Resource {
-        /// The resolved snapshot-local resource key.
-        resource: ResourceKey,
+        /// The resolved snapshot-local resource ordinal.
+        resource: ResourceOrdinal,
         /// The query component without the leading `?`.
         query: Option<String>,
     },
     /// A local resource fragment, with fragment existence when it was inspectable.
     Fragment {
-        /// The resolved snapshot-local resource key.
-        resource: ResourceKey,
+        /// The resolved snapshot-local resource ordinal.
+        resource: ResourceOrdinal,
         /// The query component without the leading `?`.
         query: Option<String>,
         /// The fragment component without the leading `#`.
@@ -125,7 +126,7 @@ pub enum HrefTarget {
         /// The authored absolute href.
         href: String,
         /// The snapshot-local resource represented by a matching declaration.
-        declared_resource: Option<ResourceKey>,
+        declared_resource: Option<ResourceOrdinal>,
     },
     /// A `data:` URL retained as authored.
     Data(String),
@@ -142,17 +143,17 @@ pub enum HrefTarget {
 pub enum ManifestTarget {
     /// One matching declaration and its resource, when that declaration resolves to one.
     Declaration {
-        /// The matching snapshot-local declaration key.
-        declaration: ManifestKey,
+        /// The matching snapshot-local declaration ordinal.
+        declaration: ManifestOrdinal,
         /// The declaration's snapshot-local resource target.
-        resource: Option<ResourceKey>,
+        resource: Option<ResourceOrdinal>,
     },
     /// No declaration has the authored ID.
     Missing,
     /// Multiple declarations have the authored ID.
     Ambiguous {
-        /// All matching snapshot-local declaration keys.
-        candidates: Vec<ManifestKey>,
+        /// All matching snapshot-local declaration ordinals.
+        candidates: Vec<ManifestOrdinal>,
     },
 }
 
@@ -225,7 +226,7 @@ impl CssContext {
 /// An authored href together with its role, source, and snapshot resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HrefReference {
-    source: ResourceKey,
+    source: ResourceOrdinal,
     declared: AuthoredHref,
     role: HrefRole,
     target: HrefTarget,
@@ -234,7 +235,7 @@ pub struct HrefReference {
 
 impl HrefReference {
     /// Returns the snapshot-local resource containing the href.
-    pub fn source(&self) -> ResourceKey {
+    pub fn source(&self) -> ResourceOrdinal {
         self.source
     }
 
@@ -262,7 +263,7 @@ impl HrefReference {
 /// An authored manifest ID reference and its snapshot resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestReference {
-    source: ManifestKey,
+    source: ManifestOrdinal,
     declared: AuthoredIdRef,
     role: ManifestRole,
     target: ManifestTarget,
@@ -270,7 +271,7 @@ pub struct ManifestReference {
 
 impl ManifestReference {
     /// Returns the snapshot-local declaration containing the ID reference.
-    pub fn source(&self) -> ManifestKey {
+    pub fn source(&self) -> ManifestOrdinal {
         self.source
     }
 
@@ -320,7 +321,7 @@ pub(crate) struct XhtmlReferenceIndex {
 #[derive(Debug, Clone, Copy)]
 pub struct XhtmlMediaOccurrence<'a> {
     fact: &'a MediaFact,
-    resource: ResourceKey,
+    resource: ResourceOrdinal,
     slots: &'a [ReferenceSlot],
     references: &'a [AuthoredReference],
 }
@@ -328,7 +329,7 @@ pub struct XhtmlMediaOccurrence<'a> {
 impl<'a> XhtmlMediaOccurrence<'a> {
     pub(crate) fn new(
         fact: &'a MediaFact,
-        resource: ResourceKey,
+        resource: ResourceOrdinal,
         slots: &'a [ReferenceSlot],
         references: &'a [AuthoredReference],
     ) -> Self {
@@ -394,17 +395,19 @@ impl PublicationAnalysis {
     /// Returns `Ok(None)` when the resource has no available XHTML facts.
     pub fn xhtml_media(
         &self,
-        resource: ResourceKey,
-    ) -> Result<Option<impl Iterator<Item = XhtmlMediaOccurrence<'_>>>, IndexKeyError> {
+        resource: ResourceOrdinal,
+    ) -> Result<Option<impl Iterator<Item = XhtmlMediaOccurrence<'_>>>, OrdinalOutOfBounds> {
+        let row = ResourceRow::from(resource);
         let facts = self
-            .content_for(resource)?
+            .content_for_row(row)
+            .map_err(|_| OrdinalOutOfBounds)?
             .value()
             .and_then(ContentFacts::as_xhtml);
         Ok(facts.map(move |facts| {
             facts.media().iter().enumerate().map(move |(index, fact)| {
                 let slots = self
                     .xhtml_references
-                    .get(&resource)
+                    .get(&row)
                     .and_then(|references| references.media.get(index))
                     .map(Vec::as_slice)
                     .unwrap_or_default();
@@ -418,17 +421,19 @@ impl PublicationAnalysis {
     /// Returns `Ok(None)` when the resource has no available XHTML facts.
     pub fn xhtml_forms(
         &self,
-        resource: ResourceKey,
-    ) -> Result<Option<impl Iterator<Item = XhtmlFormOccurrence<'_>>>, IndexKeyError> {
+        resource: ResourceOrdinal,
+    ) -> Result<Option<impl Iterator<Item = XhtmlFormOccurrence<'_>>>, OrdinalOutOfBounds> {
+        let row = ResourceRow::from(resource);
         let facts = self
-            .content_for(resource)?
+            .content_for_row(row)
+            .map_err(|_| OrdinalOutOfBounds)?
             .value()
             .and_then(ContentFacts::as_xhtml);
         Ok(facts.map(move |facts| {
             facts.forms().iter().enumerate().map(move |(index, fact)| {
                 let slot = self
                     .xhtml_references
-                    .get(&resource)
+                    .get(&row)
                     .and_then(|references| references.forms.get(index))
                     .copied()
                     .flatten();
@@ -445,10 +450,12 @@ impl PublicationAnalysis {
     /// Returns `Ok(None)` when the resource has no available XHTML facts.
     pub fn xhtml_scripts(
         &self,
-        resource: ResourceKey,
-    ) -> Result<Option<impl Iterator<Item = XhtmlScriptOccurrence<'_>>>, IndexKeyError> {
+        resource: ResourceOrdinal,
+    ) -> Result<Option<impl Iterator<Item = XhtmlScriptOccurrence<'_>>>, OrdinalOutOfBounds> {
+        let row = ResourceRow::from(resource);
         let facts = self
-            .content_for(resource)?
+            .content_for_row(row)
+            .map_err(|_| OrdinalOutOfBounds)?
             .value()
             .and_then(ContentFacts::as_xhtml);
         Ok(facts.map(move |facts| {
@@ -459,7 +466,7 @@ impl PublicationAnalysis {
                 .map(move |(index, fact)| {
                     let slot = self
                         .xhtml_references
-                        .get(&resource)
+                        .get(&row)
                         .and_then(|references| references.scripts.get(index))
                         .copied()
                         .flatten();
@@ -478,7 +485,7 @@ impl PublicationAnalysis {
 
     fn xhtml_reference(
         &self,
-        resource: ResourceKey,
+        resource: ResourceOrdinal,
         slot: ReferenceSlot,
     ) -> Option<&HrefReference> {
         match self.references.get(slot.index()) {
@@ -508,7 +515,7 @@ impl<'a> XhtmlScriptOccurrence<'a> {
 
 pub(crate) fn href_reference(
     references: &mut Vec<AuthoredReference>,
-    source: ResourceKey,
+    source: impl Into<ResourceOrdinal>,
     declared: AuthoredHref,
     role: HrefRole,
     target: HrefTarget,
@@ -516,7 +523,7 @@ pub(crate) fn href_reference(
 ) -> ReferenceSlot {
     let slot = ReferenceSlot::new(references.len());
     references.push(AuthoredReference::Href(HrefReference {
-        source,
+        source: source.into(),
         declared,
         role,
         target,
@@ -527,14 +534,14 @@ pub(crate) fn href_reference(
 
 pub(crate) fn manifest_reference(
     references: &mut Vec<AuthoredReference>,
-    source: ManifestKey,
+    source: impl Into<ManifestOrdinal>,
     declared: AuthoredIdRef,
     role: ManifestRole,
     target: ManifestTarget,
 ) -> ReferenceSlot {
     let slot = ReferenceSlot::new(references.len());
     references.push(AuthoredReference::Manifest(ManifestReference {
-        source,
+        source: source.into(),
         declared,
         role,
         target,

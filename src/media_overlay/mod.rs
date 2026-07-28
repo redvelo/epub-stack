@@ -19,7 +19,8 @@ use crate::analysis::reference::{
 };
 use crate::package::{Package, metadata::Meta};
 use crate::resource::{
-    ManifestDeclaration, ManifestKey, ReadingOrderEntry, ResourceIndex, ResourceKey, ResourceRecord,
+    ManifestDeclarationRef, ManifestOrdinal, ReadingOrderOccurrenceRef, ResourceIndex,
+    ResourceOrdinal, ResourceRef,
 };
 
 pub(crate) use facts::parse_media_time;
@@ -39,7 +40,7 @@ pub struct MediaOverlayFacts {
 impl MediaOverlayFacts {
     pub(crate) fn build(package: &Package, resources: &ResourceIndex) -> Self {
         Self {
-            present: resources.declarations().iter().any(|declaration| {
+            present: resources.declarations().any(|declaration| {
                 declaration.media_overlay().is_some()
                     || declaration
                         .media_type()
@@ -121,7 +122,7 @@ pub struct MediaOverlayDurationMeta {
     authored: String,
     parsed: Option<MediaTime>,
     refines: Option<String>,
-    targets: Vec<ManifestKey>,
+    targets: Vec<ManifestOrdinal>,
 }
 
 impl MediaOverlayDurationMeta {
@@ -141,7 +142,7 @@ impl MediaOverlayDurationMeta {
     }
 
     /// Returns every declaration in this analysis matching the refinement ID.
-    pub fn targets(&self) -> &[ManifestKey] {
+    pub fn targets(&self) -> &[ManifestOrdinal] {
         &self.targets
     }
 }
@@ -153,12 +154,12 @@ impl MediaOverlayDurationMeta {
 /// identify them. All references belong to one [`crate::PublicationAnalysis`] snapshot.
 #[derive(Debug, Clone, Copy)]
 pub struct MediaOverlayAssociationRef<'a> {
-    reading_order: &'a ReadingOrderEntry,
-    content_declaration: &'a ManifestDeclaration,
-    content_resource: Option<&'a ResourceRecord>,
+    reading_order: ReadingOrderOccurrenceRef<'a>,
+    content_declaration: ManifestDeclarationRef<'a>,
+    content_resource: Option<ResourceRef<'a>>,
     reference: &'a ManifestReference,
-    overlay_declaration: Option<&'a ManifestDeclaration>,
-    overlay_resource: Option<&'a ResourceRecord>,
+    overlay_declaration: Option<ManifestDeclarationRef<'a>>,
+    overlay_resource: Option<ResourceRef<'a>>,
     overlay_resource_facts: Option<&'a ResourceFacts>,
     references: &'a [AuthoredReference],
 }
@@ -166,12 +167,12 @@ pub struct MediaOverlayAssociationRef<'a> {
 impl<'a> MediaOverlayAssociationRef<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        reading_order: &'a ReadingOrderEntry,
-        content_declaration: &'a ManifestDeclaration,
-        content_resource: Option<&'a ResourceRecord>,
+        reading_order: ReadingOrderOccurrenceRef<'a>,
+        content_declaration: ManifestDeclarationRef<'a>,
+        content_resource: Option<ResourceRef<'a>>,
         reference: &'a ManifestReference,
-        overlay_declaration: Option<&'a ManifestDeclaration>,
-        overlay_resource: Option<&'a ResourceRecord>,
+        overlay_declaration: Option<ManifestDeclarationRef<'a>>,
+        overlay_resource: Option<ResourceRef<'a>>,
         overlay_resource_facts: Option<&'a ResourceFacts>,
         references: &'a [AuthoredReference],
     ) -> Self {
@@ -188,17 +189,17 @@ impl<'a> MediaOverlayAssociationRef<'a> {
     }
 
     /// Returns the exact reading-order occurrence carrying this association.
-    pub fn reading_order(self) -> &'a ReadingOrderEntry {
+    pub fn reading_order(self) -> ReadingOrderOccurrenceRef<'a> {
         self.reading_order
     }
 
     /// Returns the content declaration that authored `media-overlay`.
-    pub fn content_declaration(self) -> &'a ManifestDeclaration {
+    pub fn content_declaration(self) -> ManifestDeclarationRef<'a> {
         self.content_declaration
     }
 
     /// Returns the content resource when the reading-order declaration resolves to one.
-    pub fn content_resource(self) -> Option<&'a ResourceRecord> {
+    pub fn content_resource(self) -> Option<ResourceRef<'a>> {
         self.content_resource
     }
 
@@ -208,12 +209,12 @@ impl<'a> MediaOverlayAssociationRef<'a> {
     }
 
     /// Returns the uniquely resolved overlay declaration.
-    pub fn overlay_declaration(self) -> Option<&'a ManifestDeclaration> {
+    pub fn overlay_declaration(self) -> Option<ManifestDeclarationRef<'a>> {
         self.overlay_declaration
     }
 
     /// Returns the overlay resource when the target declaration resolves to one.
-    pub fn overlay_resource(self) -> Option<&'a ResourceRecord> {
+    pub fn overlay_resource(self) -> Option<ResourceRef<'a>> {
         self.overlay_resource
     }
 
@@ -229,7 +230,7 @@ impl<'a> MediaOverlayAssociationRef<'a> {
 
     /// Iterates root playback nodes with their text and audio references.
     pub fn roots(self) -> impl Iterator<Item = SmilNodeRef<'a>> {
-        let resource = self.overlay_resource.map(ResourceRecord::key);
+        let resource = self.overlay_resource.map(ResourceRef::ordinal);
         self.smil_facts().into_iter().flat_map(move |facts| {
             facts
                 .roots()
@@ -242,7 +243,7 @@ impl<'a> MediaOverlayAssociationRef<'a> {
 /// A SMIL playback node with access to its children and authored text or audio link.
 #[derive(Clone, Copy)]
 pub struct SmilNodeRef<'a> {
-    resource: ResourceKey,
+    resource: ResourceOrdinal,
     node: SmilNodeId,
     facts: &'a SmilFacts,
     references: &'a [AuthoredReference],
@@ -261,7 +262,7 @@ impl std::fmt::Debug for SmilNodeRef<'_> {
 
 impl<'a> SmilNodeRef<'a> {
     pub(crate) fn new(
-        resource: ResourceKey,
+        resource: ResourceOrdinal,
         node: SmilNodeId,
         facts: &'a SmilFacts,
         references: &'a [AuthoredReference],
@@ -325,8 +326,9 @@ fn duration_meta(meta: &Meta, resources: &ResourceIndex) -> MediaOverlayDuration
         .as_deref()
         .and_then(refinement_id)
         .into_iter()
-        .flat_map(|id| resources.declarations_with_id(id))
-        .map(crate::resource::ManifestDeclaration::key)
+        .flat_map(|id| resources.declarations_with_id(id).ok())
+        .flatten()
+        .map(crate::resource::ManifestDeclarationRef::ordinal)
         .collect();
     MediaOverlayDurationMeta {
         parsed: parse_media_time(&authored),

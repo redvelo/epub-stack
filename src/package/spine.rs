@@ -4,7 +4,8 @@
 //! mutation methods when manifest-target consistency matters; detached `Spine` methods do not
 //! resolve `idref` values. [`SpinePropertyToken`](crate::package::spine::SpinePropertyToken)
 //! retains spelling after surrounding Unicode whitespace is trimmed and exposes recognized
-//! [`KnownSpineProperty`](crate::package::spine::KnownSpineProperty) values separately.
+//! [`KnownSpineProperty`](crate::package::spine::KnownSpineProperty) values separately. Spine
+//! `toc` and itemref `idref` values retain exact decoded source text.
 
 use super::{
     PackageError, RenditionFlow, RenditionLayout, RenditionOrientation, RenditionSpread, Result,
@@ -16,6 +17,12 @@ use std::str::FromStr;
 #[derive(
     Debug, PartialEq, Eq, Clone, Copy, strum_macros::Display, strum_macros::EnumString, Hash,
 )]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "lowercase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[strum(serialize_all = "lowercase", ascii_case_insensitive)]
 /// Reading progression accepted by the spine `page-progression-direction` attribute.
 pub enum PageProgressionDirection {
@@ -28,6 +35,12 @@ pub enum PageProgressionDirection {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 /// An owned OPF spine and its reading-order itemrefs.
 ///
 /// Parsed itemrefs retain modeled source order and authored property token spellings. Unknown
@@ -35,14 +48,14 @@ pub enum PageProgressionDirection {
 pub struct Spine {
     id: Option<EpubString>,
     page_progression_direction: Option<PageProgressionDirection>,
-    toc: Option<EpubString>,
+    toc: Option<String>,
     itemrefs: Vec<ItemRef>,
 }
 impl Spine {
     pub(super) fn from_parsed(
         id: Option<EpubString>,
         page_progression_direction: Option<PageProgressionDirection>,
-        toc: Option<EpubString>,
+        toc: Option<String>,
     ) -> Self {
         Self {
             id,
@@ -80,7 +93,7 @@ impl Spine {
     ///
     /// Returns [`PackageError::EmptyField`] for an empty or whitespace-only value.
     pub fn with_toc(mut self, toc: impl AsRef<str>) -> Result<Self> {
-        self.toc = Some(required_package_string(toc, "spine toc")?);
+        self.toc = Some(super::normalize_manifest_id(toc.as_ref())?.to_string());
         Ok(self)
     }
 
@@ -95,8 +108,8 @@ impl Spine {
         self.id.as_ref()
     }
     /// Borrows the optional EPUB 2 NCX manifest ID reference.
-    pub fn toc(&self) -> Option<&EpubString> {
-        self.toc.as_ref()
+    pub fn toc(&self) -> Option<&str> {
+        self.toc.as_deref()
     }
     /// Returns the recognized page progression direction.
     pub fn page_progression_direction(&self) -> Option<PageProgressionDirection> {
@@ -120,13 +133,18 @@ impl Spine {
     ///
     /// Returns [`PackageError::SpineItemrefMissing`] without mutation if none match.
     pub fn remove_itemref(&mut self, idref: impl AsRef<str>) -> Result<()> {
-        let idref = idref.as_ref();
+        let authored_idref = idref.as_ref();
+        let idref = super::normalize_manifest_id(authored_idref)?;
         let len = self.itemrefs.len();
-        self.itemrefs
-            .retain(|itemref| !itemref.idref().is_some_and(|value| value == idref));
+        self.itemrefs.retain(|itemref| {
+            itemref
+                .idref()
+                .and_then(|value| super::normalize_manifest_id(value).ok())
+                != Some(idref)
+        });
         if self.itemrefs.len() == len {
             return Err(PackageError::SpineItemrefMissing {
-                idref: idref.to_string(),
+                idref: authored_idref.to_string(),
             });
         }
         Ok(())
@@ -185,16 +203,22 @@ impl Spine {
 /// Property tokens preserve authored spellings, but unknown XML does not survive normalized
 /// generation. See <https://www.w3.org/TR/epub-34/#attrdef-itemref-linear>.
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct ItemRef {
     id: Option<EpubString>,
-    idref: Option<EpubString>,
+    idref: Option<String>,
     linear: Linear,
     properties: Vec<SpinePropertyToken>,
 }
 impl ItemRef {
     pub(super) fn from_parsed(
         id: Option<EpubString>,
-        idref: Option<EpubString>,
+        idref: Option<String>,
         linear: Linear,
         properties: Vec<SpinePropertyToken>,
     ) -> Self {
@@ -214,7 +238,7 @@ impl ItemRef {
     pub fn new(idref: impl AsRef<str>) -> Result<Self> {
         Ok(Self {
             id: None,
-            idref: Some(required_package_string(idref, "itemref idref")?),
+            idref: Some(super::normalize_manifest_id(idref.as_ref())?.to_string()),
             linear: Linear::Yes,
             properties: Vec::new(),
         })
@@ -253,8 +277,8 @@ impl ItemRef {
         self.id.as_ref()
     }
     /// Borrows the target manifest ID, or `None` for a malformed parsed itemref.
-    pub fn idref(&self) -> Option<&EpubString> {
-        self.idref.as_ref()
+    pub fn idref(&self) -> Option<&str> {
+        self.idref.as_deref()
     }
     /// Returns linearity; missing or invalid parsed values default to [`Linear::Yes`].
     pub fn linear(&self) -> Linear {
@@ -348,6 +372,12 @@ impl ItemRef {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 /// A spine property token retaining its authored spelling and optional known projection.
 pub struct SpinePropertyToken {
     raw: EpubString,
@@ -414,64 +444,92 @@ impl From<KnownSpineProperty> for SpinePropertyToken {
 #[derive(
     Debug, PartialEq, Eq, Clone, Copy, strum_macros::Display, strum_macros::EnumString, Hash,
 )]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "kebab-case")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[strum(serialize_all = "kebab-case", ascii_case_insensitive)]
 /// A recognized EPUB spine `properties` token.
 pub enum KnownSpineProperty {
     #[strum(serialize = "rendition:layout-pre-paginated")]
+    #[cfg_attr(feature = "serde", serde(rename = "rendition:layout-pre-paginated"))]
     /// Overrides a spine item to use a pre-paginated layout.
     RenditionLayoutPrePaginated,
     #[strum(serialize = "rendition:layout-reflowable")]
+    #[cfg_attr(feature = "serde", serde(rename = "rendition:layout-reflowable"))]
     /// Overrides a spine item to use a reflowable layout.
     RenditionLayoutReflowable,
     #[strum(serialize = "rendition:flow-auto")]
+    #[cfg_attr(feature = "serde", serde(rename = "rendition:flow-auto"))]
     /// Historical automatic flow override.
     RenditionFlowAuto,
     #[strum(serialize = "rendition:flow-paginated")]
+    #[cfg_attr(feature = "serde", serde(rename = "rendition:flow-paginated"))]
     /// Historical paginated flow override.
     RenditionFlowPaginated,
     #[strum(serialize = "rendition:flow-scrolled-continuous")]
+    #[cfg_attr(
+        feature = "serde",
+        serde(rename = "rendition:flow-scrolled-continuous")
+    )]
     /// Historical continuous-scrolling flow override.
     RenditionFlowScrolledContinuous,
     #[strum(serialize = "rendition:flow-scrolled-doc")]
+    #[cfg_attr(feature = "serde", serde(rename = "rendition:flow-scrolled-doc"))]
     /// Historical per-document scrolling flow override.
     RenditionFlowScrolledDoc,
     #[strum(serialize = "rendition:orientation-auto")]
+    #[cfg_attr(feature = "serde", serde(rename = "rendition:orientation-auto"))]
     /// Historical automatic orientation override.
     RenditionOrientationAuto,
     #[strum(serialize = "rendition:orientation-landscape")]
+    #[cfg_attr(feature = "serde", serde(rename = "rendition:orientation-landscape"))]
     /// Historical landscape orientation override.
     RenditionOrientationLandscape,
     #[strum(serialize = "rendition:orientation-portrait")]
+    #[cfg_attr(feature = "serde", serde(rename = "rendition:orientation-portrait"))]
     /// Historical portrait orientation override.
     RenditionOrientationPortrait,
     #[strum(serialize = "rendition:spread-auto")]
+    #[cfg_attr(feature = "serde", serde(rename = "rendition:spread-auto"))]
     /// Historical automatic spread override.
     RenditionSpreadAuto,
     #[strum(serialize = "rendition:spread-both")]
+    #[cfg_attr(feature = "serde", serde(rename = "rendition:spread-both"))]
     /// Historical both-orientations spread override.
     RenditionSpreadBoth,
     #[strum(serialize = "rendition:spread-landscape")]
+    #[cfg_attr(feature = "serde", serde(rename = "rendition:spread-landscape"))]
     /// Historical landscape spread override.
     RenditionSpreadLandscape,
     #[strum(serialize = "rendition:spread-none")]
+    #[cfg_attr(feature = "serde", serde(rename = "rendition:spread-none"))]
     /// Historical no-spread override.
     RenditionSpreadNone,
     #[strum(serialize = "rendition:spread-portrait")]
+    #[cfg_attr(feature = "serde", serde(rename = "rendition:spread-portrait"))]
     /// Historical portrait spread override.
     RenditionSpreadPortrait,
     #[strum(serialize = "rendition:page-spread-left")]
+    #[cfg_attr(feature = "serde", serde(rename = "rendition:page-spread-left"))]
     /// Places the page on the left side of a synthetic spread.
     PageSpreadLeft,
     #[strum(serialize = "rendition:page-spread-right")]
+    #[cfg_attr(feature = "serde", serde(rename = "rendition:page-spread-right"))]
     /// Places the page on the right side of a synthetic spread.
     PageSpreadRight,
     #[strum(serialize = "rendition:page-spread-center")]
+    #[cfg_attr(feature = "serde", serde(rename = "rendition:page-spread-center"))]
     /// Centers the page across a synthetic spread.
     PageSpreadCenter,
     #[strum(serialize = "page-spread-left")]
+    #[cfg_attr(feature = "serde", serde(rename = "page-spread-left"))]
     /// The unprefixed spine-vocabulary alias for left-page placement.
     UnprefixedPageSpreadLeft,
     #[strum(serialize = "page-spread-right")]
+    #[cfg_attr(feature = "serde", serde(rename = "page-spread-right"))]
     /// The unprefixed spine-vocabulary alias for right-page placement.
     UnprefixedPageSpreadRight,
 }
@@ -479,6 +537,12 @@ pub enum KnownSpineProperty {
 #[derive(
     Debug, PartialEq, Eq, Clone, Copy, Hash, strum_macros::Display, strum_macros::EnumString,
 )]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "lowercase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[strum(serialize_all = "lowercase", ascii_case_insensitive)]
 /// A current EPUB synthetic page-spread placement projected from an itemref property.
 pub enum PageSpread {
@@ -493,6 +557,12 @@ pub enum PageSpread {
 #[derive(
     Debug, PartialEq, Eq, Clone, Copy, strum_macros::Display, strum_macros::EnumString, Hash,
 )]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "lowercase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[strum(serialize_all = "lowercase", ascii_case_insensitive)]
 #[derive(Default)]
 /// Whether a spine item belongs to the primary reading order.
@@ -509,6 +579,18 @@ mod tests {
     use super::*;
     use std::str::FromStr;
 
+    #[test]
+    fn programmatic_spine_relationships_reject_invalid_ids() {
+        assert!(matches!(
+            ItemRef::new("\u{a0}chapter"),
+            Err(PackageError::InvalidManifestId(_))
+        ));
+        assert!(matches!(
+            Spine::new_empty().with_toc("1ncx"),
+            Err(PackageError::InvalidManifestId(_))
+        ));
+    }
+
     fn spine_with(idrefs: &[&str]) -> Spine {
         let mut spine = Spine::new_empty();
         for idref in idrefs {
@@ -518,12 +600,7 @@ mod tests {
     }
 
     fn idrefs(spine: &Spine) -> Vec<&str> {
-        spine
-            .itemrefs()
-            .iter()
-            .filter_map(ItemRef::idref)
-            .map(EpubString::as_str)
-            .collect()
+        spine.itemrefs().iter().filter_map(ItemRef::idref).collect()
     }
 
     #[test]
@@ -535,6 +612,31 @@ mod tests {
 
         spine.remove_itemref("one").unwrap();
         assert!(spine.itemrefs().is_empty());
+    }
+
+    #[test]
+    fn remove_by_idref_uses_xml_whitespace_normalization() {
+        let mut spine = Spine::new_empty();
+        spine.add_itemref(ItemRef::from_parsed(
+            None,
+            Some("\t chapter \r\n".to_string()),
+            Linear::Yes,
+            Vec::new(),
+        ));
+        spine.add_itemref(ItemRef::from_parsed(
+            None,
+            Some("\u{a0}chapter".to_string()),
+            Linear::Yes,
+            Vec::new(),
+        ));
+
+        spine.remove_itemref(" chapter ").unwrap();
+
+        assert_eq!(idrefs(&spine), vec!["\u{a0}chapter"]);
+        assert!(matches!(
+            spine.remove_itemref("\u{a0}chapter"),
+            Err(PackageError::InvalidManifestId(_))
+        ));
     }
 
     #[test]

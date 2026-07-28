@@ -11,9 +11,9 @@ use super::reference::{
     ReferenceContext, ReferenceSource,
 };
 use crate::resource::{
-    AuthoredHref, EpubPath, IndexKeyError, ManifestDeclaration, ManifestKey, ParsedHref,
-    ProviderPresence, ReadingOrderEntry, ReadingOrderKey, ReadingOrderTarget, ResourceKey,
-    ResourceRecord, parse_href,
+    AuthoredHref, EpubPath, ManifestOrdinal, ParsedHref, ProviderPresence,
+    ReadingOrderOccurrenceRef, ReadingOrderOrdinal, ReadingOrderTargetRow, ResourceOrdinal,
+    ResourceRef, parse_href,
 };
 use std::collections::HashSet;
 
@@ -22,27 +22,27 @@ use std::collections::HashSet;
 /// This value does not execute an edit and can become stale after any committed change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Impact {
-    pub(crate) resource: ResourceKey,
+    pub(crate) resource: ResourceOrdinal,
     pub(crate) incoming: Vec<AuthoredReference>,
     pub(crate) outgoing_rebased: Vec<AuthoredReference>,
     pub(crate) structural_changes: Vec<StructuralChange>,
     pub(crate) incomplete_sources: Vec<ReferenceSource>,
 }
 
-/// Failure to derive resource impact from a requested snapshot key.
+/// Failure to derive resource impact from a requested snapshot ordinal.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ImpactError {
-    /// The key does not belong to this analysis snapshot.
-    #[error(transparent)]
-    Index(#[from] IndexKeyError),
+    /// The ordinal is outside this analysis snapshot.
+    #[error("resource ordinal is outside this analysis snapshot")]
+    UnknownOrdinal,
     /// Package-document changes require package-aware edit planning.
     #[error("package document impact is not represented by resource impact")]
-    PackageDocument(ResourceKey),
+    PackageDocument(ResourceOrdinal),
 }
 
 impl Impact {
-    /// Returns the affected snapshot-local resource key.
-    pub fn resource(&self) -> ResourceKey {
+    /// Returns the affected snapshot-local resource ordinal.
+    pub fn resource(&self) -> ResourceOrdinal {
         self.resource
     }
 
@@ -76,9 +76,9 @@ impl Impact {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StructuralChange {
     /// A manifest declaration for the resource.
-    ManifestDeclaration(ManifestKey),
+    ManifestDeclaration(ManifestOrdinal),
     /// A reading-order occurrence resolving to the resource.
-    ReadingOrderOccurrence(ReadingOrderKey),
+    ReadingOrderOccurrence(ReadingOrderOrdinal),
     /// An authored navigation href targeting the resource.
     NavigationReference(AuthoredReference),
     /// A manifest fallback relationship targeting the resource.
@@ -89,15 +89,17 @@ pub enum StructuralChange {
 
 impl PublicationAnalysis {
     /// Derives advisory consequences of removing a snapshot resource.
-    pub fn impact_of_removal(&self, key: ResourceKey) -> Result<Impact, ImpactError> {
-        let record = self.resources().resource(key)?;
-        if key == self.resources().package().key() {
+    pub fn impact_of_removal(&self, key: ResourceOrdinal) -> Result<Impact, ImpactError> {
+        let record = self
+            .resources()
+            .resource(key)
+            .map_err(|_| ImpactError::UnknownOrdinal)?;
+        if key == self.resources().package().ordinal() {
             return Err(ImpactError::PackageDocument(key));
         }
         let declarations = record
             .declarations()
-            .iter()
-            .copied()
+            .map(|declaration| declaration.ordinal())
             .collect::<HashSet<_>>();
         let incoming = self
             .references()
@@ -109,14 +111,12 @@ impl PublicationAnalysis {
             .collect::<Vec<_>>();
         let mut structural_changes = record
             .declarations()
-            .iter()
-            .copied()
-            .map(StructuralChange::ManifestDeclaration)
+            .map(|declaration| StructuralChange::ManifestDeclaration(declaration.ordinal()))
             .collect::<Vec<_>>();
 
         structural_changes.extend(self.resources().reading_order().filter_map(|entry| {
             reading_order_targets(entry, key, &declarations)
-                .then_some(StructuralChange::ReadingOrderOccurrence(entry.key()))
+                .then_some(StructuralChange::ReadingOrderOccurrence(entry.ordinal()))
         }));
         structural_changes.extend(incoming.iter().filter_map(|reference| match reference {
             AuthoredReference::Href(reference)
@@ -157,11 +157,14 @@ impl PublicationAnalysis {
     /// Derives advisory consequences of moving a snapshot resource to `destination`.
     pub fn impact_of_move(
         &self,
-        key: ResourceKey,
+        key: ResourceOrdinal,
         destination: &EpubPath,
     ) -> Result<Impact, ImpactError> {
-        let record = self.resources().resource(key)?;
-        if key == self.resources().package().key() {
+        let record = self
+            .resources()
+            .resource(key)
+            .map_err(|_| ImpactError::UnknownOrdinal)?;
+        if key == self.resources().package().ordinal() {
             return Err(ImpactError::PackageDocument(key));
         }
         if record.local_path() == Some(destination) {
@@ -198,9 +201,7 @@ impl PublicationAnalysis {
             .collect::<Vec<_>>();
         let mut structural_changes = record
             .declarations()
-            .iter()
-            .copied()
-            .map(StructuralChange::ManifestDeclaration)
+            .map(|declaration| StructuralChange::ManifestDeclaration(declaration.ordinal()))
             .collect::<Vec<_>>();
         structural_changes.extend(incoming.iter().filter_map(|reference| match reference {
             AuthoredReference::Href(reference)
@@ -233,7 +234,7 @@ impl PublicationAnalysis {
         {
             let source = match coverage.source() {
                 RelationshipSource::Package => {
-                    ReferenceSource::Resource(self.resources().package().key())
+                    ReferenceSource::Resource(self.resources().package().ordinal())
                 }
                 RelationshipSource::Navigation(resource)
                 | RelationshipSource::Ncx(resource)
@@ -247,37 +248,32 @@ impl PublicationAnalysis {
         for record in self
             .resources()
             .resources()
-            .iter()
-            .filter(|record| self.remote_relationships_unknown(record))
+            .filter(|record| self.remote_relationships_unknown(*record))
         {
             push_unique(
                 &mut sources,
                 &mut seen,
-                ReferenceSource::Resource(record.key()),
+                ReferenceSource::Resource(record.ordinal()),
             );
         }
         sources
     }
 
-    fn remote_relationships_unknown(&self, record: &ResourceRecord) -> bool {
+    fn remote_relationships_unknown(&self, record: ResourceRef<'_>) -> bool {
         record.presence() == ProviderPresence::NotApplicable
-            && record.declarations().iter().any(|key| {
-                self.resources()
-                    .declaration(*key)
-                    .ok()
-                    .and_then(ManifestDeclaration::media_type)
-                    .is_some_and(|media_type| {
-                        media_type.is_xhtml()
-                            || media_type.is_css()
-                            || media_type.is_svg()
-                            || media_type.is_smil()
-                            || media_type.is_ncx()
-                    })
+            && record.declarations().any(|declaration| {
+                declaration.media_type().is_some_and(|media_type| {
+                    media_type.is_xhtml()
+                        || media_type.is_css()
+                        || media_type.is_svg()
+                        || media_type.is_smil()
+                        || media_type.is_ncx()
+                })
             })
     }
 }
 
-fn reference_targets_resource(reference: &AuthoredReference, target: ResourceKey) -> bool {
+fn reference_targets_resource(reference: &AuthoredReference, target: ResourceOrdinal) -> bool {
     match reference {
         AuthoredReference::Href(reference) => match reference.target() {
             HrefTarget::Resource { resource, .. } | HrefTarget::Fragment { resource, .. } => {
@@ -299,26 +295,29 @@ fn reference_targets_resource(reference: &AuthoredReference, target: ResourceKey
 }
 
 fn reading_order_targets(
-    entry: &ReadingOrderEntry,
-    resource: ResourceKey,
-    declarations: &HashSet<ManifestKey>,
+    entry: ReadingOrderOccurrenceRef<'_>,
+    resource: ResourceOrdinal,
+    declarations: &HashSet<ManifestOrdinal>,
 ) -> bool {
-    match entry.target() {
-        ReadingOrderTarget::Declaration {
+    match entry.target_row() {
+        ReadingOrderTargetRow::Declaration {
             declaration,
             resource: target,
-        } => *target == Some(resource) || declarations.contains(declaration),
-        ReadingOrderTarget::AmbiguousManifestId { candidates } => {
-            candidates.iter().any(|key| declarations.contains(key))
+        } => {
+            target.map(Into::into) == Some(resource)
+                || declarations.contains(&(*declaration).into())
         }
-        ReadingOrderTarget::MissingIdref | ReadingOrderTarget::MissingManifestId => false,
+        ReadingOrderTargetRow::AmbiguousManifestId { candidates } => candidates
+            .iter()
+            .any(|key| declarations.contains(&(*key).into())),
+        ReadingOrderTargetRow::MissingIdref | ReadingOrderTargetRow::MissingManifestId => false,
     }
 }
 
 fn manifest_id_targets(
     reference: &ManifestReference,
-    resource: ResourceKey,
-    declarations: &HashSet<ManifestKey>,
+    resource: ResourceOrdinal,
+    declarations: &HashSet<ManifestOrdinal>,
 ) -> bool {
     match reference.target() {
         ManifestTarget::Declaration {

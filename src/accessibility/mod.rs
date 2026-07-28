@@ -24,7 +24,7 @@ use crate::package::{
     Package,
     metadata::{Meta, MetadataLink},
 };
-use crate::resource::{ResourceAddress, ResourceIndex, ResourceKey, ResourceRecord};
+use crate::resource::{ResourceAddress, ResourceIndex, ResourceRef, ResourceRow};
 use std::collections::HashMap;
 
 use metadata::collect_metadata;
@@ -72,7 +72,7 @@ impl AccessibilityFacts {
         secondary_navigation: &[NavigationDocument],
         resources: &ResourceIndex,
         resource_facts: &[ResourceFacts],
-        content_occurrences: Vec<(ResourceKey, AccessibilityFact)>,
+        content_occurrences: Vec<(ResourceRow, AccessibilityFact)>,
         package_link_references: &[Option<ReferenceSlot>],
     ) -> Self {
         let (metadata, claims) = collect_metadata(package, package_link_references);
@@ -89,12 +89,12 @@ impl AccessibilityFacts {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AccessibilityContentOccurrence {
-    resource: ResourceKey,
+    resource: ResourceRow,
     fact: AccessibilityFact,
 }
 
 impl AccessibilityContentOccurrence {
-    pub(crate) fn resource(&self) -> ResourceKey {
+    pub(crate) fn resource(&self) -> ResourceRow {
         self.resource
     }
 
@@ -567,26 +567,26 @@ pub enum AccessibilityObservationRef<'a> {
         /// The analyzed navigation-list properties.
         observation: &'a AccessibilityNavigationObservation,
         /// The navigation document resource, when present in the resource index.
-        resource: Option<&'a ResourceRecord>,
+        resource: Option<ResourceRef<'a>>,
     },
     /// One accessibility fact extracted from XHTML or SVG.
     Content {
         /// The source resource.
-        resource: &'a ResourceRecord,
+        resource: ResourceRef<'a>,
         /// The extracted accessibility fact.
         fact: &'a AccessibilityFact,
     },
     /// One structural fact relevant to accessibility consumers.
     Structure {
         /// The source resource.
-        resource: &'a ResourceRecord,
+        resource: ResourceRef<'a>,
         /// The extracted structural fact.
         fact: &'a StructureFact,
     },
     /// An analyzed standalone SMIL document.
     Smil {
         /// The SMIL resource.
-        resource: &'a ResourceRecord,
+        resource: ResourceRef<'a>,
         /// The analyzed SMIL facts.
         facts: &'a SmilFacts,
     },
@@ -595,14 +595,14 @@ pub enum AccessibilityObservationRef<'a> {
     /// One inspected audio or video track.
     MediaTrack {
         /// The media resource.
-        resource: &'a ResourceRecord,
+        resource: ResourceRef<'a>,
         /// The inspected track.
         track: &'a MediaTrack,
     },
     /// An inspected WebVTT resource.
     WebVtt {
         /// The WebVTT resource.
-        resource: &'a ResourceRecord,
+        resource: ResourceRef<'a>,
         /// The inspected WebVTT facts.
         webvtt: &'a WebVtt,
     },
@@ -624,7 +624,7 @@ pub enum AccessibilityNavigationKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Factual properties of one selected EPUB NAV or NCX list.
 pub struct AccessibilityNavigationObservation {
-    resource: Option<ResourceKey>,
+    resource: Option<ResourceRow>,
     source: NavigationSource,
     kind: AccessibilityNavigationKind,
     hidden: bool,
@@ -632,7 +632,7 @@ pub struct AccessibilityNavigationObservation {
 }
 
 impl AccessibilityNavigationObservation {
-    pub(crate) fn resource_key(&self) -> Option<ResourceKey> {
+    pub(crate) fn resource_key(&self) -> Option<ResourceRow> {
         self.resource
     }
 
@@ -678,7 +678,7 @@ fn collect_navigation_document(
     let resource = resources
         .resources_at(&address)
         .next()
-        .map(|record| record.key());
+        .map(ResourceRef::row);
     document
         .lists()
         .iter()
@@ -715,15 +715,15 @@ fn count_navigation_points(points: &[NavigationPoint]) -> usize {
 
 fn collect_content(
     facts: &[ResourceFacts],
-    occurrences: Vec<(ResourceKey, AccessibilityFact)>,
+    occurrences: Vec<(ResourceRow, AccessibilityFact)>,
 ) -> Vec<AccessibilityContentOccurrence> {
-    let mut by_resource = HashMap::<ResourceKey, Vec<AccessibilityFact>>::new();
+    let mut by_resource = HashMap::<ResourceRow, Vec<AccessibilityFact>>::new();
     let mut content_occurrences = Vec::with_capacity(occurrences.len());
     for (resource, fact) in occurrences {
         by_resource.entry(resource).or_default().push(fact);
     }
     for resource_facts in facts {
-        let resource = resource_facts.resource();
+        let resource = resource_facts.resource_row();
         let Some(content) = resource_facts.content().value() else {
             continue;
         };

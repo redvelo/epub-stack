@@ -10,42 +10,42 @@ use super::reference::{
     AuthoredReference, HrefRole, HrefTarget, ManifestRole, ManifestTarget, ReferenceSource,
 };
 use crate::resource::{
-    AuthoredIdRef, DeclarationTarget, IndexKeyError, ManifestDeclaration, ManifestKey,
-    ProviderPresence, ReadingOrderKey, ReadingOrderTarget, ResourceKey, ResourceRecord,
+    AuthoredIdRef, DeclarationTargetRow, ManifestOrdinal, ProviderPresence, ReadingOrderOrdinal,
+    ReadingOrderTargetRow, ResourceOrdinal, ResourceRef,
 };
 use std::collections::{HashSet, VecDeque};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Node {
-    Resource(ResourceKey),
-    Declaration(ManifestKey),
+    Resource(ResourceOrdinal),
+    Declaration(ManifestOrdinal),
 }
 
 /// The resource, declaration, or reading-order entry whose local dependencies are requested.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Root {
     /// Start from a resolved resource.
-    Resource(ResourceKey),
+    Resource(ResourceOrdinal),
     /// Start from a manifest declaration, preserving fallback and overlay edges.
-    Declaration(ManifestKey),
+    Declaration(ManifestOrdinal),
     /// Start from one reading-order occurrence and resolve its declaration.
-    ReadingOrderOccurrence(ReadingOrderKey),
+    ReadingOrderOccurrence(ReadingOrderOrdinal),
 }
 
 /// Failure to resolve a dependency-closure root.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RootError {
-    /// A key does not belong to this analysis snapshot.
-    #[error(transparent)]
-    Index(#[from] IndexKeyError),
+    /// An ordinal is outside this analysis snapshot.
+    #[error("ordinal is outside this analysis snapshot")]
+    UnknownOrdinal,
     /// The occurrence has no authored manifest ID reference.
     #[error("reading-order occurrence has no manifest id reference")]
-    MissingReadingOrderIdref(ReadingOrderKey),
+    MissingReadingOrderIdref(ReadingOrderOrdinal),
     /// The occurrence's authored ID has no matching manifest declaration.
     #[error("reading-order occurrence references a missing manifest id")]
     MissingManifestId {
         /// The snapshot-local reading-order occurrence.
-        root: ReadingOrderKey,
+        root: ReadingOrderOrdinal,
         /// The unresolved authored ID reference.
         idref: AuthoredIdRef,
     },
@@ -53,27 +53,27 @@ pub enum RootError {
     #[error("reading-order occurrence references an ambiguous manifest id")]
     AmbiguousManifestId {
         /// The snapshot-local reading-order occurrence.
-        root: ReadingOrderKey,
+        root: ReadingOrderOrdinal,
         /// All matching snapshot-local declarations.
-        candidates: Vec<ManifestKey>,
+        candidates: Vec<ManifestOrdinal>,
     },
 }
 
 /// Local resources and unresolved links reached from one dependency root.
 ///
-/// Resource keys and references belong to the analysis snapshot that produced this value.
+/// Resource ordinals and references belong to the analysis snapshot that produced this value.
 /// [`Self::unresolved`] reports authored links with no unique target, while
 /// [`Self::incomplete_sources`] reports documents whose links were not fully extracted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Closure {
-    pub(crate) resources: Vec<ResourceKey>,
+    pub(crate) resources: Vec<ResourceOrdinal>,
     pub(crate) unresolved: Vec<AuthoredReference>,
     pub(crate) incomplete_sources: Vec<ReferenceSource>,
 }
 
 impl Closure {
-    /// Returns reached resource keys in deterministic traversal order.
-    pub fn resources(&self) -> &[ResourceKey] {
+    /// Returns reached resource ordinals in deterministic traversal order.
+    pub fn resources(&self) -> &[ResourceOrdinal] {
         &self.resources
     }
 
@@ -100,32 +100,39 @@ impl PublicationAnalysis {
     pub fn dependency_closure(&self, root: Root) -> Result<Closure, RootError> {
         let root = match root {
             Root::Resource(key) => {
-                self.resources().resource(key)?;
+                self.resources()
+                    .resource(key)
+                    .map_err(|_| RootError::UnknownOrdinal)?;
                 Node::Resource(key)
             }
             Root::Declaration(key) => {
-                self.resources().declaration(key)?;
+                self.resources()
+                    .declaration(key)
+                    .map_err(|_| RootError::UnknownOrdinal)?;
                 Node::Declaration(key)
             }
             Root::ReadingOrderOccurrence(key) => {
-                let entry = self.resources().reading_order_entry(key)?;
-                match entry.target() {
-                    ReadingOrderTarget::Declaration { declaration, .. } => {
-                        Node::Declaration(*declaration)
+                let entry = self
+                    .resources()
+                    .occurrence(key)
+                    .map_err(|_| RootError::UnknownOrdinal)?;
+                match entry.target_row() {
+                    ReadingOrderTargetRow::Declaration { declaration, .. } => {
+                        Node::Declaration((*declaration).into())
                     }
-                    ReadingOrderTarget::MissingIdref => {
+                    ReadingOrderTargetRow::MissingIdref => {
                         return Err(RootError::MissingReadingOrderIdref(key));
                     }
-                    ReadingOrderTarget::MissingManifestId => {
+                    ReadingOrderTargetRow::MissingManifestId => {
                         let Some(idref) = entry.idref().cloned() else {
                             return Err(RootError::MissingReadingOrderIdref(key));
                         };
                         return Err(RootError::MissingManifestId { root: key, idref });
                     }
-                    ReadingOrderTarget::AmbiguousManifestId { candidates } => {
+                    ReadingOrderTargetRow::AmbiguousManifestId { candidates } => {
                         return Err(RootError::AmbiguousManifestId {
                             root: key,
-                            candidates: candidates.clone(),
+                            candidates: candidates.iter().copied().map(Into::into).collect(),
                         });
                     }
                 }
@@ -183,11 +190,12 @@ impl PublicationAnalysis {
                         .resources()
                         .declaration(key)
                         .expect("dependency nodes use resource-index keys");
-                    match declaration.target() {
-                        DeclarationTarget::Resource(resource) => {
-                            queue.push_back(Node::Resource(*resource));
+                    match declaration.target_row() {
+                        DeclarationTargetRow::Resource(resource) => {
+                            queue.push_back(Node::Resource((*resource).into()));
                         }
-                        DeclarationTarget::MissingHref | DeclarationTarget::InvalidHref(_) => {
+                        DeclarationTargetRow::MissingHref
+                        | DeclarationTargetRow::InvalidHref(_) => {
                             push_unique(
                                 &mut incomplete_sources,
                                 &mut incomplete_seen,
@@ -274,7 +282,7 @@ impl PublicationAnalysis {
         }
     }
 
-    fn resource_relationships_incomplete(&self, key: ResourceKey) -> bool {
+    fn resource_relationships_incomplete(&self, key: ResourceOrdinal) -> bool {
         self.coverage().relationships().iter().any(|coverage| {
             matches!(
                 coverage.source(),
@@ -287,20 +295,16 @@ impl PublicationAnalysis {
         })
     }
 
-    fn dependency_remote_relationships_unknown(&self, record: &ResourceRecord) -> bool {
+    fn dependency_remote_relationships_unknown(&self, record: ResourceRef<'_>) -> bool {
         record.presence() == ProviderPresence::NotApplicable
-            && record.declarations().iter().any(|key| {
-                self.resources()
-                    .declaration(*key)
-                    .ok()
-                    .and_then(ManifestDeclaration::media_type)
-                    .is_some_and(|media_type| {
-                        media_type.is_xhtml()
-                            || media_type.is_css()
-                            || media_type.is_svg()
-                            || media_type.is_smil()
-                            || media_type.is_ncx()
-                    })
+            && record.declarations().any(|declaration| {
+                declaration.media_type().is_some_and(|media_type| {
+                    media_type.is_xhtml()
+                        || media_type.is_css()
+                        || media_type.is_svg()
+                        || media_type.is_smil()
+                        || media_type.is_ncx()
+                })
             })
     }
 

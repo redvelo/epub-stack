@@ -36,9 +36,9 @@ use crate::package::{Package, collection::Collection};
 use crate::publication::Epub;
 use crate::resource::provider::ResourceProvider;
 use crate::resource::{
-    AuthoredHref, AuthoredIdRef, DeclarationTarget, EpubPath, ManifestDeclaration, ParsedHref,
-    ProviderPresence, ResolvedHref, ResourceAddress, ResourceIndex, ResourceKey, ResourceRecord,
-    parse_href,
+    AuthoredHref, AuthoredIdRef, DeclarationTargetRow, EpubPath, ManifestDeclarationRef,
+    ParsedHref, ProviderPresence, ResolvedHref, ResourceAddress, ResourceIndex, ResourceRef,
+    ResourceRow, parse_href,
 };
 use crate::xml::XmlUtf8Reader;
 use std::collections::{HashMap, HashSet};
@@ -88,27 +88,27 @@ pub(crate) fn analyze<R: ResourceProvider>(
     let mut xhtml_pending = HashMap::new();
     let mut css_sources = HashSet::new();
     let mut css_references =
-        HashMap::<ResourceKey, Vec<crate::content::extraction::css::CssPendingReference>>::new();
-    let mut css_outcomes = HashMap::<ResourceKey, AnalysisOutcome<()>>::new();
+        HashMap::<ResourceRow, Vec<crate::content::extraction::css::CssPendingReference>>::new();
+    let mut css_outcomes = HashMap::<ResourceRow, AnalysisOutcome<()>>::new();
     let mut svg_sources = HashSet::new();
-    let mut svg_references = HashMap::<ResourceKey, Vec<SvgPendingRef>>::new();
+    let mut svg_references = HashMap::<ResourceRow, Vec<SvgPendingRef>>::new();
     let mut smil_sources = HashSet::new();
-    let mut smil_references = HashMap::<ResourceKey, Vec<SmilPendingReference>>::new();
+    let mut smil_references = HashMap::<ResourceRow, Vec<SmilPendingReference>>::new();
     let mut accessibility_occurrences = Vec::new();
     let selected_ncx = publication
         .navigation()
         .ncx()
         .map(|document| document.path().clone());
     let mut secondary_ncx_keys = HashSet::new();
-    for declaration in resources.declarations().iter().filter(|declaration| {
+    for declaration in resources.declarations().filter(|declaration| {
         declaration
             .media_type()
             .is_some_and(crate::resource::MediaType::is_ncx)
     }) {
-        let DeclarationTarget::Resource(key) = declaration.target() else {
+        let DeclarationTargetRow::Resource(key) = declaration.target_row() else {
             continue;
         };
-        let Ok(record) = resources.resource(*key) else {
+        let Ok(record) = resources.resource((*key).into()) else {
             continue;
         };
         if record.local_path() != selected_ncx.as_ref() {
@@ -137,8 +137,7 @@ pub(crate) fn analyze<R: ResourceProvider>(
             .max_analyzed_resources()
             .is_some_and(|limit| analyzed_resources >= limit)
         {
-            let classification =
-                ResourceClassification::from_formats(semantic_formats_for(record, &resources));
+            let classification = ResourceClassification::from_formats(semantic_formats_for(record));
             let content_format = match &classification {
                 ResourceClassification::Identified(
                     format @ (SemanticFormat::Xhtml
@@ -357,7 +356,7 @@ pub(crate) fn analyze<R: ResourceProvider>(
     );
     let secondary_navigation = facts
         .iter()
-        .filter_map(|facts| secondary_ncx.get(&facts.resource())?.as_ref().ok())
+        .filter_map(|facts| secondary_ncx.get(&facts.resource_row())?.as_ref().ok())
         .cloned()
         .collect::<Vec<_>>();
     collect_secondary_ncx_references(

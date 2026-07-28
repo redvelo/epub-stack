@@ -15,7 +15,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -23,11 +23,14 @@ jobs:
         run: |
           version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "epub-stack") | .version')"
           test "$GITHUB_REF_NAME" = "v$version"
-      - run: cargo test --all-targets
-      - run: cargo check --target wasm32-unknown-unknown
-      - run: cargo doc --no-deps
+      - run: cargo test --all-features --all-targets
+      - run: cargo check --target wasm32-unknown-unknown --all-features
+      - run: cargo doc --all-features --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+      - run: cargo package
+      - run: cargo test --all-features --all-targets --manifest-path target/package/epub-stack-*/Cargo.toml
+      - run: cargo check --target wasm32-unknown-unknown --all-features --manifest-path target/package/epub-stack-*/Cargo.toml
       - run: cargo publish --dry-run
       - name: Authenticate with crates.io
         id: auth

@@ -7,8 +7,10 @@
 //! [`Package::to_normalized_xml`] when you want new OPF XML from the semantic model.
 //!
 //! String fields represented by [`EpubString`] trim leading and trailing Unicode whitespace and
-//! reject an empty result. Parsing and normalized generation preserve selected authored values,
-//! but do not provide a source-preserving XML round trip.
+//! reject an empty result. Manifest IDs and their relationship attributes instead preserve exact
+//! decoded source text and use XML whitespace only when validating or matching. Parsing and
+//! normalized generation preserve selected authored values, but do not provide a source-preserving
+//! XML round trip.
 
 /// EPUB package collection models.
 pub mod collection;
@@ -99,6 +101,12 @@ type Result<T> = std::result::Result<T, PackageError>;
 #[derive(
     Debug, PartialEq, Eq, Clone, Copy, Hash, strum_macros::Display, strum_macros::EnumString,
 )]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "kebab-case")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[strum(serialize_all = "kebab-case", ascii_case_insensitive)]
 /// A recognized EPUB rendition layout value.
 pub enum RenditionLayout {
@@ -113,6 +121,12 @@ pub enum RenditionLayout {
 #[derive(
     Debug, PartialEq, Eq, Clone, Copy, Hash, strum_macros::Display, strum_macros::EnumString,
 )]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "kebab-case")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[strum(serialize_all = "kebab-case", ascii_case_insensitive)]
 /// An authored `rendition:flow` value retained for historical EPUB inspection.
 ///
@@ -132,6 +146,12 @@ pub enum RenditionFlow {
 #[derive(
     Debug, PartialEq, Eq, Clone, Copy, Hash, strum_macros::Display, strum_macros::EnumString,
 )]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "kebab-case")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[strum(serialize_all = "kebab-case", ascii_case_insensitive)]
 /// An authored `rendition:orientation` value retained for historical EPUB inspection.
 ///
@@ -149,6 +169,12 @@ pub enum RenditionOrientation {
 #[derive(
     Debug, PartialEq, Eq, Clone, Copy, Hash, strum_macros::Display, strum_macros::EnumString,
 )]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "kebab-case")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[strum(serialize_all = "kebab-case", ascii_case_insensitive)]
 /// An authored `rendition:spread` value retained for historical EPUB inspection.
 ///
@@ -168,6 +194,12 @@ pub enum RenditionSpread {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 /// A parsed deprecated package `rendition:viewport` source value.
 ///
 /// EPUB 3.4 deprecates this package metadata control. The projection records positive, finite CSS
@@ -225,6 +257,9 @@ pub enum PackageError {
         /// The name of the rejected field.
         field: &'static str,
     },
+    /// A programmatic manifest ID or IDREF is invalid.
+    #[error(transparent)]
+    InvalidManifestId(#[from] InvalidManifestId),
     /// A manifest mutation would orphan a spine reference.
     #[error("Manifest item still referenced by spine: {id}")]
     ManifestItemInUse {
@@ -316,7 +351,101 @@ pub enum PackageError {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid manifest ID: {value:?}")]
+/// A manifest ID or IDREF that is not an XML `NCName` after XML whitespace handling.
+pub struct InvalidManifestId {
+    value: String,
+}
+
+impl InvalidManifestId {
+    /// Returns the rejected caller-supplied text.
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+pub(crate) fn normalize_manifest_id(value: &str) -> std::result::Result<&str, InvalidManifestId> {
+    let normalized = value.trim_matches(is_xml_whitespace);
+    if is_ncname(normalized) {
+        Ok(normalized)
+    } else {
+        Err(InvalidManifestId {
+            value: value.to_string(),
+        })
+    }
+}
+
+pub(crate) fn manifest_ids_equal(left: &str, right: &str) -> bool {
+    match (normalize_manifest_id(left), normalize_manifest_id(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn is_xml_whitespace(ch: char) -> bool {
+    matches!(ch, '\u{9}' | '\u{A}' | '\u{D}' | ' ')
+}
+
+fn is_ncname(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    is_ncname_start(first) && chars.all(is_ncname_char)
+}
+
+fn is_ncname_start(ch: char) -> bool {
+    matches!(ch,
+        'A'..='Z' | '_' | 'a'..='z'
+        | '\u{C0}'..='\u{D6}' | '\u{D8}'..='\u{F6}' | '\u{F8}'..='\u{2FF}'
+        | '\u{370}'..='\u{37D}' | '\u{37F}'..='\u{1FFF}'
+        | '\u{200C}'..='\u{200D}' | '\u{2070}'..='\u{218F}'
+        | '\u{2C00}'..='\u{2FEF}' | '\u{3001}'..='\u{D7FF}'
+        | '\u{F900}'..='\u{FDCF}' | '\u{FDF0}'..='\u{FFFD}'
+        | '\u{10000}'..='\u{EFFFF}'
+    )
+}
+
+fn is_ncname_char(ch: char) -> bool {
+    is_ncname_start(ch)
+        || matches!(ch,
+            '-' | '.' | '0'..='9' | '\u{B7}'
+            | '\u{300}'..='\u{36F}' | '\u{203F}'..='\u{2040}'
+        )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PackageSelection {
+    Absent,
+    Selected {
+        source: crate::resource::facts::SelectionSource,
+        declaration: usize,
+    },
+    UnresolvedAuthoredId {
+        source: crate::resource::facts::SelectionSource,
+        authored_id: String,
+    },
+    Ambiguous {
+        source: crate::resource::facts::SelectionSource,
+        candidates: Vec<usize>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PackageResourceSelections {
+    pub(crate) cover: PackageSelection,
+    pub(crate) epub_nav: PackageSelection,
+    pub(crate) ncx: PackageSelection,
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 /// The semantic projection of an OPF package document.
 ///
 /// The model owns all represented package data. Parsing preserves source order within modeled
@@ -404,7 +533,7 @@ impl Package {
                 "manifest item media-type",
             )?)
             .properties(vec![KnownManifestProperty::Nav.into()])
-            .build();
+            .build()?;
         manifest.add_item(nav_item)?;
 
         Ok(Self {
@@ -487,16 +616,38 @@ impl Package {
     /// Returns [`PackageError::ManifestItemInUse`] or [`PackageError::ManifestItemMissing`].
     /// Failure leaves the package unchanged.
     pub fn remove_manifest_item(&mut self, id: impl AsRef<str>) -> Result<()> {
-        let id = id.as_ref();
-        if self
-            .spine
-            .itemrefs()
-            .iter()
-            .any(|itemref| itemref.idref().is_some_and(|idref| idref == id))
-        {
+        let id = normalize_manifest_id(id.as_ref())?;
+        if self.spine.itemrefs().iter().any(|itemref| {
+            itemref
+                .idref()
+                .and_then(|idref| normalize_manifest_id(idref).ok())
+                == Some(id)
+        }) {
             return Err(PackageError::ManifestItemInUse { id: id.to_string() });
         }
         self.manifest.remove_item(id)
+    }
+
+    pub(crate) fn remove_manifest_item_at(&mut self, index: usize) -> Result<()> {
+        let Some(item) = self.manifest.items().get(index) else {
+            return Err(PackageError::ManifestItemMissing {
+                id: index.to_string(),
+            });
+        };
+        if let Some(id) = item.id().and_then(|id| normalize_manifest_id(id).ok())
+            && self.spine.itemrefs().iter().any(|itemref| {
+                itemref
+                    .idref()
+                    .and_then(|idref| normalize_manifest_id(idref).ok())
+                    == Some(id)
+            })
+        {
+            return Err(PackageError::ManifestItemInUse { id: id.to_string() });
+        }
+        self.manifest
+            .remove_item_at(index)
+            .expect("validated manifest index");
+        Ok(())
     }
 
     /// Replaces the first manifest item with `id` while preserving its list position.
@@ -506,17 +657,47 @@ impl Package {
     /// Returns an in-use, missing-item, duplicate-ID, or duplicate-href error. Failure leaves the
     /// package unchanged.
     pub fn replace_manifest_item(&mut self, id: impl AsRef<str>, item: ManifestItem) -> Result<()> {
-        let id = id.as_ref();
+        let id = normalize_manifest_id(id.as_ref())?;
         if item.id().is_some_and(|item_id| item_id != id)
-            && self
-                .spine
-                .itemrefs()
-                .iter()
-                .any(|itemref| itemref.idref().is_some_and(|idref| idref == id))
+            && self.spine.itemrefs().iter().any(|itemref| {
+                itemref
+                    .idref()
+                    .and_then(|idref| normalize_manifest_id(idref).ok())
+                    == Some(id)
+            })
         {
             return Err(PackageError::ManifestItemInUse { id: id.to_string() });
         }
         self.manifest.replace_item(id, item)
+    }
+
+    pub(crate) fn replace_manifest_item_at(
+        &mut self,
+        index: usize,
+        item: ManifestItem,
+    ) -> Result<()> {
+        let Some(existing) = self.manifest.items().get(index) else {
+            return Err(PackageError::ManifestItemMissing {
+                id: index.to_string(),
+            });
+        };
+        if !existing
+            .id()
+            .zip(item.id())
+            .is_some_and(|(existing_id, replacement_id)| {
+                manifest_ids_equal(existing_id, replacement_id)
+            })
+            && let Some(id) = existing.id().and_then(|id| normalize_manifest_id(id).ok())
+            && self.spine.itemrefs().iter().any(|itemref| {
+                itemref
+                    .idref()
+                    .and_then(|idref| normalize_manifest_id(idref).ok())
+                    == Some(id)
+            })
+        {
+            return Err(PackageError::ManifestItemInUse { id: id.to_string() });
+        }
+        self.manifest.replace_item_at(index, item)
     }
 
     /// Appends an owned itemref after confirming that its manifest target exists.
@@ -525,12 +706,11 @@ impl Package {
     ///
     /// Returns [`PackageError::ManifestItemMissing`] when `idref` has no manifest target.
     pub fn add_spine_itemref(&mut self, itemref: ItemRef) -> Result<()> {
-        if !self
-            .manifest
-            .items()
-            .iter()
-            .any(|item| item.id().is_some() && item.id() == itemref.idref())
-        {
+        if !self.manifest.items().iter().any(|item| {
+            item.id()
+                .zip(itemref.idref())
+                .is_some_and(|(id, idref)| manifest_ids_equal(id, idref))
+        }) {
             return Err(PackageError::ManifestItemMissing {
                 id: itemref.idref().map(ToString::to_string).unwrap_or_default(),
             });
@@ -564,12 +744,11 @@ impl Package {
     ///
     /// Returns a missing-manifest-target or out-of-range error. Failure is atomic.
     pub fn replace_spine_itemref_at(&mut self, index: usize, itemref: ItemRef) -> Result<()> {
-        if !self
-            .manifest
-            .items()
-            .iter()
-            .any(|item| item.id().is_some() && item.id() == itemref.idref())
-        {
+        if !self.manifest.items().iter().any(|item| {
+            item.id()
+                .zip(itemref.idref())
+                .is_some_and(|(id, idref)| manifest_ids_equal(id, idref))
+        }) {
             return Err(PackageError::ManifestItemMissing {
                 id: itemref.idref().map(ToString::to_string).unwrap_or_default(),
             });
@@ -599,47 +778,119 @@ impl Package {
     pub fn collections(&self) -> &[Collection] {
         self.collections.as_slice()
     }
-    /// Returns the cover-image manifest item using EPUB 3 then EPUB 2 metadata semantics.
+    /// Iterates manifest declarations whose valid ID equals `id`.
     ///
-    /// EPUB 3's `cover-image` manifest property takes precedence over EPUB 2 cover metadata.
-    pub fn cover_image_item(&self) -> Option<&ManifestItem> {
-        let v3 = self
-            .manifest
-            .items()
-            .iter()
-            .find(|item| item.has_property(KnownManifestProperty::CoverImage));
-        let cover_id = self.metadata.opf2_cover_id();
-        let v2 = cover_id.and_then(|cover_id| self.manifest_item_by_id(cover_id));
-        v3.or(v2)
+    /// Parsed invalid IDs remain in the manifest but never match this query.
+    pub fn manifest_items_by_id<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> std::result::Result<impl Iterator<Item = &'a ManifestItem> + 'a, InvalidManifestId> {
+        let id = normalize_manifest_id(id)?;
+        Ok(self.manifest.items().iter().filter(move |item| {
+            item.id()
+                .and_then(|item_id| normalize_manifest_id(item_id).ok())
+                == Some(id)
+        }))
     }
-    /// Returns the unique manifest item carrying the `nav` property.
-    ///
-    /// Returns `None` for zero or multiple matches.
-    pub fn nav_item(&self) -> Option<&ManifestItem> {
-        let mut matches = self
-            .manifest
-            .items()
-            .iter()
-            .filter(|item| item.has_property(KnownManifestProperty::Nav));
+
+    pub(crate) fn manifest_item_by_id(&self, id: &str) -> Option<&ManifestItem> {
+        let id = normalize_manifest_id(id).ok()?;
+        let mut matches = self.manifest.items().iter().filter(|item| {
+            item.id()
+                .and_then(|item_id| normalize_manifest_id(item_id).ok())
+                == Some(id)
+        });
         let item = matches.next()?;
         matches.next().is_none().then_some(item)
     }
-    /// Returns the unique manifest item referenced by the spine's EPUB 2 `toc` attribute.
-    pub fn ncx_item(&self) -> Option<&ManifestItem> {
-        let ncx_id = self.spine.toc()?;
-        self.manifest_item_by_id(ncx_id)
+
+    pub(crate) fn nav_item(&self) -> Option<&ManifestItem> {
+        match self.resource_selections().epub_nav {
+            PackageSelection::Selected { declaration, .. } => {
+                self.manifest.items().get(declaration)
+            }
+            _ => None,
+        }
     }
-    /// Returns the manifest item with `id` only when exactly one item matches.
-    ///
-    /// Duplicate authored IDs produce `None`.
-    pub fn manifest_item_by_id(&self, id: impl AsRef<str>) -> Option<&ManifestItem> {
-        let mut matches = self
-            .manifest
-            .items()
-            .iter()
-            .filter(|item| item.id().is_some_and(|item_id| item_id == id.as_ref()));
-        let item = matches.next()?;
-        matches.next().is_none().then_some(item)
+
+    pub(crate) fn ncx_item(&self) -> Option<&ManifestItem> {
+        match self.resource_selections().ncx {
+            PackageSelection::Selected { declaration, .. } => {
+                self.manifest.items().get(declaration)
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn resource_selections(&self) -> PackageResourceSelections {
+        use crate::resource::facts::SelectionSource;
+
+        let property_candidates = |property| {
+            self.manifest
+                .items()
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| item.has_property(property))
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>()
+        };
+        let select_candidates = |source, candidates: Vec<usize>| match candidates.as_slice() {
+            [] => PackageSelection::Absent,
+            [declaration] => PackageSelection::Selected {
+                source,
+                declaration: *declaration,
+            },
+            _ => PackageSelection::Ambiguous { source, candidates },
+        };
+        let select_id = |source, authored_id: &str| {
+            let candidates = normalize_manifest_id(authored_id)
+                .ok()
+                .map(|id| {
+                    self.manifest
+                        .items()
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, item)| {
+                            item.id()
+                                .and_then(|value| normalize_manifest_id(value).ok())
+                                == Some(id)
+                        })
+                        .map(|(index, _)| index)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if candidates.is_empty() {
+                PackageSelection::UnresolvedAuthoredId {
+                    source,
+                    authored_id: authored_id.to_string(),
+                }
+            } else {
+                select_candidates(source, candidates)
+            }
+        };
+
+        let epub_nav = select_candidates(
+            SelectionSource::EpubNavProperty,
+            property_candidates(KnownManifestProperty::Nav),
+        );
+        let cover_v3 = property_candidates(KnownManifestProperty::CoverImage);
+        let cover = if cover_v3.is_empty() {
+            self.metadata
+                .opf2_cover_id()
+                .map_or(PackageSelection::Absent, |id| {
+                    select_id(SelectionSource::Opf2CoverMetadata, id)
+                })
+        } else {
+            select_candidates(SelectionSource::CoverImageProperty, cover_v3)
+        };
+        let ncx = self.spine.toc().map_or(PackageSelection::Absent, |id| {
+            select_id(SelectionSource::SpineToc, id)
+        });
+        PackageResourceSelections {
+            cover,
+            epub_nav,
+            ncx,
+        }
     }
 }
 
@@ -654,6 +905,8 @@ impl Package {
     Hash,
     Default,
 )]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 /// The recognized major version of an OPF package document.
 ///
 /// Parsing accepts the configured `2`/`2.0` and `3`/`3.0` spellings; unknown source values are
@@ -661,9 +914,11 @@ impl Package {
 pub enum EpubVersion {
     /// EPUB 2.x, serialized as `2.0`.
     #[strum(to_string = "2.0", serialize = "2")]
+    #[cfg_attr(feature = "serde", serde(rename = "2.0"))]
     Two,
     /// EPUB 3.x, serialized as `3.0` and used as the construction default.
     #[strum(to_string = "3.0", serialize = "3")]
+    #[cfg_attr(feature = "serde", serde(rename = "3.0"))]
     #[default]
     Three,
 }
@@ -760,6 +1015,7 @@ mod test {
                 required_media_type("application/xhtml+xml", "manifest item media-type").unwrap(),
             )
             .build()
+            .unwrap()
     }
 
     #[test]
@@ -813,12 +1069,7 @@ mod test {
             .unwrap();
 
         assert_eq!(package.manifest_item_by_id("chapter"), Some(&replacement));
-        assert_eq!(
-            package.spine().itemrefs()[0]
-                .idref()
-                .map(EpubString::as_str),
-            Some("chapter")
-        );
+        assert_eq!(package.spine().itemrefs()[0].idref(), Some("chapter"));
     }
 
     #[test]
@@ -980,7 +1231,11 @@ mod test {
             creator.opf2_file_as().map(EpubString::as_str),
             Some("Auteur, A")
         );
-        let cover = package.cover_image_item().unwrap();
+        let cover = package
+            .manifest_items_by_id("cover")
+            .unwrap()
+            .next()
+            .unwrap();
         assert!(!cover.has_property(KnownManifestProperty::CoverImage));
     }
 

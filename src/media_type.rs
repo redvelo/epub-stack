@@ -31,6 +31,7 @@ pub(crate) enum MediaContainer {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "specta", derive(specta::Type), specta(transparent))]
 /// A manifest media type that supports both source inspection and MIME queries.
 ///
 /// The stored text has surrounding whitespace removed but otherwise preserves spelling and
@@ -39,7 +40,18 @@ pub(crate) enum MediaContainer {
 /// Direct comparison with `str` always compares the stored text.
 pub struct MediaType {
     raw: EpubString,
+    #[cfg_attr(feature = "specta", specta(skip))]
     parsed: Option<mime::Mime>,
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for MediaType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.raw())
+    }
 }
 
 impl MediaType {

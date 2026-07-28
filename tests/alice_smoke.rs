@@ -44,9 +44,9 @@ fn alice_real_publication_runs_the_public_open_read_and_analysis_workflow() {
         .resources()
         .find_unique_resource_by_id("titlepage.xhtml")
         .expect("Alice titlepage declaration");
-    let titlepage_key = titlepage.key();
+    let titlepage_key = titlepage.ordinal();
     let text = book
-        .resource(ResourceSelector::id("titlepage.xhtml").unwrap())
+        .resource(ResourceSelector::manifest_href("text/titlepage.xhtml").unwrap())
         .unwrap()
         .utf8_text()
         .unwrap();
@@ -72,7 +72,7 @@ fn alice_real_publication_runs_the_public_open_read_and_analysis_workflow() {
                 .expect("Alice illustration path must be canonical"),
         )
         .expect("Alice must contain illustration 2");
-    let illustration_key = illustration.key();
+    let illustration_key = illustration.ordinal();
     let illustration_content = analysis.content_for(illustration_key).unwrap();
     assert!(illustration_content.is_complete());
     assert!(
@@ -97,7 +97,7 @@ fn alice_real_publication_runs_the_public_open_read_and_analysis_workflow() {
         )
         .expect("Alice must contain chapter 1");
     let authored_use = analysis
-        .xhtml_media(chapter.key())
+        .xhtml_media(chapter.ordinal())
         .unwrap()
         .expect("Alice chapter 1 must have XHTML facts")
         .find(|occurrence| {

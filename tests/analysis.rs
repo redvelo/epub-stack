@@ -171,12 +171,12 @@ fn media_overlay_associations_preserve_reading_order_occurrences() {
     let associations = analysis.media_overlay_associations().collect::<Vec<_>>();
     assert_eq!(associations.len(), 2);
     assert_ne!(
-        associations[0].reading_order().key(),
-        associations[1].reading_order().key()
+        associations[0].reading_order().ordinal(),
+        associations[1].reading_order().ordinal()
     );
     assert_eq!(
-        associations[0].content_declaration().key(),
-        associations[1].content_declaration().key()
+        associations[0].content_declaration().ordinal(),
+        associations[1].content_declaration().ordinal()
     );
 }
 
@@ -335,8 +335,7 @@ fn assert_all_partitions(analysis: &epub_stack::PublicationAnalysis) {
     let indexed = analysis
         .resources()
         .resources()
-        .iter()
-        .map(|resource| resource.key())
+        .map(|resource| resource.ordinal())
         .collect::<Vec<_>>();
     let facts = analysis
         .resource_facts()
@@ -396,7 +395,7 @@ fn selected_ncx_contributes_one_complete_relationship_source() {
         .coverage()
         .relationships()
         .iter()
-        .filter(|coverage| coverage.source() == &RelationshipSource::Ncx(ncx.key()))
+        .filter(|coverage| coverage.source() == &RelationshipSource::Ncx(ncx.ordinal()))
         .collect::<Vec<_>>();
 
     assert_eq!(coverage.len(), 1);
@@ -432,26 +431,26 @@ fn declaration_and_reading_order_roots_preserve_exact_declaration_identity() {
         .resources()
         .find_unique_resource_by_id("primary")
         .unwrap()
-        .key();
+        .ordinal();
     let a = analysis
         .resources()
         .find_unique_resource_by_id("a")
         .unwrap()
-        .key();
+        .ordinal();
     let b = analysis
         .resources()
         .find_unique_resource_by_id("b")
         .unwrap()
-        .key();
+        .ordinal();
     let primary = analysis.resources().find_unique_by_id("primary").unwrap();
     let alias = analysis.resources().find_unique_by_id("alias").unwrap();
     let reading_order = analysis.resources().reading_order().collect::<Vec<_>>();
 
     let primary_closure = analysis
-        .dependency_closure(Root::Declaration(primary.key()))
+        .dependency_closure(Root::Declaration(primary.ordinal()))
         .unwrap();
     let alias_closure = analysis
-        .dependency_closure(Root::Declaration(alias.key()))
+        .dependency_closure(Root::Declaration(alias.ordinal()))
         .unwrap();
     assert_eq!(primary_closure.resources(), &[chapter, a]);
     assert_eq!(alias_closure.resources(), &[chapter, b]);
@@ -462,34 +461,37 @@ fn declaration_and_reading_order_roots_preserve_exact_declaration_identity() {
 
     assert_eq!(
         analysis
-            .dependency_closure(Root::ReadingOrderOccurrence(reading_order[0].key(),))
+            .dependency_closure(Root::ReadingOrderOccurrence(reading_order[0].ordinal(),))
             .unwrap(),
         primary_closure
     );
     assert_eq!(
         analysis
-            .dependency_closure(Root::ReadingOrderOccurrence(reading_order[1].key(),))
+            .dependency_closure(Root::ReadingOrderOccurrence(reading_order[1].ordinal(),))
             .unwrap(),
         alias_closure
     );
     assert_eq!(
-        analysis.dependency_closure(Root::ReadingOrderOccurrence(reading_order[2].key())),
-        Err(RootError::MissingReadingOrderIdref(reading_order[2].key()))
+        analysis.dependency_closure(Root::ReadingOrderOccurrence(reading_order[2].ordinal())),
+        Err(RootError::MissingReadingOrderIdref(
+            reading_order[2].ordinal()
+        ))
     );
     assert!(matches!(
-        analysis.dependency_closure(Root::ReadingOrderOccurrence(reading_order[3].key())),
+        analysis.dependency_closure(Root::ReadingOrderOccurrence(reading_order[3].ordinal())),
         Err(RootError::MissingManifestId { root, idref })
-            if root == reading_order[3].key() && idref.as_str() == "missing"
+            if root == reading_order[3].ordinal() && idref.as_str() == "missing"
     ));
     let duplicate_candidates = analysis
         .resources()
         .declarations_with_id("duplicate")
-        .map(|declaration| declaration.key())
+        .unwrap()
+        .map(|declaration| declaration.ordinal())
         .collect::<Vec<_>>();
     assert_eq!(
-        analysis.dependency_closure(Root::ReadingOrderOccurrence(reading_order[4].key())),
+        analysis.dependency_closure(Root::ReadingOrderOccurrence(reading_order[4].ordinal())),
         Err(RootError::AmbiguousManifestId {
-            root: reading_order[4].key(),
+            root: reading_order[4].ordinal(),
             candidates: duplicate_candidates,
         })
     );
@@ -517,9 +519,8 @@ fn coverage_partitions_have_stable_expected_universes_for_every_budget() {
     let local = baseline
         .resources()
         .resources()
-        .iter()
         .filter(|resource| resource.local_path().is_some())
-        .map(|resource| resource.key())
+        .map(|resource| resource.ordinal())
         .collect::<Vec<_>>();
     let total_bytes = PACKAGE.len() as u64 + chapter.len() as u64 + blob.len() as u64;
     let largest = [PACKAGE.len(), chapter.len(), blob.len()]
@@ -530,7 +531,7 @@ fn coverage_partitions_have_stable_expected_universes_for_every_budget() {
         .resources()
         .find_unique_resource_by_id("remote")
         .unwrap()
-        .key();
+        .ordinal();
 
     assert_all_partitions(&baseline);
     assert_coverage(baseline.coverage().classification(), 3, 3, &[], &[]);
@@ -546,7 +547,7 @@ fn coverage_partitions_have_stable_expected_universes_for_every_budget() {
         .resources()
         .find_unique_resource_by_id("chapter")
         .unwrap()
-        .key();
+        .ordinal();
     assert_eq!(baseline.coverage().fragments().expected(), &[chapter_key]);
     assert_eq!(
         baseline
@@ -743,7 +744,7 @@ fn search_entries_borrow_facts_and_keep_a_detached_text_snapshot() {
         .unwrap();
 
     assert_eq!(entry.text().unwrap(), "Bonjour monde");
-    assert_eq!(entry.facts().resource(), entry.resource().key());
+    assert_eq!(entry.facts().resource(), entry.resource().ordinal());
     assert!(matches!(
         entry.chunk().kind(),
         TextChunkKind::Heading { .. }
@@ -830,7 +831,7 @@ fn standalone_svg_foreign_object_exposes_nested_xhtml_and_resolved_links()
     .analyze();
     let page = analysis.resources().find_unique_resource_by_id("page")?;
     let facts = analysis
-        .content_for(page.key())?
+        .content_for(page.ordinal())?
         .value()
         .and_then(ContentFacts::as_svg)
         .ok_or("missing SVG facts")?;
@@ -843,7 +844,7 @@ fn standalone_svg_foreign_object_exposes_nested_xhtml_and_resolved_links()
     assert_eq!(foreign.xhtml().scripts().len(), 1);
 
     let references = analysis
-        .references_from_resource(page.key())?
+        .references_from_resource(page.ordinal())?
         .collect::<Vec<_>>();
     assert_eq!(references.len(), 2);
     for (reference, (declared, role, element, attribute, target)) in references.into_iter().zip([
@@ -884,12 +885,12 @@ fn standalone_svg_foreign_object_exposes_nested_xhtml_and_resolved_links()
         );
     }
     assert!(analysis.coverage().relationships().iter().any(|coverage| {
-        matches!(coverage.source(), RelationshipSource::Svg(key) if *key == page.key())
+        matches!(coverage.source(), RelationshipSource::Svg(key) if *key == page.ordinal())
             && coverage.state() == &CoverageState::Complete
     }));
     let unknown = analysis.resources().find_unique_resource_by_id("unknown")?;
     assert!(analysis.coverage().relationships().iter().any(|coverage| {
-        matches!(coverage.source(), RelationshipSource::Svg(key) if *key == unknown.key())
+        matches!(coverage.source(), RelationshipSource::Svg(key) if *key == unknown.ordinal())
             && coverage.state() == &CoverageState::Partial(AnalysisIssue::Unsupported)
     }));
 
@@ -922,7 +923,7 @@ fn curated_content_facts_expose_semantic_variants_and_joined_optional_references
         .resources()
         .find_unique_resource_by_id("chapter")
         .unwrap()
-        .key();
+        .ordinal();
     let media = analysis
         .xhtml_media(chapter)
         .unwrap()
@@ -1043,7 +1044,7 @@ fn responsive_media_and_submit_controls_keep_exact_public_reference_joins() {
         .resources()
         .find_unique_resource_by_id("chapter")
         .unwrap()
-        .key();
+        .ordinal();
     let media = analysis
         .xhtml_media(chapter)
         .unwrap()

@@ -57,13 +57,13 @@ pub(super) fn reject_manifest_resource_structural_removal<R: ResourceProvider>(
 
 pub(super) fn reject_shared_manifest_resource_path(
     package: &Package,
-    selected_id: &str,
+    selected_index: usize,
     resource_path: &EpubPath,
     package_path: &EpubPath,
     allow_nav_alias: bool,
 ) -> Result<()> {
-    for item in package.manifest().items() {
-        if item.id().is_some_and(|id| id == selected_id) {
+    for (index, item) in package.manifest().items().iter().enumerate() {
+        if index == selected_index {
             continue;
         }
         if allow_nav_alias && item.has_property(KnownManifestProperty::Nav) {
@@ -306,19 +306,37 @@ pub(super) fn remove_manifest_item_from_package_xml(
     Ok(())
 }
 
-pub(super) fn replace_manifest_item_in_package_xml(
+pub(super) fn remove_manifest_item_at_from_package_xml(
     xot: &mut Xot,
     doc: Node,
-    id: &str,
+    index: usize,
+    package_path: &EpubPath,
+) -> Result<()> {
+    let item = find_manifest_item_node_at(xot, doc, index, package_path)?.ok_or_else(|| {
+        EditError::StructuralXml {
+            path: package_path.clone(),
+            message: format!("manifest item at index {index} not found in package XML"),
+        }
+    })?;
+    xot.remove(item)
+        .map_err(|source| structural_xml_operation(package_path.clone(), source))?;
+    Ok(())
+}
+
+pub(super) fn replace_manifest_item_at_in_package_xml(
+    xot: &mut Xot,
+    doc: Node,
+    index: usize,
     item: &ManifestItem,
     package_path: &EpubPath,
 ) -> Result<()> {
-    let item_node = find_manifest_item_node(xot, doc, id, package_path)?.ok_or_else(|| {
-        EditError::StructuralXml {
-            path: package_path.clone(),
-            message: format!("manifest item {id} not found in package XML"),
-        }
-    })?;
+    let item_node =
+        find_manifest_item_node_at(xot, doc, index, package_path)?.ok_or_else(|| {
+            EditError::StructuralXml {
+                path: package_path.clone(),
+                message: format!("manifest item at index {index} not found in package XML"),
+            }
+        })?;
     set_manifest_item_attributes(xot, item_node, item)
 }
 
@@ -1032,10 +1050,26 @@ pub(super) fn find_manifest_item_node(
                 let (name, namespace) = xot.name_ns_str(element.name());
                 name == "item"
                     && namespace == OPF_NS
-                    && id_name.is_some_and(|name| xot.get_attribute(*child, name) == Some(id))
+                    && id_name.is_some_and(|name| {
+                        xot.get_attribute(*child, name)
+                            .is_some_and(|authored_id| manifest_ids_equal(authored_id, id))
+                    })
             })
             .unwrap_or(false)
     }))
+}
+
+pub(super) fn find_manifest_item_node_at(
+    xot: &Xot,
+    doc: Node,
+    index: usize,
+    package_path: &EpubPath,
+) -> Result<Option<Node>> {
+    let manifest = find_opf_package_child(xot, doc, "manifest", package_path)?;
+    Ok(xot
+        .children(manifest)
+        .filter(|child| is_opf_element(xot, *child, "item"))
+        .nth(index))
 }
 
 pub(super) fn find_opf_child(xot: &Xot, parent: Node, local_name: &str) -> Option<Node> {

@@ -312,6 +312,12 @@ pub(super) fn serialize_rootfiles<'a>(
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 /// A package-document rendition declared by `META-INF/container.xml`.
 ///
 /// The path, media query, language, and label have surrounding whitespace trimmed, and empty
@@ -527,6 +533,12 @@ impl Rootfile {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, strum_macros::Display, strum_macros::EnumString)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "lowercase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[strum(serialize_all = "lowercase", ascii_case_insensitive)]
 /// A recognized OCF `rendition:accessMode` value.
 pub enum RenditionAccessMode {

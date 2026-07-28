@@ -14,6 +14,8 @@ pub struct EpubStringEmpty;
 /// the trimmed value. Interior whitespace is unchanged. This is whitespace handling, not
 /// language-tag, identifier, URI, case, or Unicode normalization.
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize), serde(transparent))]
+#[cfg_attr(feature = "specta", derive(specta::Type), specta(transparent))]
 pub struct EpubString(String);
 
 impl EpubString {

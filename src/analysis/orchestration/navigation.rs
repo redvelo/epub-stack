@@ -4,17 +4,17 @@ use super::*;
 pub(super) fn collect_secondary_ncx_references(
     resources: &ResourceIndex,
     facts: &[ResourceFacts],
-    mut results: HashMap<ResourceKey, std::result::Result<NavigationDocument, AnalysisIssue>>,
+    mut results: HashMap<ResourceRow, std::result::Result<NavigationDocument, AnalysisIssue>>,
     references: &mut Vec<AuthoredReference>,
     coverage: &mut Vec<RelationshipCoverage>,
 ) {
     let mut seen = HashSet::new();
-    for declaration in resources.declarations().iter().filter(|declaration| {
+    for declaration in resources.declarations().filter(|declaration| {
         declaration
             .media_type()
             .is_some_and(crate::resource::MediaType::is_ncx)
     }) {
-        let DeclarationTarget::Resource(key) = declaration.target() else {
+        let DeclarationTargetRow::Resource(key) = declaration.target_row() else {
             continue;
         };
         if !seen.insert(*key) {
@@ -29,12 +29,12 @@ pub(super) fn collect_secondary_ncx_references(
                     &document, *key, resources, facts, references, None,
                 );
                 coverage.push(RelationshipCoverage::new(
-                    RelationshipSource::Ncx(*key),
+                    RelationshipSource::Ncx((*key).into()),
                     CoverageState::Complete,
                 ));
             }
             Err(issue) => coverage.push(RelationshipCoverage::new(
-                RelationshipSource::Ncx(*key),
+                RelationshipSource::Ncx((*key).into()),
                 CoverageState::Unavailable(issue),
             )),
         }
@@ -46,7 +46,7 @@ pub(super) fn collect_navigation_references(
     resources: &ResourceIndex,
     facts: &[ResourceFacts],
     xhtml_pending: &HashMap<
-        ResourceKey,
+        ResourceRow,
         (Vec<LinkFact>, Option<AuthoredHref>, XhtmlLinkAssociations),
     >,
     references: &mut Vec<AuthoredReference>,
@@ -63,21 +63,21 @@ pub(super) fn collect_navigation_references(
     };
     let (source, state, authored_base) = match document.source() {
         NavigationSource::Ncx => (
-            RelationshipSource::Ncx(record.key()),
+            RelationshipSource::Ncx(record.ordinal()),
             CoverageState::Complete,
             None,
         ),
         NavigationSource::EpubNav => {
             let outcome = facts
                 .iter()
-                .find(|facts| facts.resource() == record.key())
+                .find(|facts| facts.resource_row() == record.key())
                 .map(ResourceFacts::content);
             let authored_base = xhtml_pending
                 .get(&record.key())
                 .and_then(|(_, authored_base, _)| authored_base.as_ref());
             match outcome {
                 Some(AnalysisOutcome::Complete(content)) => (
-                    RelationshipSource::Navigation(record.key()),
+                    RelationshipSource::Navigation(record.ordinal()),
                     CoverageState::Complete,
                     content.as_xhtml().and(authored_base),
                 ),
@@ -85,20 +85,20 @@ pub(super) fn collect_navigation_references(
                     value: content,
                     issue,
                 }) => (
-                    RelationshipSource::Navigation(record.key()),
+                    RelationshipSource::Navigation(record.ordinal()),
                     CoverageState::Partial(*issue),
                     content.as_xhtml().and(authored_base),
                 ),
                 Some(AnalysisOutcome::Unavailable(issue)) => {
                     coverage.push(RelationshipCoverage::new(
-                        RelationshipSource::Navigation(record.key()),
+                        RelationshipSource::Navigation(record.ordinal()),
                         CoverageState::Unavailable(*issue),
                     ));
                     return;
                 }
                 Some(AnalysisOutcome::NotApplicable) | None => {
                     coverage.push(RelationshipCoverage::new(
-                        RelationshipSource::Navigation(record.key()),
+                        RelationshipSource::Navigation(record.ordinal()),
                         CoverageState::Unavailable(AnalysisIssue::Unsupported),
                     ));
                     return;
@@ -119,7 +119,7 @@ pub(super) fn collect_navigation_references(
 
 fn collect_navigation_document_references(
     document: &NavigationDocument,
-    source: ResourceKey,
+    source: ResourceRow,
     resources: &ResourceIndex,
     facts: &[ResourceFacts],
     references: &mut Vec<AuthoredReference>,
@@ -183,7 +183,7 @@ fn collect_navigation_document_references(
 pub(super) fn navigation_reference_indices(
     links: &[LinkFact],
     references: &[AuthoredReference],
-    source: ResourceKey,
+    source: ResourceRow,
 ) -> Vec<Option<usize>> {
     let navigation = references
         .iter()
@@ -193,7 +193,7 @@ pub(super) fn navigation_reference_indices(
             let AuthoredReference::Href(reference) = reference else {
                 return None;
             };
-            (reference.source() == source
+            (reference.source() == source.into()
                 && matches!(
                     reference.role(),
                     HrefRole::Toc | HrefRole::PageList | HrefRole::Landmark

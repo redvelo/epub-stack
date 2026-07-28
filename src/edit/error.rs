@@ -33,6 +33,13 @@ pub enum StructuralResourceKind {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum EditError {
+    /// The staged resource topology cannot be represented by public ordinals.
+    #[error("staged resource topology cannot be indexed: {source}")]
+    ResourceIndex {
+        /// The topology overflow.
+        #[from]
+        source: crate::resource::ResourceIndexError,
+    },
     /// Touched embedded annotations could not be loaded into a bundle.
     #[error("embedded annotations could not be loaded: {source}")]
     EmbeddedAnnotations {

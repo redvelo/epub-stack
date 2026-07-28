@@ -29,6 +29,7 @@ use crate::{
         DC_NS, EpubVersion, LINK, META, OPF_NS, Package, PackageError,
         legacy::ReferenceType,
         manifest::{KnownManifestProperty, ManifestItem},
+        manifest_ids_equal,
         metadata::{Element, Meta, MetaPropertyToken, MetadataElement, MetadataLink},
         spine::{ItemRef, Linear},
     },
@@ -391,13 +392,14 @@ use xml::*;
 fn unique_manifest_item<'a>(
     package: &'a Package,
     selector: &ManifestItemSelector,
-) -> Result<&'a ManifestItem> {
+) -> Result<(usize, &'a ManifestItem)> {
     let errors = manifest_selector_errors(selector);
     let matches = package
         .manifest()
         .items()
         .iter()
-        .filter(|item| manifest_item_matches_selector(item, selector))
+        .enumerate()
+        .filter(|(_, item)| manifest_item_matches_selector(item, selector))
         .collect::<Vec<_>>();
     match matches.as_slice() {
         [item] => Ok(*item),
@@ -436,18 +438,20 @@ impl From<&NavInsertionResolved> for NavInsertionEditTarget {
 
 fn manifest_item_matches_selector(item: &ManifestItem, selector: &ManifestItemSelector) -> bool {
     match selector {
-        ManifestItemSelector::Id(id) => item.id() == Some(id),
+        ManifestItemSelector::Id(id) => item
+            .id()
+            .is_some_and(|item_id| manifest_ids_equal(item_id, id)),
         ManifestItemSelector::Href(href) => item.href().as_ref() == Some(href),
         ManifestItemSelector::AuthoredHref(href) => item.authored_href() == Some(href),
     }
 }
 
-fn selected_manifest_item_id(item: &ManifestItem) -> Result<&EpubString> {
+fn selected_manifest_item_id(item: &ManifestItem) -> Result<&str> {
     item.id()
         .ok_or_else(|| ManifestItemLookupError::MissingId.into())
 }
 
-fn required_manifest_item_id(item: &ManifestItem) -> Result<&EpubString> {
+fn required_manifest_item_id(item: &ManifestItem) -> Result<&str> {
     item.id().ok_or_else(|| {
         PackageError::EmptyField {
             field: "manifest item id",
@@ -456,7 +460,7 @@ fn required_manifest_item_id(item: &ManifestItem) -> Result<&EpubString> {
     })
 }
 
-fn required_spine_itemref_idref(itemref: &ItemRef) -> Result<&EpubString> {
+fn required_spine_itemref_idref(itemref: &ItemRef) -> Result<&str> {
     itemref.idref().ok_or_else(|| {
         PackageError::EmptyField {
             field: "itemref idref",
@@ -789,7 +793,9 @@ fn spine_itemref_matches_selector(
     selector: &SpineItemRefSelector,
 ) -> bool {
     match selector {
-        SpineItemRefSelector::Idref(idref) => itemref.idref() == Some(idref),
+        SpineItemRefSelector::Idref(idref) => itemref
+            .idref()
+            .is_some_and(|itemref_id| manifest_ids_equal(itemref_id, idref)),
         SpineItemRefSelector::Index(expected) => index == *expected,
     }
 }

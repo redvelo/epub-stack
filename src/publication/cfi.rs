@@ -5,8 +5,7 @@ use crate::{
         ResolvedCfi, ResolvedCfiLocation, ResolvedCfiPoint, ResolvedCfiRange, Step,
     },
     resource::{
-        ReadingOrderTarget, ResourceAddress, ResourceLookupCandidate, ResourceLookupError,
-        ResourceSelector,
+        ReadingOrderTargetRow, ResourceAddress, ResourceLookupError,
         provider::{ProviderReadError, ResourceProvider},
     },
     xml::decode_xml,
@@ -186,42 +185,39 @@ impl<R: ResourceProvider> Epub<R> {
             .reading_order()
             .nth(page)
             .ok_or(CfiResolveError::InvalidLocation)?;
-        let record = match reading_order.target() {
-            ReadingOrderTarget::Declaration {
+        let record = match reading_order.target_row() {
+            ReadingOrderTargetRow::Declaration {
                 resource: Some(resource),
                 ..
             } => self
                 .resources
-                .resource(*resource)
+                .resource((*resource).into())
                 .map_err(|_| CfiResolveError::InvalidLocation)?,
-            ReadingOrderTarget::Declaration {
+            ReadingOrderTargetRow::Declaration {
                 declaration,
                 resource: None,
             } => {
                 return Err(CfiResolveError::ResourceLookup {
-                    source: ResourceLookupError::UnresolvedDeclaration(*declaration),
+                    source: ResourceLookupError::UnresolvedDeclaration(
+                        crate::resource::ManifestOrdinal::from_index(declaration.0),
+                    ),
                 });
             }
-            ReadingOrderTarget::MissingIdref => return Err(CfiResolveError::InvalidLocation),
-            ReadingOrderTarget::MissingManifestId => {
+            ReadingOrderTargetRow::MissingIdref => return Err(CfiResolveError::InvalidLocation),
+            ReadingOrderTargetRow::MissingManifestId => {
                 return Err(CfiResolveError::InvalidLocation);
             }
-            ReadingOrderTarget::AmbiguousManifestId { candidates } => {
-                let selector = ResourceSelector::id(
-                    reading_order
-                        .idref()
-                        .map(|idref| idref.as_str())
-                        .unwrap_or_default(),
-                )
-                .ok_or(CfiResolveError::InvalidLocation)?;
+            ReadingOrderTargetRow::AmbiguousManifestId { candidates } => {
+                let id = reading_order
+                    .idref()
+                    .map(|idref| idref.as_str())
+                    .unwrap_or_default();
                 return Err(CfiResolveError::ResourceLookup {
-                    source: ResourceLookupError::Ambiguous {
-                        selector,
-                        candidates: candidates
-                            .iter()
-                            .copied()
-                            .map(ResourceLookupCandidate::Manifest)
-                            .collect(),
+                    source: ResourceLookupError::AmbiguousManifestId {
+                        id: crate::package::normalize_manifest_id(id)
+                            .map_err(|_| CfiResolveError::InvalidLocation)?
+                            .to_string(),
+                        candidates: candidates.iter().copied().map(|row| row.into()).collect(),
                     },
                 });
             }

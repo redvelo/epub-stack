@@ -6,8 +6,8 @@
 //! unavailable because of limits, missing bytes, or unsupported formats.
 //!
 //! Building a full analysis may read every selected publication resource, subject to
-//! [`AnalysisLimits`]. The result is an owned snapshot: its resource and occurrence keys work
-//! only with that snapshot, and after the publication is edited it still describes the version
+//! [`AnalysisLimits`]. The result is an owned snapshot: its ordinals and borrowed graph views
+//! describe only that snapshot, and after the publication is edited it still describes the version
 //! that was analyzed. Results contain the modeled facts exposed by these APIs, not complete
 //! source bytes or unknown document structure.
 
@@ -27,7 +27,9 @@ use crate::accessibility::{
 use crate::content::text::TextStream;
 use crate::content::{ContentFacts, XhtmlFacts};
 use crate::media_overlay::{MediaOverlayFacts, SmilNodeRef};
-use crate::resource::{IndexKeyError, ManifestKey, ResourceIndex, ResourceKey};
+use crate::resource::{
+    IndexRowError, OrdinalOutOfBounds, ResourceIndex, ResourceOrdinal, ResourceRow,
+};
 use coverage::Coverage;
 use fingerprint::Blake3Hash;
 use reference::{AuthoredReference, HrefReference, XhtmlReferenceIndex};
@@ -248,7 +250,7 @@ impl ResourceClassification {
 /// Extracted content, inspection metadata, classification, and fingerprint for one resource.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceFacts {
-    resource: ResourceKey,
+    resource: ResourceRow,
     classification: AnalysisOutcome<ResourceClassification>,
     fingerprint: AnalysisOutcome<Blake3Hash>,
     inspection: AnalysisOutcome<inspection::ResourceInspection>,
@@ -256,8 +258,12 @@ pub struct ResourceFacts {
 }
 
 impl ResourceFacts {
-    /// Returns the key of the resource in this analysis snapshot.
-    pub fn resource(&self) -> ResourceKey {
+    /// Returns the resource position in this analysis snapshot.
+    pub fn resource(&self) -> ResourceOrdinal {
+        ResourceOrdinal::from_index(self.resource.0)
+    }
+
+    pub(crate) fn resource_row(&self) -> ResourceRow {
         self.resource
     }
 
@@ -288,7 +294,7 @@ impl ResourceFacts {
     #[allow(clippy::too_many_arguments, dead_code)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        resource: ResourceKey,
+        resource: ResourceRow,
         classification: AnalysisOutcome<ResourceClassification>,
         fingerprint: AnalysisOutcome<Blake3Hash>,
         inspection: AnalysisOutcome<inspection::ResourceInspection>,
@@ -309,20 +315,20 @@ impl ResourceFacts {
 /// Use its query methods to connect extracted text and media to resource records, inspect broken
 /// links and dependencies, and enumerate accessibility and media-overlay observations. The value
 /// remains usable after an edit, but it continues to describe the publication version from which
-/// it was built. Keys obtained from it must be used only with the same snapshot.
+/// it was built. Ordinals obtained from it must be interpreted against the same snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicationAnalysis {
     limits: AnalysisLimits,
     resources: ResourceIndex,
     resource_facts: Vec<ResourceFacts>,
-    resource_fact_slots: HashMap<ResourceKey, usize>,
+    resource_fact_slots: HashMap<ResourceRow, usize>,
     references: Vec<AuthoredReference>,
-    media_overlay_references: HashMap<ManifestKey, usize>,
-    xhtml_references: HashMap<ResourceKey, XhtmlReferenceIndex>,
+    media_overlay_references: HashMap<crate::resource::ManifestOrdinal, usize>,
+    xhtml_references: HashMap<ResourceRow, XhtmlReferenceIndex>,
     media_overlays: MediaOverlayFacts,
     accessibility: AccessibilityFacts,
     coverage: Coverage,
-    fingerprint_index: HashMap<Blake3Hash, Vec<ResourceKey>>,
+    fingerprint_index: HashMap<Blake3Hash, Vec<ResourceRow>>,
     duplicate_fingerprints: Vec<Blake3Hash>,
 }
 
@@ -334,7 +340,7 @@ impl PublicationAnalysis {
 
     /// Returns the resources and package declarations represented by this snapshot.
     ///
-    /// Keys from this index must be used only with queries on the same snapshot.
+    /// Ordinals from this index must be used only with queries on the same snapshot.
     pub fn resources(&self) -> &ResourceIndex {
         &self.resources
     }
@@ -344,35 +350,64 @@ impl PublicationAnalysis {
         self.resource_facts.iter()
     }
 
-    /// Returns facts for a key from this snapshot's resource index.
-    pub fn facts_for(&self, key: ResourceKey) -> Result<&ResourceFacts, IndexKeyError> {
-        self.resources.resource(key)?;
+    /// Returns facts for a resource position in this snapshot.
+    pub fn facts_for(
+        &self,
+        ordinal: ResourceOrdinal,
+    ) -> Result<&ResourceFacts, OrdinalOutOfBounds> {
+        self.facts_for_row(ResourceRow(ordinal.index()))
+            .map_err(|_| OrdinalOutOfBounds)
+    }
+
+    pub(crate) fn facts_for_row(&self, key: ResourceRow) -> Result<&ResourceFacts, IndexRowError> {
+        self.resources.validate_resource_row(key)?;
         self.resource_fact_slots
             .get(&key)
             .and_then(|slot| self.resource_facts.get(*slot))
-            .ok_or(IndexKeyError::UnknownKey)
+            .ok_or(IndexRowError)
     }
 
     /// Returns the semantic content outcome for a snapshot resource.
     pub fn content_for(
         &self,
-        key: ResourceKey,
-    ) -> Result<&AnalysisOutcome<ContentFacts>, IndexKeyError> {
-        self.facts_for(key).map(ResourceFacts::content)
+        ordinal: ResourceOrdinal,
+    ) -> Result<&AnalysisOutcome<ContentFacts>, OrdinalOutOfBounds> {
+        self.facts_for(ordinal).map(ResourceFacts::content)
+    }
+
+    pub(crate) fn content_for_row(
+        &self,
+        key: ResourceRow,
+    ) -> Result<&AnalysisOutcome<ContentFacts>, IndexRowError> {
+        self.facts_for_row(key).map(ResourceFacts::content)
     }
 
     /// Returns the byte-inspection outcome for a snapshot resource.
     pub fn inspection_for(
         &self,
-        key: ResourceKey,
-    ) -> Result<&AnalysisOutcome<inspection::ResourceInspection>, IndexKeyError> {
-        self.facts_for(key).map(ResourceFacts::inspection)
+        ordinal: ResourceOrdinal,
+    ) -> Result<&AnalysisOutcome<inspection::ResourceInspection>, OrdinalOutOfBounds> {
+        self.facts_for(ordinal).map(ResourceFacts::inspection)
     }
 
     /// Returns the XHTML text stream when complete or partial XHTML facts are available.
-    pub fn text_stream_for(&self, key: ResourceKey) -> Result<Option<&TextStream>, IndexKeyError> {
+    pub fn text_stream_for(
+        &self,
+        ordinal: ResourceOrdinal,
+    ) -> Result<Option<&TextStream>, OrdinalOutOfBounds> {
         Ok(self
-            .content_for(key)?
+            .content_for(ordinal)?
+            .value()
+            .and_then(ContentFacts::as_xhtml)
+            .map(XhtmlFacts::text_stream))
+    }
+
+    pub(crate) fn text_stream_for_row(
+        &self,
+        key: ResourceRow,
+    ) -> Result<Option<&TextStream>, IndexRowError> {
+        Ok(self
+            .content_for_row(key)?
             .value()
             .and_then(ContentFacts::as_xhtml)
             .map(XhtmlFacts::text_stream))
@@ -424,18 +459,18 @@ impl PublicationAnalysis {
                 observation,
                 resource: observation
                     .resource_key()
-                    .and_then(|key| self.resources.resource(key).ok()),
+                    .and_then(|key| self.resources.resource(key.into()).ok()),
             });
         let content = self.accessibility.content_occurrences().map(|occurrence| {
             AccessibilityObservationRef::Content {
                 resource: self
                     .resources
-                    .resource(occurrence.resource())
+                    .resource(occurrence.resource().into())
                     .expect("accessibility content resource must remain valid"),
                 fact: occurrence.fact(),
             }
         });
-        let resource_facts = || self.resources.resources().iter().zip(&self.resource_facts);
+        let resource_facts = || self.resources.resources().zip(&self.resource_facts);
         let structure = resource_facts().flat_map(|(resource, facts)| {
             let structure = match facts.content().value() {
                 Some(ContentFacts::Xhtml(facts)) => facts.structure(),
@@ -485,17 +520,18 @@ impl PublicationAnalysis {
     /// Returns `Ok(None)` when no complete or partial SMIL facts are available.
     pub fn smil_roots_for(
         &self,
-        resource: ResourceKey,
-    ) -> Result<Option<impl Iterator<Item = SmilNodeRef<'_>>>, IndexKeyError> {
+        ordinal: ResourceOrdinal,
+    ) -> Result<Option<impl Iterator<Item = SmilNodeRef<'_>>>, OrdinalOutOfBounds> {
+        let resource = ResourceRow(ordinal.index());
         let facts = self
-            .content_for(resource)?
+            .content_for_row(resource)
+            .map_err(|_| OrdinalOutOfBounds)?
             .value()
             .and_then(ContentFacts::as_smil);
         Ok(facts.map(move |facts| {
-            facts
-                .roots()
-                .iter()
-                .filter_map(move |node| SmilNodeRef::new(resource, *node, facts, &self.references))
+            facts.roots().iter().filter_map(move |node| {
+                SmilNodeRef::new(resource.into(), *node, facts, &self.references)
+            })
         }))
     }
 
@@ -510,7 +546,7 @@ impl PublicationAnalysis {
         resources: ResourceIndex,
         resource_facts: Vec<ResourceFacts>,
         references: Vec<AuthoredReference>,
-        xhtml_references: HashMap<ResourceKey, XhtmlReferenceIndex>,
+        xhtml_references: HashMap<ResourceRow, XhtmlReferenceIndex>,
         media_overlays: MediaOverlayFacts,
         accessibility: AccessibilityFacts,
         coverage: Coverage,
@@ -519,14 +555,13 @@ impl PublicationAnalysis {
         assert!(
             resources
                 .resources()
-                .iter()
                 .zip(&resource_facts)
-                .all(|(resource, facts)| resource.key() == facts.resource())
+                .all(|(resource, facts)| resource.key() == facts.resource_row())
         );
         let resource_fact_slots = resource_facts
             .iter()
             .enumerate()
-            .map(|(slot, facts)| (facts.resource(), slot))
+            .map(|(slot, facts)| (facts.resource_row(), slot))
             .collect();
         let media_overlay_references = references
             .iter()
@@ -540,13 +575,13 @@ impl PublicationAnalysis {
                 AuthoredReference::Href(_) | AuthoredReference::Manifest(_) => None,
             })
             .collect();
-        let mut fingerprint_index = HashMap::<Blake3Hash, Vec<ResourceKey>>::new();
+        let mut fingerprint_index = HashMap::<Blake3Hash, Vec<ResourceRow>>::new();
         for facts in &resource_facts {
             if let AnalysisOutcome::Complete(hash) = facts.fingerprint() {
                 fingerprint_index
                     .entry(*hash)
                     .or_default()
-                    .push(facts.resource());
+                    .push(facts.resource_row());
             }
         }
         let duplicate_fingerprints = resource_facts

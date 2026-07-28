@@ -1,23 +1,23 @@
 //! Completeness of extracted links, content, inspection metadata, and fingerprints.
 //!
 //! Use [`Coverage`] to distinguish an empty result from analysis that could not inspect all
-//! expected resources. Coverage belongs to one analysis snapshot, and its resource keys must be
+//! expected resources. Coverage belongs to one analysis snapshot, and its resource ordinals must be
 //! used only with that snapshot.
 
 use super::AnalysisIssue;
-use crate::resource::ResourceKey;
+use crate::resource::ResourceOrdinal;
 use std::collections::HashSet;
 
 /// One expected resource whose result is partial or unavailable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IncompleteResource {
-    resource: ResourceKey,
+    resource: ResourceOrdinal,
     issue: AnalysisIssue,
 }
 
 impl IncompleteResource {
-    /// Returns the resource key in the containing analysis snapshot.
-    pub fn resource(&self) -> ResourceKey {
+    /// Returns the resource ordinal in the containing analysis snapshot.
+    pub fn resource(&self) -> ResourceOrdinal {
         self.resource
     }
 
@@ -26,32 +26,35 @@ impl IncompleteResource {
         self.issue
     }
 
-    pub(crate) fn new(resource: ResourceKey, issue: AnalysisIssue) -> Self {
-        Self { resource, issue }
+    pub(crate) fn new(resource: impl Into<ResourceOrdinal>, issue: AnalysisIssue) -> Self {
+        Self {
+            resource: resource.into(),
+            issue,
+        }
     }
 }
 
 /// Completeness of one analysis result family across its expected resources.
 ///
-/// Each key in [`Self::expected`] occurs in exactly one of [`Self::completed`],
-/// [`Self::partial`], or [`Self::unavailable`]. Keys are valid only in the analysis snapshot
+/// Each ordinal in [`Self::expected`] occurs in exactly one of [`Self::completed`],
+/// [`Self::partial`], or [`Self::unavailable`]. Ordinals apply only to the analysis snapshot
 /// that owns this value.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ResourceCoverage {
-    expected: Vec<ResourceKey>,
-    completed: Vec<ResourceKey>,
+    expected: Vec<ResourceOrdinal>,
+    completed: Vec<ResourceOrdinal>,
     partial: Vec<IncompleteResource>,
     unavailable: Vec<IncompleteResource>,
 }
 
 impl ResourceCoverage {
     /// Returns every resource for which this result family applies.
-    pub fn expected(&self) -> &[ResourceKey] {
+    pub fn expected(&self) -> &[ResourceOrdinal] {
         &self.expected
     }
 
     /// Returns resources with complete results.
-    pub fn completed(&self) -> &[ResourceKey] {
+    pub fn completed(&self) -> &[ResourceOrdinal] {
         &self.completed
     }
 
@@ -72,12 +75,14 @@ impl ResourceCoverage {
             && self.completed.len() == self.expected.len()
     }
 
-    pub(crate) fn new(
-        expected: Vec<ResourceKey>,
-        completed: Vec<ResourceKey>,
+    pub(crate) fn new<T: Into<ResourceOrdinal>>(
+        expected: Vec<T>,
+        completed: Vec<T>,
         partial: Vec<IncompleteResource>,
         unavailable: Vec<IncompleteResource>,
     ) -> Self {
+        let expected = expected.into_iter().map(Into::into).collect::<Vec<_>>();
+        let completed = completed.into_iter().map(Into::into).collect::<Vec<_>>();
         assert_eq!(
             expected.len(),
             completed.len() + partial.len() + unavailable.len()
@@ -109,18 +114,18 @@ impl ResourceCoverage {
 pub enum RelationshipSource {
     /// OPF package relationships.
     Package,
-    /// The selected EPUB NAV document at this snapshot resource key.
-    Navigation(ResourceKey),
-    /// An NCX document at this snapshot resource key.
-    Ncx(ResourceKey),
-    /// A SMIL document at this snapshot resource key.
-    Smil(ResourceKey),
-    /// An XHTML document at this snapshot resource key.
-    Xhtml(ResourceKey),
-    /// A stylesheet at this snapshot resource key.
-    Css(ResourceKey),
-    /// An SVG document at this snapshot resource key.
-    Svg(ResourceKey),
+    /// The selected EPUB NAV document at this snapshot resource ordinal.
+    Navigation(ResourceOrdinal),
+    /// An NCX document at this snapshot resource ordinal.
+    Ncx(ResourceOrdinal),
+    /// A SMIL document at this snapshot resource ordinal.
+    Smil(ResourceOrdinal),
+    /// An XHTML document at this snapshot resource ordinal.
+    Xhtml(ResourceOrdinal),
+    /// A stylesheet at this snapshot resource ordinal.
+    Css(ResourceOrdinal),
+    /// An SVG document at this snapshot resource ordinal.
+    Svg(ResourceOrdinal),
 }
 
 /// Completeness of links extracted from one source.

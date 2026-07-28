@@ -185,7 +185,7 @@ fn write_opf2_meta(writer: &mut Writer<Vec<u8>>, meta: &Opf2Meta) -> Result<()> 
         node.push_attribute((NAME, name.as_str()));
     }
     if let Some(content) = content {
-        node.push_attribute((CONTENT, content.as_str()));
+        node.push_attribute((CONTENT, content));
     }
     writer.write_event(Event::Empty(node))?;
     Ok(())
@@ -241,7 +241,7 @@ fn write_manifest(writer: &mut Writer<Vec<u8>>, manifest: &Manifest) -> Result<(
 fn write_manifest_item(writer: &mut Writer<Vec<u8>>, item: &ManifestItem) -> Result<()> {
     let mut node = BytesStart::new(ITEM);
     if let Some(id) = item.id() {
-        node.push_attribute((ID, id.as_str()));
+        node.push_attribute((ID, id));
     }
     if let Some(href) = item.authored_href() {
         node.push_attribute((HREF, href.as_str()));
@@ -250,10 +250,10 @@ fn write_manifest_item(writer: &mut Writer<Vec<u8>>, item: &ManifestItem) -> Res
         node.push_attribute((MEDIA_TYPE, media_type.as_str()));
     }
     if let Some(fallback) = item.fallback() {
-        node.push_attribute((FALLBACK, fallback.as_str()));
+        node.push_attribute((FALLBACK, fallback));
     }
     if let Some(overlay) = item.media_overlay() {
-        node.push_attribute((MEDIA_OVERLAY, overlay.as_str()));
+        node.push_attribute((MEDIA_OVERLAY, overlay));
     }
     if !item.properties().is_empty() {
         let properties = item
@@ -274,7 +274,7 @@ fn write_spine(writer: &mut Writer<Vec<u8>>, spine: &Spine) -> Result<()> {
         node.push_attribute((ID, id.as_str()));
     }
     if let Some(toc) = spine.toc() {
-        node.push_attribute((TOC, toc.as_str()));
+        node.push_attribute((TOC, toc));
     }
     let dir_value = spine
         .page_progression_direction()
@@ -297,7 +297,7 @@ fn write_itemref(writer: &mut Writer<Vec<u8>>, itemref: &ItemRef) -> Result<()> 
         node.push_attribute((ID, id.as_str()));
     }
     if let Some(idref) = itemref.idref() {
-        node.push_attribute((IDREF, idref.as_str()));
+        node.push_attribute((IDREF, idref));
     }
     if itemref.linear() == Linear::No {
         let linear = itemref.linear().to_string();

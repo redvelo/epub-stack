@@ -44,7 +44,7 @@ fn create_builds_a_minimal_conventional_publication() {
     let [nav_item] = book.package().manifest().items() else {
         panic!("created package must declare exactly one NAV item");
     };
-    assert_eq!(nav_item.id().unwrap().as_str(), "nav");
+    assert_eq!(nav_item.id().unwrap(), "nav");
     assert_eq!(nav_item.href().unwrap().as_str(), "nav.xhtml");
     assert_eq!(
         nav_item.media_type().unwrap().as_str(),
@@ -120,7 +120,8 @@ fn created_publication_supports_edit_export_and_reopen() {
         .id(EpubString::new("chapter").unwrap())
         .href(EpubHref::try_new("text/chapter.xhtml").unwrap())
         .media_type(MediaType::try_from("application/xhtml+xml").unwrap())
-        .build();
+        .build()
+        .unwrap();
     let nav_point = NavigationPoint::builder()
         .label(EpubString::new("Chapter").unwrap())
         .href(EpubHref::try_new("text/chapter.xhtml").unwrap())

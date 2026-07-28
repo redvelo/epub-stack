@@ -16,6 +16,12 @@ use crate::string::EpubString;
 pub const MAX_COLLECTION_NESTING_DEPTH: usize = 128;
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 /// An owned OPF `collection` subtree.
 ///
 /// Children, links, and metadata retain modeled source order. Unknown XML and invalid typed
@@ -175,6 +181,12 @@ impl Collection {
 #[derive(
     Debug, PartialEq, Eq, Clone, Copy, strum_macros::Display, strum_macros::EnumString, Hash,
 )]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "kebab-case")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[strum(serialize_all = "lowercase")]
 /// A recognized EPUB collection role.
 pub enum CollectionRole {
@@ -183,18 +195,22 @@ pub enum CollectionRole {
     /// An index collection.
     Index,
     /// A grouping of index collections.
+    #[cfg_attr(feature = "serde", serde(rename = "index-group"))]
     IndexGroup,
     /// A distributable-object collection.
+    #[cfg_attr(feature = "serde", serde(rename = "distributable-object"))]
     DistributableObject,
     /// A resource manifest collection.
     Manifest,
     /// A publication preview collection.
     Preview,
     /// A scriptable-content collection.
+    #[cfg_attr(feature = "serde", serde(rename = "scriptable-content"))]
     ScriptableContent,
     /// A collection of learning units.
     Units,
     /// A page-list set.
+    #[cfg_attr(feature = "serde", serde(rename = "page-set"))]
     PageSet,
     /// A single page collection.
     Page,
