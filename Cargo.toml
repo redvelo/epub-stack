@@ -64,8 +64,13 @@ serde = { version = "=1.0.228", features = ["derive"], optional = true }
 specta = { version = "=2.0.0-rc.25", features = ["derive"], optional = true }
 
 [dev-dependencies]
+rayon = "1.12.0"
 specta-serde = "=0.0.12"
 specta-typescript = "=0.0.12"
+
+[[bench]]
+name = "corpus_analysis"
+harness = false
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.3.4", features = ["wasm_js"] }
