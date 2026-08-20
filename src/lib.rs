@@ -79,7 +79,7 @@ pub mod semantics;
 mod string;
 mod xml;
 
-pub use analysis::{AnalysisLimits, PublicationAnalysis};
+pub use analysis::{AnalysisLimits, ForegroundPreparationEligibility, PublicationAnalysis};
 pub use annotation::{Annotation, AnnotationBundle, AnnotationSet};
 pub use cfi::{Cfi, CfiRange};
 pub use container::EpubZip;

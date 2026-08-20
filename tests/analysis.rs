@@ -1,6 +1,7 @@
 use epub_stack::content::text::TextChunkKind;
 use epub_stack::{
-    AnalysisLimits, Epub, MemoryResourceProvider, ResourceSelector,
+    AnalysisLimits, Epub, ForegroundPreparationEligibility, MemoryResourceProvider,
+    ResourceSelector,
     accessibility::{AccessibilityFact, AccessibilityObservationRef},
     analysis::{
         AnalysisIssue,
@@ -24,6 +25,187 @@ fn publication(
     )
     .unwrap();
     Epub::from_provider(provider, "EPUB/package.opf").unwrap()
+}
+
+fn foreground_preparation_state(
+    media_type: &str,
+    document: &str,
+    limits: AnalysisLimits,
+) -> ForegroundPreparationEligibility {
+    let package = format!(
+        r#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0"><metadata/><manifest><item id="chapter" href="chapter.xhtml" media-type="{media_type}"/></manifest><spine><itemref idref="chapter"/></spine></package>"#,
+    );
+    let book = publication(
+        package.as_bytes(),
+        [("EPUB/chapter.xhtml", document.as_bytes().to_vec())],
+    );
+    let analysis = book.analyze_with_limits(limits);
+    let ordinal = analysis
+        .resources()
+        .resources()
+        .find(|resource| {
+            resource
+                .local_path()
+                .is_some_and(|path| path.as_str() == "EPUB/chapter.xhtml")
+        })
+        .unwrap()
+        .ordinal();
+    analysis
+        .facts_for(ordinal)
+        .unwrap()
+        .foreground_preparation_eligibility()
+}
+
+#[test]
+fn foreground_preparation_requires_complete_static_xhtml() {
+    let unlimited = || AnalysisLimits::new(None, None, None, None);
+    let static_document = r#"<html xmlns="http://www.w3.org/1999/xhtml"><head><link rel="stylesheet" href="book.css"/></head><body><img src="cover.jpg"/><p>Static</p></body></html>"#;
+    assert_eq!(
+        foreground_preparation_state("application/xhtml+xml", static_document, unlimited()),
+        ForegroundPreparationEligibility::Eligible
+    );
+    assert_eq!(
+        foreground_preparation_state(
+            "application/xhtml+xml",
+            r#"<html xmlns="http://www.w3.org/1999/xhtml"><body><script type="application/ld+json">{}</script></body></html>"#,
+            unlimited(),
+        ),
+        ForegroundPreparationEligibility::Ineligible
+    );
+    assert_eq!(
+        foreground_preparation_state(
+            "application/xhtml+xml",
+            "<html><body><p>broken</body></html>",
+            unlimited(),
+        ),
+        ForegroundPreparationEligibility::Unknown
+    );
+    assert_eq!(
+        foreground_preparation_state(
+            "application/xhtml+xml",
+            static_document,
+            AnalysisLimits::new(None, Some(8), None, None),
+        ),
+        ForegroundPreparationEligibility::Unknown
+    );
+    assert_eq!(
+        foreground_preparation_state(
+            "image/svg+xml",
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><text>Static</text></svg>"#,
+            unlimited(),
+        ),
+        ForegroundPreparationEligibility::Ineligible
+    );
+}
+
+#[test]
+fn foreground_preparation_excludes_active_and_early_lifecycle_constructs() {
+    let constructs = [
+        "<audio/>",
+        "<video/>",
+        "<source/>",
+        "<track/>",
+        "<iframe/>",
+        "<object/>",
+        "<embed/>",
+        "<input autofocus=\"autofocus\"/>",
+        "<meta http-equiv=\"refresh\" content=\"0\"/>",
+        "<link rel=\"preload\" href=\"image.png\"/>",
+        "<link rel=\"prefetch\" href=\"next.xhtml\"/>",
+        "<link rel=\"modulepreload\" href=\"module.js\"/>",
+        "<link rel=\"preconnect\" href=\"https://example.com\"/>",
+        "<link rel=\"dns-prefetch\" href=\"//example.com\"/>",
+        "<link rel=\"prerender\" href=\"next.xhtml\"/>",
+        "<script>run()</script>",
+        "<script type=\"speculationrules\">{}</script>",
+        "<p onclick=\"run()\">Event</p>",
+    ];
+    for construct in constructs {
+        let document = format!(
+            r#"<html xmlns="http://www.w3.org/1999/xhtml"><head>{construct}</head><body><p>Text</p></body></html>"#
+        );
+        assert_eq!(
+            foreground_preparation_state(
+                "application/xhtml+xml",
+                &document,
+                AnalysisLimits::new(None, None, None, None),
+            ),
+            ForegroundPreparationEligibility::Ineligible,
+            "construct should be excluded: {construct}"
+        );
+    }
+}
+
+#[test]
+fn foreground_preparation_requires_supported_authored_element_namespaces() {
+    let state = |document: &str| {
+        foreground_preparation_state(
+            "application/xhtml+xml",
+            document,
+            AnalysisLimits::new(None, None, None, None),
+        )
+    };
+    assert_eq!(
+        state(r#"<html xmlns="urn:not-xhtml"><body><p>Text</p></body></html>"#),
+        ForegroundPreparationEligibility::Unknown
+    );
+    assert_eq!(
+        state(
+            r#"<html xmlns="http://www.w3.org/1999/xhtml"><body><custom xmlns="urn:unsupported">Text</custom></body></html>"#
+        ),
+        ForegroundPreparationEligibility::Unknown
+    );
+    assert_eq!(
+        state(
+            r#"<html xmlns="http://www.w3.org/1999/xhtml"><body><svg xmlns="http://www.w3.org/2000/svg"><circle cx="1" cy="1" r="1"/></svg><math xmlns="http://www.w3.org/1998/Math/MathML"><mn>1</mn></math></body></html>"#
+        ),
+        ForegroundPreparationEligibility::Eligible
+    );
+    for construct in ["<h:script>run()</h:script>", "<h:iframe/>"] {
+        let document = format!(
+            r#"<h:html xmlns:h="http://www.w3.org/1999/xhtml"><h:body>{construct}</h:body></h:html>"#
+        );
+        assert_eq!(
+            state(&document),
+            ForegroundPreparationEligibility::Ineligible,
+            "prefixed XHTML construct should be excluded: {construct}"
+        );
+    }
+}
+
+#[test]
+fn foreground_preparation_excludes_active_inline_svg_constructs() {
+    for construct in [
+        "animate",
+        "animateColor",
+        "animateMotion",
+        "animateTransform",
+        "discard",
+        "script",
+        "set",
+    ] {
+        let document = format!(
+            r#"<html xmlns="http://www.w3.org/1999/xhtml"><body><svg xmlns="http://www.w3.org/2000/svg"><{construct}/></svg></body></html>"#
+        );
+        assert_eq!(
+            foreground_preparation_state(
+                "application/xhtml+xml",
+                &document,
+                AnalysisLimits::new(None, None, None, None),
+            ),
+            ForegroundPreparationEligibility::Ineligible,
+            "active SVG construct should be excluded: {construct}"
+        );
+    }
+
+    assert_eq!(
+        foreground_preparation_state(
+            "application/xhtml+xml",
+            r#"<html xmlns="http://www.w3.org/1999/xhtml" xmlns:svg="http://www.w3.org/2000/svg"><body><svg:svg><svg:animate/></svg:svg></body></html>"#,
+            AnalysisLimits::new(None, None, None, None),
+        ),
+        ForegroundPreparationEligibility::Ineligible
+    );
 }
 
 #[test]

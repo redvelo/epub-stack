@@ -139,6 +139,8 @@ pub struct XhtmlFacts {
     pub(crate) media: Vec<MediaFact>,
     pub(crate) forms: Vec<FormFact>,
     pub(crate) scripts: Vec<ScriptFact>,
+    pub(crate) foreground_preparation_document_supported: bool,
+    pub(crate) foreground_preparation_hazard_detected: bool,
 }
 
 impl XhtmlFacts {
@@ -175,6 +177,12 @@ impl XhtmlFacts {
     /// Returns forms and controls in source order.
     pub fn forms(&self) -> &[FormFact] {
         &self.forms
+    }
+
+    pub(crate) fn supports_foreground_preparation(&self) -> bool {
+        self.foreground_preparation_document_supported
+            && !self.foreground_preparation_hazard_detected
+            && !self.scripts.iter().any(ScriptFact::is_executable)
     }
 
     /// Returns scripts and event handlers in source order.

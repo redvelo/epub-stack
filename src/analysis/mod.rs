@@ -229,6 +229,21 @@ pub enum ResourceClassification {
     Conflict(Vec<SemanticFormat>),
 }
 
+/// Whether one physical resource is conservatively safe to prepare in a foreground frame.
+///
+/// Eligibility requires complete analysis of a well-formed XHTML document and no executable
+/// content or supported active early-lifecycle construct. `Unknown` means XHTML eligibility could
+/// not be established from a complete supported analysis; it is not equivalent to ineligibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ForegroundPreparationEligibility {
+    /// Complete supported XHTML analysis found no excluded construct.
+    Eligible,
+    /// Complete analysis established that the resource is not eligible.
+    Ineligible,
+    /// Analysis could not establish eligibility or ineligibility.
+    Unknown,
+}
+
 impl ResourceClassification {
     pub(crate) fn from_formats(semantic_formats: impl IntoIterator<Item = SemanticFormat>) -> Self {
         let mut formats = semantic_formats.into_iter().collect::<Vec<_>>();
@@ -285,6 +300,31 @@ impl ResourceFacts {
     /// Returns extracted semantic content and its execution state.
     pub fn content(&self) -> &AnalysisOutcome<ContentFacts> {
         &self.content
+    }
+
+    /// Classifies this physical resource for conservative foreground frame preparation.
+    pub fn foreground_preparation_eligibility(&self) -> ForegroundPreparationEligibility {
+        match &self.content {
+            AnalysisOutcome::Complete(ContentFacts::Xhtml(facts)) => {
+                if !facts.foreground_preparation_document_supported {
+                    ForegroundPreparationEligibility::Unknown
+                } else if facts.supports_foreground_preparation() {
+                    ForegroundPreparationEligibility::Eligible
+                } else {
+                    ForegroundPreparationEligibility::Ineligible
+                }
+            }
+            AnalysisOutcome::Complete(_) => ForegroundPreparationEligibility::Ineligible,
+            AnalysisOutcome::Partial { .. } | AnalysisOutcome::Unavailable(_) => {
+                ForegroundPreparationEligibility::Unknown
+            }
+            AnalysisOutcome::NotApplicable => match &self.classification {
+                AnalysisOutcome::Complete(_) => ForegroundPreparationEligibility::Ineligible,
+                AnalysisOutcome::Partial { .. }
+                | AnalysisOutcome::Unavailable(_)
+                | AnalysisOutcome::NotApplicable => ForegroundPreparationEligibility::Unknown,
+            },
+        }
     }
 
     pub(crate) fn content_mut(&mut self) -> &mut AnalysisOutcome<ContentFacts> {
