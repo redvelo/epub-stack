@@ -32,9 +32,11 @@ pub(crate) struct SvgScan {
     source_text: Vec<SvgSourceText>,
     fragments: Vec<SvgFragment>,
     scripts: Vec<ScriptFact>,
+    script_has_text: Vec<bool>,
     foreign_objects: Vec<(usize, SvgForeignObjectFact)>,
     foreign_accessibility: Vec<(usize, AccessibilityFact)>,
     pending_references: Vec<SvgPendingRef>,
+    foreground_preparation_hazard: bool,
     semantic_issue: Option<crate::analysis::AnalysisIssue>,
     malformed: bool,
     root_closed: bool,
@@ -197,7 +199,9 @@ impl SvgScan {
                 fragments,
                 text,
                 std::mem::take(&mut self.scripts),
+                std::mem::take(&mut self.script_has_text),
                 foreign_objects,
+                self.foreground_preparation_hazard,
             ),
             accessibility,
             std::mem::take(&mut self.pending_references),
@@ -292,6 +296,9 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                 }
                 let (namespace, local) = reader.resolver().resolve_element(element.name());
                 let in_svg_namespace = namespace_is(&namespace, SVG_NS);
+                if in_svg_namespace && is_active_svg_element(local.as_ref()) {
+                    scan.foreground_preparation_hazard = true;
+                }
                 if depth > 0
                     && foreign_captures.is_empty()
                     && !in_svg_namespace
@@ -319,6 +326,7 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                     &mut nearest_fragment,
                     &base_chain,
                 );
+                scan.script_has_text.resize(scan.scripts.len(), false);
                 if let Some(base) = attributes.base {
                     base_chain.push(base);
                 }
@@ -390,6 +398,7 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                 }
                 if in_svg_namespace && local.as_ref() == b"script" {
                     let index = scan.scripts.len();
+                    scan.script_has_text.push(false);
                     if attributes.has_href {
                         scan.scripts.push(ScriptFact::External {
                             fragment: nearest_fragment.clone(),
@@ -401,11 +410,11 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                             script_type: attributes.script_type,
                             has_text: false,
                         });
-                        script_capture = Some(SvgScriptCapture {
-                            depth: depth + 1,
-                            index,
-                        });
                     }
+                    script_capture = Some(SvgScriptCapture {
+                        depth: depth + 1,
+                        index,
+                    });
                 }
                 if in_svg_namespace && local.as_ref() == b"style" && style_capture.is_none() {
                     style_capture = Some(SvgStyleCapture {
@@ -428,6 +437,9 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                 }
                 let (namespace, local) = reader.resolver().resolve_element(element.name());
                 let in_svg_namespace = namespace_is(&namespace, SVG_NS);
+                if in_svg_namespace && is_active_svg_element(local.as_ref()) {
+                    scan.foreground_preparation_hazard = true;
+                }
                 if depth > 0
                     && foreign_captures.is_empty()
                     && !in_svg_namespace
@@ -454,6 +466,7 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                     &mut element_fragment,
                     &base_chain,
                 );
+                scan.script_has_text.resize(scan.scripts.len(), false);
                 let mut effective_bases = base_chain.clone();
                 if let Some(base) = &attributes.base {
                     effective_bases.push(base.clone());
@@ -514,6 +527,7 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                     });
                 }
                 if in_svg_namespace && local.as_ref() == b"script" {
+                    scan.script_has_text.push(false);
                     if attributes.has_href {
                         scan.scripts.push(ScriptFact::External {
                             fragment: element_fragment.clone(),
@@ -570,9 +584,11 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                 }
                 if let Some(capture) = script_capture
                     && !text.iter().all(u8::is_ascii_whitespace)
-                    && let ScriptFact::Inline { has_text, .. } = &mut scan.scripts[capture.index]
                 {
-                    *has_text = true;
+                    scan.script_has_text[capture.index] = true;
+                    if let ScriptFact::Inline { has_text, .. } = &mut scan.scripts[capture.index] {
+                        *has_text = true;
+                    }
                 }
                 if let Some(capture) = &mut style_capture {
                     match text_content(&text) {
@@ -620,9 +636,11 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                 }
                 if let Some(capture) = script_capture
                     && !text.iter().all(u8::is_ascii_whitespace)
-                    && let ScriptFact::Inline { has_text, .. } = &mut scan.scripts[capture.index]
                 {
-                    *has_text = true;
+                    scan.script_has_text[capture.index] = true;
+                    if let ScriptFact::Inline { has_text, .. } = &mut scan.scripts[capture.index] {
+                        *has_text = true;
+                    }
                 }
                 if let Some(capture) = &mut style_capture {
                     match cdata_content(&text) {
@@ -674,10 +692,13 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                     let mut value = String::new();
                     if matches!(push_general_ref(&mut value, &reference), Ok(false))
                         && !value.chars().all(char::is_whitespace)
-                        && let ScriptFact::Inline { has_text, .. } =
-                            &mut scan.scripts[capture.index]
                     {
-                        *has_text = true;
+                        scan.script_has_text[capture.index] = true;
+                        if let ScriptFact::Inline { has_text, .. } =
+                            &mut scan.scripts[capture.index]
+                        {
+                            *has_text = true;
+                        }
                     }
                 }
                 if let Some(capture) = &mut style_capture {
@@ -742,6 +763,7 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                     break;
                 }
                 seen_doctype = true;
+                scan.foreground_preparation_hazard = true;
             }
             Event::Eof => break,
             _ => {}
@@ -1151,6 +1173,13 @@ fn supports_svg_href(local: &[u8]) -> bool {
             | b"set"
             | b"textPath"
             | b"use"
+    )
+}
+
+fn is_active_svg_element(local: &[u8]) -> bool {
+    matches!(
+        local,
+        b"animate" | b"animateColor" | b"animateMotion" | b"animateTransform" | b"discard" | b"set"
     )
 }
 

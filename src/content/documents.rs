@@ -38,6 +38,18 @@ impl ContentFacts {
             Self::Xhtml(_) | Self::Svg(_) => None,
         }
     }
+
+    /// Returns whether supported document content contains a known executable script occurrence.
+    ///
+    /// XHTML and standalone SVG are supported. SVG includes scripts in nested `foreignObject`
+    /// XHTML; SMIL returns `None` because this projection does not apply to it.
+    pub fn executable_content_detected(&self) -> Option<bool> {
+        match self {
+            Self::Xhtml(facts) => Some(facts.has_executable_content()),
+            Self::Svg(facts) => Some(facts.has_executable_content()),
+            Self::Smil(_) => None,
+        }
+    }
 }
 
 /// Fragment targets extracted from a standalone SVG resource.
@@ -47,6 +59,7 @@ pub struct SvgFacts {
     pub(crate) text: Vec<SvgTextFact>,
     pub(crate) scripts: Vec<ScriptFact>,
     pub(crate) foreign_objects: Vec<SvgForeignObjectFact>,
+    pub(crate) foreground_preparation_hazard: bool,
 }
 
 impl SvgFacts {
@@ -54,13 +67,50 @@ impl SvgFacts {
         fragments: Vec<FragmentFact>,
         text: Vec<SvgTextFact>,
         scripts: Vec<ScriptFact>,
+        script_has_text: Vec<bool>,
         foreign_objects: Vec<SvgForeignObjectFact>,
+        foreground_preparation_hazard: bool,
     ) -> Self {
+        let scripts = scripts
+            .into_iter()
+            .enumerate()
+            .map(|(index, script)| match script {
+                ScriptFact::Inline {
+                    fragment,
+                    script_type,
+                    has_text,
+                } if !super::extraction::xhtml::is_executable_script_type(
+                    script_type.as_deref(),
+                ) =>
+                {
+                    ScriptFact::DataBlock {
+                        fragment,
+                        script_type,
+                        has_text,
+                    }
+                }
+                ScriptFact::External {
+                    fragment,
+                    script_type,
+                } if !super::extraction::xhtml::is_executable_script_type(
+                    script_type.as_deref(),
+                ) =>
+                {
+                    ScriptFact::DataBlock {
+                        fragment,
+                        script_type,
+                        has_text: script_has_text.get(index).copied().unwrap_or(false),
+                    }
+                }
+                script => script,
+            })
+            .collect();
         Self {
             fragments,
             text,
             scripts,
             foreign_objects,
+            foreground_preparation_hazard,
         }
     }
 
@@ -82,6 +132,23 @@ impl SvgFacts {
     /// Returns XHTML-bearing SVG `foreignObject` occurrences in source order.
     pub fn foreign_objects(&self) -> &[SvgForeignObjectFact] {
         &self.foreign_objects
+    }
+
+    fn has_executable_content(&self) -> bool {
+        self.scripts.iter().any(ScriptFact::is_executable)
+            || self
+                .foreign_objects
+                .iter()
+                .any(|foreign| foreign.xhtml.has_executable_content())
+    }
+
+    pub(crate) fn supports_foreground_preparation(&self) -> bool {
+        !self.foreground_preparation_hazard
+            && !self.scripts.iter().any(ScriptFact::is_executable)
+            && self
+                .foreign_objects
+                .iter()
+                .all(|foreign| foreign.xhtml.supports_foreground_preparation_fragment())
     }
 }
 
@@ -181,8 +248,15 @@ impl XhtmlFacts {
 
     pub(crate) fn supports_foreground_preparation(&self) -> bool {
         self.foreground_preparation_document_supported
-            && !self.foreground_preparation_hazard_detected
-            && !self.scripts.iter().any(ScriptFact::is_executable)
+            && self.supports_foreground_preparation_fragment()
+    }
+
+    fn has_executable_content(&self) -> bool {
+        self.scripts.iter().any(ScriptFact::is_executable)
+    }
+
+    fn supports_foreground_preparation_fragment(&self) -> bool {
+        !self.foreground_preparation_hazard_detected && !self.has_executable_content()
     }
 
     /// Returns scripts and event handlers in source order.

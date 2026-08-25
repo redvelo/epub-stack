@@ -1373,9 +1373,12 @@ fn foreground_preparation_hazard(element: &str, attrs: &ElementAttrs) -> bool {
         || (element == "link"
             && attrs.value("rel").is_some_and(|value| {
                 value.split_ascii_whitespace().any(|token| {
-                    token.eq_ignore_ascii_case("preload")
+                    token.eq_ignore_ascii_case("dns-prefetch")
+                        || token.eq_ignore_ascii_case("preconnect")
+                        || token.eq_ignore_ascii_case("preload")
                         || token.eq_ignore_ascii_case("prefetch")
                         || token.eq_ignore_ascii_case("modulepreload")
+                        || token.eq_ignore_ascii_case("prerender")
                 })
             }))
 }

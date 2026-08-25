@@ -231,12 +231,13 @@ pub enum ResourceClassification {
 
 /// Whether one physical resource is conservatively safe to prepare in a foreground frame.
 ///
-/// Eligibility requires complete analysis of a well-formed XHTML document and no executable
-/// content or supported active early-lifecycle construct. `Unknown` means XHTML eligibility could
-/// not be established from a complete supported analysis; it is not equivalent to ineligibility.
+/// Eligibility requires complete analysis of a supported XHTML or standalone SVG document and no
+/// executable content or supported active early-lifecycle construct. `Unknown` means eligibility
+/// could not be established from a complete supported analysis; it is not equivalent to
+/// ineligibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ForegroundPreparationEligibility {
-    /// Complete supported XHTML analysis found no excluded construct.
+    /// Complete supported XHTML or standalone SVG analysis found no excluded construct.
     Eligible,
     /// Complete analysis established that the resource is not eligible.
     Ineligible,
@@ -314,7 +315,16 @@ impl ResourceFacts {
                     ForegroundPreparationEligibility::Ineligible
                 }
             }
-            AnalysisOutcome::Complete(_) => ForegroundPreparationEligibility::Ineligible,
+            AnalysisOutcome::Complete(ContentFacts::Svg(facts)) => {
+                if facts.supports_foreground_preparation() {
+                    ForegroundPreparationEligibility::Eligible
+                } else {
+                    ForegroundPreparationEligibility::Ineligible
+                }
+            }
+            AnalysisOutcome::Complete(ContentFacts::Smil(_)) => {
+                ForegroundPreparationEligibility::Ineligible
+            }
             AnalysisOutcome::Partial { .. } | AnalysisOutcome::Unavailable(_) => {
                 ForegroundPreparationEligibility::Unknown
             }

@@ -94,7 +94,146 @@ fn foreground_preparation_requires_complete_static_xhtml() {
             r#"<svg xmlns="http://www.w3.org/2000/svg"><text>Static</text></svg>"#,
             unlimited(),
         ),
-        ForegroundPreparationEligibility::Ineligible
+        ForegroundPreparationEligibility::Eligible
+    );
+}
+
+#[test]
+fn foreground_preparation_requires_complete_static_svg() {
+    let state = |document: &str| {
+        foreground_preparation_state(
+            "image/svg+xml",
+            document,
+            AnalysisLimits::new(None, None, None, None),
+        )
+    };
+
+    for document in [
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><script>run()</script></svg>"#,
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><script href="app.js"/></svg>"#,
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><rect onclick="run()"/></svg>"#,
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><animate attributeName="opacity"/></svg>"#,
+        r#"<!DOCTYPE svg [<!ATTLIST svg onload CDATA "run()">]><svg xmlns="http://www.w3.org/2000/svg"/>"#,
+    ] {
+        assert_eq!(
+            state(document),
+            ForegroundPreparationEligibility::Ineligible
+        );
+    }
+
+    assert_eq!(
+        state(
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><script type="application/ld+json">{}</script><text>Static</text></svg>"#
+        ),
+        ForegroundPreparationEligibility::Eligible
+    );
+    let package = br#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0"><metadata/><manifest><item id="chapter" href="chapter.svg" media-type="image/svg+xml"/></manifest><spine><itemref idref="chapter"/></spine></package>"#;
+    let book = publication(
+        package,
+        [(
+            "EPUB/chapter.svg",
+            br#"<svg xmlns="http://www.w3.org/2000/svg"><script type="application/ld+json" href="data.json">fallback</script></svg>"#.to_vec(),
+        )],
+    );
+    let analysis = book.analyze();
+    let chapter = analysis
+        .resources()
+        .find_unique_resource_by_id("chapter")
+        .expect("chapter resource");
+    let facts = analysis
+        .content_for(chapter.ordinal())
+        .expect("chapter analysis")
+        .value()
+        .and_then(ContentFacts::as_svg)
+        .expect("SVG facts");
+    assert!(matches!(
+        facts.scripts(),
+        [ScriptFact::DataBlock { has_text: true, .. }]
+    ));
+    assert_eq!(
+        state(
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><foreignObject><div xmlns="http://www.w3.org/1999/xhtml"><p>Static</p></div></foreignObject></svg>"#
+        ),
+        ForegroundPreparationEligibility::Eligible
+    );
+    for construct in [
+        "<script>run()</script>",
+        "<p onclick=\"run()\">Event</p>",
+        "<iframe/>",
+        "<link rel=\"preconnect\" href=\"https://example.com\"/>",
+    ] {
+        let document = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><foreignObject><div xmlns="http://www.w3.org/1999/xhtml">{construct}</div></foreignObject></svg>"#
+        );
+        assert_eq!(
+            state(&document),
+            ForegroundPreparationEligibility::Ineligible,
+            "foreignObject construct should be excluded: {construct}"
+        );
+    }
+    assert_eq!(
+        state(r#"<svg xmlns="http://www.w3.org/2000/svg"><text>broken</svg>"#),
+        ForegroundPreparationEligibility::Unknown
+    );
+    assert_eq!(
+        foreground_preparation_state(
+            "image/svg+xml",
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><text>truncated by budget</text></svg>"#,
+            AnalysisLimits::new(None, Some(16), None, None),
+        ),
+        ForegroundPreparationEligibility::Unknown
+    );
+}
+
+#[test]
+fn standalone_svg_executable_projection_includes_foreign_object_xhtml() {
+    let executable = |document: &str| {
+        let package = br#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0"><metadata/><manifest><item id="page" href="page.svg" media-type="image/svg+xml"/></manifest><spine><itemref idref="page"/></spine></package>"#;
+        let analysis =
+            publication(package, [("EPUB/page.svg", document.as_bytes().to_vec())]).analyze();
+        let page = analysis
+            .resources()
+            .find_unique_resource_by_id("page")
+            .unwrap();
+        analysis
+            .content_for(page.ordinal())
+            .unwrap()
+            .value()
+            .and_then(ContentFacts::executable_content_detected)
+    };
+
+    assert_eq!(
+        executable(r#"<svg xmlns="http://www.w3.org/2000/svg"><text>Static</text></svg>"#),
+        Some(false)
+    );
+    assert_eq!(
+        executable(
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><script type="application/ld+json">{}</script></svg>"#
+        ),
+        Some(false)
+    );
+    let package = br#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0"><metadata/><manifest><item id="page" href="page.svg" media-type="image/svg+xml"/></manifest><spine><itemref idref="page"/></spine></package>"#;
+    let analysis = publication(
+        package,
+        [("EPUB/page.svg", br#"<svg xmlns="http://www.w3.org/2000/svg"><script type="application/ld+json">{}</script></svg>"#.to_vec())],
+    )
+    .analyze();
+    let page = analysis
+        .resources()
+        .find_unique_resource_by_id("page")
+        .unwrap();
+    let svg = analysis
+        .content_for(page.ordinal())
+        .unwrap()
+        .value()
+        .and_then(ContentFacts::as_svg)
+        .unwrap();
+    assert!(matches!(svg.scripts(), [ScriptFact::DataBlock { .. }]));
+    assert_eq!(
+        executable(
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><foreignObject><script xmlns="http://www.w3.org/1999/xhtml">run()</script></foreignObject></svg>"#
+        ),
+        Some(true)
     );
 }
 
