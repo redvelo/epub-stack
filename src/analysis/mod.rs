@@ -452,17 +452,6 @@ impl PublicationAnalysis {
             .map(XhtmlFacts::text_stream))
     }
 
-    pub(crate) fn text_stream_for_row(
-        &self,
-        key: ResourceRow,
-    ) -> Result<Option<&TextStream>, IndexRowError> {
-        Ok(self
-            .content_for_row(key)?
-            .value()
-            .and_then(ContentFacts::as_xhtml)
-            .map(XhtmlFacts::text_stream))
-    }
-
     /// Returns analyzed media-overlay associations for this snapshot.
     pub fn media_overlays(&self) -> &MediaOverlayFacts {
         &self.media_overlays

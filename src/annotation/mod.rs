@@ -1,7 +1,8 @@
 //! Parse, build, exchange, and resolve EPUB Annotations 1.0 data.
 //!
-//! Use [`AnnotationSet::parse_json`] to import annotation JSON, the builders to create annotations,
-//! [`AnnotationBundle`] to exchange a set with audiovisual body resources, and
+//! Use [`AnnotationSet::parse_json`] or [`AnnotationTarget::parse_json`] to import annotation JSON,
+//! the builders to create annotations, [`AnnotationBundle`] to exchange a set with audiovisual
+//! body resources, and
 //! [`PublicationAnalysis::resolve_annotation_target`](crate::analysis::PublicationAnalysis::resolve_annotation_target)
 //! to resolve targets against analyzed publication content.
 //!
@@ -697,6 +698,23 @@ impl AnnotationTarget {
         })
     }
 
+    /// Parses a target-only UTF-8 JSON object for inspection or normalized export.
+    pub fn parse_json(input: &str) -> Result<Self, AnnotationError> {
+        let value: Value = serde_json::from_str(input)?;
+        Self::from_json_value(value)
+    }
+
+    fn from_json_value(value: Value) -> Result<Self, AnnotationError> {
+        Self::from_value(value).ok_or(AnnotationError::ExpectedObject {
+            kind: "annotation target",
+        })
+    }
+
+    /// Exports the target as compact, normalized JSON.
+    pub fn to_json_string(&self) -> Result<String, AnnotationError> {
+        Ok(serde_json::to_string(&self.to_value())?)
+    }
+
     /// Returns the recovered source, or an empty string when import could not recover one.
     pub fn source(&self) -> &str {
         self.source.as_deref().unwrap_or_default()
@@ -1014,10 +1032,10 @@ impl CssSelector {
     }
 }
 
-/// A half-open Unicode code-point range in the publication text representation.
+/// A half-open range in the rendered text representation defined by Web Annotations.
 ///
-/// Detached analysis resolves these offsets against its normalized extracted source-text stream,
-/// not browser layout or UTF-8/UTF-16 units.
+/// Resolution requires a browser host because extracted source text is not authoritative for
+/// rendered-text offsets.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextPositionSelector {
     start: Option<u64>,
@@ -2567,6 +2585,44 @@ mod tests {
             AnnotationSet::from_json_value(serde_json::json!([])),
             Err(AnnotationError::ExpectedObject {
                 kind: "annotation set"
+            })
+        ));
+    }
+
+    #[test]
+    fn target_json_round_trips_unknown_members_and_large_offsets() {
+        let target = AnnotationTarget::parse_json(
+            r#"{
+                "source":"chapter.xhtml",
+                "selector":[{
+                    "type":"TextPositionSelector",
+                    "start":9007199254740993,
+                    "end":18446744073709551615,
+                    "x-selector":{"kept":true}
+                }],
+                "x-target":[1,2,3]
+            }"#,
+        )
+        .unwrap();
+
+        let AnnotationSelector::TextPosition(position) = &target.selectors()[0] else {
+            panic!("expected text position selector");
+        };
+        assert_eq!(position.start(), Some(9_007_199_254_740_993));
+        assert_eq!(position.end(), Some(u64::MAX));
+
+        let output: Value = serde_json::from_str(&target.to_json_string().unwrap()).unwrap();
+        assert_eq!(output["x-target"], serde_json::json!([1, 2, 3]));
+        assert_eq!(output[SELECTOR][0]["x-selector"]["kept"], true);
+        assert_eq!(output[SELECTOR][0][START], 9_007_199_254_740_993_u64);
+        assert_eq!(output[SELECTOR][0][END], u64::MAX);
+
+        let reparsed = AnnotationTarget::parse_json(&target.to_json_string().unwrap()).unwrap();
+        assert_eq!(reparsed, target);
+        assert!(matches!(
+            AnnotationTarget::parse_json("[]"),
+            Err(AnnotationError::ExpectedObject {
+                kind: "annotation target"
             })
         ));
     }

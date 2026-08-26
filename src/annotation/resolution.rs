@@ -1,5 +1,4 @@
 use crate::analysis::PublicationAnalysis;
-use crate::content::text::{TextRange, TextRangeError};
 use crate::resource::{
     ProviderPresence, ResolvedHref, ResourceAddress, ResourceIndex, ResourceRef,
 };
@@ -58,13 +57,6 @@ pub enum AnnotationResolution {
         /// Percent-decoded fragment identifier.
         value: String,
     },
-    /// A text-position selector selected source text.
-    Text {
-        /// Resolved publication address.
-        source: ResourceAddress,
-        /// Selected normalized source-text snapshot.
-        text: String,
-    },
     /// A fragment identifier matched multiple elements.
     Ambiguous {
         /// Resolved publication address.
@@ -111,21 +103,12 @@ impl AnnotationResolution {
             Self::ProviderMissing { source }
             | Self::Resource { source }
             | Self::Fragment { source, .. }
-            | Self::Text { source, .. }
             | Self::Ambiguous { source, .. }
             | Self::Broken { source }
             | Self::Unavailable { source }
             | Self::HostRequired { source, .. }
             | Self::InvalidSelector { source }
             | Self::UnsupportedSelector { source } => Some(source),
-        }
-    }
-
-    /// Returns resolved text when this result selected a text range.
-    pub fn text(&self) -> Option<&str> {
-        match self {
-            Self::Text { text, .. } => Some(text),
-            _ => None,
         }
     }
 }
@@ -199,25 +182,6 @@ impl PublicationAnalysis {
                     ) =>
             {
                 self.resolve_fragment(source_record, fragment.value())
-            }
-            AnnotationSelector::TextPosition(position) if position.refined_by().is_empty() => {
-                let Some(range) = position
-                    .start()
-                    .zip(position.end())
-                    .and_then(|(start, end)| TextRange::new(start, end))
-                else {
-                    return AnnotationResolution::InvalidSelector { source };
-                };
-                let Ok(Some(stream)) = self.text_stream_for_row(source_record.key()) else {
-                    return AnnotationResolution::Unavailable { source };
-                };
-                match stream.text_for_range(range) {
-                    Ok(text) => AnnotationResolution::Text {
-                        source,
-                        text: text.to_string(),
-                    },
-                    Err(TextRangeError::OutOfBounds) => AnnotationResolution::Broken { source },
-                }
             }
             _ => AnnotationResolution::HostRequired {
                 source,
@@ -327,7 +291,7 @@ fn selector_requirement(
             if !source.has_xhtml_declaration() {
                 return Err(SelectorValidationError::Unsupported);
             }
-            HostRequirement::Dom
+            HostRequirement::RenderedText
         }
         AnnotationSelector::Unknown(selector)
             if selector
@@ -346,10 +310,6 @@ fn selector_requirement(
     let mut best = None;
     let mut invalid = false;
     for refinement in refinements {
-        if matches!(refinement, AnnotationSelector::Unknown(_)) {
-            invalid = true;
-            continue;
-        }
         match selector_requirement(refinement, source) {
             Ok(requirement) => {
                 let branch = greater_requirement(own, requirement);
@@ -362,10 +322,10 @@ fn selector_requirement(
             Err(SelectorValidationError::Unsupported) => {}
         }
     }
-    if invalid {
-        Err(SelectorValidationError::Invalid)
-    } else {
-        best.ok_or(SelectorValidationError::Unsupported)
+    match best {
+        Some(requirement) => Ok(requirement),
+        None if invalid => Err(SelectorValidationError::Invalid),
+        None => Err(SelectorValidationError::Unsupported),
     }
 }
 
@@ -489,7 +449,6 @@ mod tests {
         let resolution = resolve("chapter.xhtml", json!([])).pop().unwrap();
         assert!(matches!(resolution, AnnotationResolution::Resource { .. }));
         assert!(resolution.source().is_some());
-        assert_eq!(resolution.text(), None);
         assert_eq!(AnnotationResolution::MissingSource.source(), None);
     }
 
@@ -543,23 +502,21 @@ mod tests {
     }
 
     #[test]
-    fn text_ranges_project_text_and_report_out_of_bounds() {
-        let selected = resolve(
+    fn text_positions_require_rendered_text_host_resolution() {
+        let resolution = resolve(
             "chapter.xhtml",
             json!([{"type":"TextPositionSelector","start":0,"end":5}]),
         )
         .pop()
         .unwrap();
-        assert_eq!(selected.text(), Some("Hello"));
-        assert!(selected.source().is_some());
-
         assert!(matches!(
-            resolve(
-                "chapter.xhtml",
-                json!([{"type":"TextPositionSelector","start":0,"end":500}])
-            )[0],
-            AnnotationResolution::Broken { .. }
+            &resolution,
+            AnnotationResolution::HostRequired {
+                requirement: HostRequirement::RenderedText,
+                ..
+            }
         ));
+        assert!(resolution.source().is_some());
     }
 
     #[test]
@@ -578,7 +535,13 @@ mod tests {
         );
 
         assert!(matches!(results[0], AnnotationResolution::Fragment { .. }));
-        assert!(matches!(results[1], AnnotationResolution::Text { .. }));
+        assert!(matches!(
+            results[1],
+            AnnotationResolution::HostRequired {
+                requirement: HostRequirement::RenderedText,
+                ..
+            }
+        ));
         assert!(matches!(
             results[2],
             AnnotationResolution::HostRequired {
@@ -593,7 +556,55 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(results[0].text(), None);
         assert!(results.iter().all(|result| result.source().is_some()));
+    }
+
+    #[test]
+    fn valid_refinement_branch_survives_invalid_and_unsupported_siblings() {
+        let resolution = resolve(
+            "chapter.xhtml",
+            json!([{
+                "type":"CssSelector",
+                "value":"body",
+                "refinedBy":[
+                    {"value":"missing type"},
+                    {"type":"FutureSelector","value":"future"},
+                    {"type":"CssSelector","value":"#one"}
+                ]
+            }]),
+        )
+        .pop()
+        .unwrap();
+
+        assert!(matches!(
+            resolution,
+            AnnotationResolution::HostRequired {
+                requirement: HostRequirement::Dom,
+                ..
+            }
+        ));
+
+        assert!(matches!(
+            resolve(
+                "chapter.xhtml",
+                json!([{
+                    "type":"CssSelector",
+                    "value":"body",
+                    "refinedBy":[{"value":"missing type"}]
+                }])
+            )[0],
+            AnnotationResolution::InvalidSelector { .. }
+        ));
+        assert!(matches!(
+            resolve(
+                "chapter.xhtml",
+                json!([{
+                    "type":"CssSelector",
+                    "value":"body",
+                    "refinedBy":[{"type":"FutureSelector","value":"future"}]
+                }])
+            )[0],
+            AnnotationResolution::UnsupportedSelector { .. }
+        ));
     }
 }
