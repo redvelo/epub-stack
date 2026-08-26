@@ -1,9 +1,38 @@
 use crate::analysis::PublicationAnalysis;
 use crate::resource::{
-    ProviderPresence, ResolvedHref, ResourceAddress, ResourceIndex, ResourceRef,
+    AuthoredHref, EpubPath, ParsedHref, ProviderPresence, ResolvedHref, ResourceAddress,
+    ResourceIndex, ResourceRef, parse_href, resolve_local_href_from_source,
 };
 
 use super::{AnnotationSelector, AnnotationTarget, FragmentConformsTo, FragmentSelector};
+
+/// Resolves an authored unfragmented annotation reference relative to a package document.
+///
+/// The reference must be a local relative href. Queries do not participate in resource identity,
+/// matching [`ResourceIndex::resolve_manifest_href`]. Invalid syntax, fragments, absolute paths,
+/// root escapes, encoded separators, and references with a scheme return `None`.
+pub fn resolve_annotation_reference(reference: &str, package_path: &EpubPath) -> Option<EpubPath> {
+    let target = reference
+        .split_once('#')
+        .map_or(reference, |(target, _)| target);
+    let authored_path = target.split_once('?').map_or(target, |(path, _)| path);
+    if !authored_path.is_empty() {
+        let decoded = percent_encoding::percent_decode_str(authored_path)
+            .decode_utf8()
+            .ok()?;
+        let mut segments = decoded.split('/');
+        if segments.clone().any(str::is_empty)
+            || segments
+                .next_back()
+                .is_some_and(|segment| matches!(segment, "." | ".."))
+        {
+            return None;
+        }
+    }
+    let (path, fragment) =
+        resolve_local_href_from_source(&AuthoredHref::new(reference), package_path)?;
+    fragment.is_none().then_some(path)
+}
 
 /// Reports whether an annotation target source is available in a publication inventory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,11 +233,9 @@ impl PublicationAnalysis {
         }) else {
             return AnnotationResolution::Unavailable { source };
         };
-        let fragment = percent_encoding::percent_decode_str(value)
-            .decode_utf8()
-            .ok()
-            .map(|value| value.into_owned())
-            .unwrap_or_else(|| value.to_string());
+        let Some(fragment) = decode_fragment_selector_value(value) else {
+            return AnnotationResolution::Broken { source };
+        };
         let matches = facts
             .fragments()
             .iter()
@@ -336,6 +363,9 @@ fn fragment_requirement(
     if selector.value().trim().is_empty() {
         return Err(SelectorValidationError::Invalid);
     }
+    if decode_fragment_selector_value(selector.value()).is_none() {
+        return Err(SelectorValidationError::Invalid);
+    }
     match selector.conforms_to() {
         None | Some(FragmentConformsTo::Html) if source.has_xhtml_declaration() => {
             Ok(HostRequirement::Dom)
@@ -344,6 +374,17 @@ fn fragment_requirement(
             Ok(HostRequirement::RenderedText)
         }
         _ => Err(SelectorValidationError::Unsupported),
+    }
+}
+
+/// Strictly decodes an authored FragmentSelector value without accepting a raw delimiter.
+pub fn decode_fragment_selector_value(value: &str) -> Option<String> {
+    if value.contains('#') {
+        return None;
+    }
+    match parse_href(AuthoredHref::new(format!("#{value}"))) {
+        ParsedHref::SameDocument { fragment, .. } => Some(fragment),
+        _ => None,
     }
 }
 
@@ -432,6 +473,54 @@ mod tests {
     }
 
     #[test]
+    fn annotation_reference_resolution_matches_manifest_href_identity() {
+        let epub = epub();
+        let package_path = epub.package_path();
+        for reference in [
+            "chapter.xhtml",
+            "./chapter.xhtml",
+            "text/../chapter.xhtml",
+            "chapt%65r.xhtml",
+            "chapter.xhtml?view=reader",
+            "?view=reader",
+        ] {
+            let resolved = resolve_annotation_reference(reference, package_path).unwrap();
+            assert_eq!(
+                epub.resources().resolve_manifest_href(reference),
+                ResolvedHref::Resource(ResourceAddress::Local(resolved))
+            );
+        }
+
+        for reference in [
+            "",
+            "chapter.xhtml#one",
+            "https://example.com/chapter.xhtml",
+            "//example.com/chapter.xhtml",
+            "data:text/plain,chapter",
+            "urn:example:chapter",
+            "/chapter.xhtml",
+            "../../chapter.xhtml",
+            "text%2Fchapter.xhtml",
+            "text%5cchapter.xhtml",
+            "chapter%",
+            "chapter%GG.xhtml",
+            " chapter.xhtml",
+            "chapter.xhtml\n",
+            "chapter\\name.xhtml",
+            "text//chapter.xhtml",
+            "chapter.xhtml/",
+            ".",
+            "text/..",
+        ] {
+            assert_eq!(
+                resolve_annotation_reference(reference, package_path),
+                None,
+                "{reference:?}"
+            );
+        }
+    }
+
+    #[test]
     fn source_failures_and_selectorless_targets_project_consistently() {
         assert!(matches!(
             resolve("unknown.xhtml", json!([])).as_slice(),
@@ -498,6 +587,34 @@ mod tests {
                 json!([{"type":"FragmentSelector","value":"one"}])
             )[0],
             AnnotationResolution::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn malformed_fragment_percent_encoding_is_invalid() {
+        for value in ["literal%", "literal%GG", "%FF", "#one", "one#two"] {
+            assert!(matches!(
+                resolve(
+                    "chapter.xhtml",
+                    json!([{"type":"FragmentSelector","value":value}])
+                )[0],
+                AnnotationResolution::InvalidSelector { .. }
+            ));
+        }
+
+        assert!(matches!(
+            resolve(
+                "chapter.xhtml",
+                json!([{"type":"FragmentSelector","value":"%6fne"}])
+            )[0],
+            AnnotationResolution::Fragment { ref value, .. } if value == "one"
+        ));
+        assert!(matches!(
+            resolve(
+                "chapter.xhtml",
+                json!([{"type":"FragmentSelector","value":"one%23two"}])
+            )[0],
+            AnnotationResolution::Broken { .. }
         ));
     }
 

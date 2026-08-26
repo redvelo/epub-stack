@@ -12,7 +12,6 @@
 //! array entries, or every malformed shape. Selector refinements beyond
 //! [`MAX_SELECTOR_NESTING_DEPTH`] are discarded.
 
-use crate::content::text::TextRange;
 use crate::resource::EpubPath;
 use crate::resource::MediaType;
 use crate::resource::provider::{ProviderReadError, ResourceProviderIndexError};
@@ -33,7 +32,10 @@ pub(crate) use bundle::{
     MAX_ANNOTATIONS_JSON_BYTES, MAX_ARCHIVE_ENTRIES, MAX_ARCHIVE_RESOURCE_BYTES,
     MAX_ARCHIVE_UNCOMPRESSED_BYTES, normalize_annotation_resource_path,
 };
-pub use resolution::{AnnotationResolution, AnnotationSourceState, HostRequirement};
+pub use resolution::{
+    AnnotationResolution, AnnotationSourceState, HostRequirement, decode_fragment_selector_value,
+    resolve_annotation_reference,
+};
 
 /// Stores JSON members that are not represented by typed annotation fields.
 pub type JsonObject = Map<String, Value>;
@@ -872,6 +874,7 @@ impl FragmentSelector {
         #[builder(default)] refined_by: Vec<AnnotationSelector>,
     ) -> Result<Self, AnnotationModelError> {
         require_non_empty(&value, "fragment selector value")?;
+        require_valid_fragment_value(&value)?;
         ensure_valid_refinements(&refined_by)?;
         Ok(Self {
             value: Some(value),
@@ -1049,19 +1052,20 @@ impl TextPositionSelector {
     /// Builds a non-empty half-open text range with bounded valid refinements.
     #[builder]
     pub fn new(
-        range: TextRange,
+        start: u64,
+        end: u64,
         #[builder(default)] refined_by: Vec<AnnotationSelector>,
     ) -> Result<Self, AnnotationModelError> {
         ensure_valid_refinements(&refined_by)?;
-        if range.start() >= range.end() {
+        if start >= end {
             return Err(AnnotationModelError::InvalidField {
                 field: "text position selector range",
-                value: format!("{}..{}", range.start(), range.end()),
+                value: format!("{start}..{end}"),
             });
         }
         Ok(Self {
-            start: Some(range.start()),
-            end: Some(range.end()),
+            start: Some(start),
+            end: Some(end),
             refined_by,
             extra: JsonObject::new(),
         })
@@ -2449,6 +2453,16 @@ fn ensure_valid_refinements(selectors: &[AnnotationSelector]) -> Result<(), Anno
     ensure_valid_selector_tree(selectors, 2, true)
 }
 
+fn require_valid_fragment_value(value: &str) -> Result<(), AnnotationModelError> {
+    if decode_fragment_selector_value(value).is_none() {
+        return Err(AnnotationModelError::InvalidField {
+            field: "fragment selector value",
+            value: value.to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn ensure_valid_selector_tree(
     selectors: &[AnnotationSelector],
     starting_depth: usize,
@@ -2467,6 +2481,7 @@ fn ensure_valid_selector_tree(
         match selector {
             AnnotationSelector::Fragment(selector) => {
                 require_non_empty(selector.value(), "fragment selector value")?;
+                require_valid_fragment_value(selector.value())?;
                 pending.extend(
                     selector
                         .refined_by()
@@ -3027,7 +3042,8 @@ mod tests {
                 .build()
                 .unwrap_err(),
             TextPositionSelector::builder()
-                .range(TextRange::new(0, 1).unwrap())
+                .start(0)
+                .end(1)
                 .refined_by(vec![at_limit])
                 .build()
                 .unwrap_err(),
@@ -3039,6 +3055,26 @@ mod tests {
                 }
             ));
         }
+    }
+
+    #[test]
+    fn typed_fragment_selectors_reject_malformed_values() {
+        for value in ["literal%", "%FF", "#one", "one#two"] {
+            assert!(
+                FragmentSelector::builder()
+                    .value(value.to_string())
+                    .build()
+                    .is_err(),
+                "{value:?}"
+            );
+        }
+
+        assert!(
+            FragmentSelector::builder()
+                .value("one%23two".to_string())
+                .build()
+                .is_ok()
+        );
     }
 
     #[test]
@@ -3114,7 +3150,8 @@ mod tests {
         );
         assert!(
             TextPositionSelector::builder()
-                .range(TextRange::new(0, 1).unwrap())
+                .start(0)
+                .end(1)
                 .refined_by(vec![unknown])
                 .build()
                 .is_err()
@@ -3384,9 +3421,9 @@ mod tests {
 
     #[test]
     fn typed_builders_create_canonical_annotation_json() {
-        let range = TextRange::new(4, 19).unwrap();
         let refinement = TextPositionSelector::builder()
-            .range(range)
+            .start(4)
+            .end(19)
             .build()
             .unwrap();
         let selector = CssSelector::builder()
@@ -3723,10 +3760,10 @@ mod tests {
         };
         assert_eq!((position.start(), position.end()), (Some(4), Some(4)));
 
-        let empty = TextRange::new(4, 4).unwrap();
         assert!(
             TextPositionSelector::builder()
-                .range(empty)
+                .start(4)
+                .end(4)
                 .build()
                 .is_err()
         );
