@@ -312,7 +312,7 @@ fn selector_requirement(
             let (Some(start), Some(end)) = (selector.start(), selector.end()) else {
                 return Err(SelectorValidationError::Invalid);
             };
-            if start >= end {
+            if start > end {
                 return Err(SelectorValidationError::Invalid);
             }
             if !source.has_xhtml_declaration() {
@@ -634,6 +634,24 @@ mod tests {
             }
         ));
         assert!(resolution.source().is_some());
+
+        assert!(matches!(
+            resolve(
+                "chapter.xhtml",
+                json!([{"type":"TextPositionSelector","start":4,"end":4}]),
+            )[0],
+            AnnotationResolution::HostRequired {
+                requirement: HostRequirement::RenderedText,
+                ..
+            }
+        ));
+        assert!(matches!(
+            resolve(
+                "chapter.xhtml",
+                json!([{"type":"TextPositionSelector","start":5,"end":4}]),
+            )[0],
+            AnnotationResolution::InvalidSelector { .. }
+        ));
     }
 
     #[test]

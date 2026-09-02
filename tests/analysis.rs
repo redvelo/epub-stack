@@ -57,7 +57,7 @@ fn foreground_preparation_state(
 }
 
 #[test]
-fn foreground_preparation_requires_complete_static_xhtml() {
+fn foreground_preparation_uses_complete_normalized_static_xhtml() {
     let unlimited = || AnalysisLimits::new(None, None, None, None);
     let static_document = r#"<html xmlns="http://www.w3.org/1999/xhtml"><head><link rel="stylesheet" href="book.css"/></head><body><img src="cover.jpg"/><p>Static</p></body></html>"#;
     assert_eq!(
@@ -78,7 +78,15 @@ fn foreground_preparation_requires_complete_static_xhtml() {
             "<html><body><p>broken</body></html>",
             unlimited(),
         ),
-        ForegroundPreparationEligibility::Unknown
+        ForegroundPreparationEligibility::Eligible
+    );
+    assert_eq!(
+        foreground_preparation_state(
+            "application/xhtml+xml",
+            "<html><body><script>run()</body></html>",
+            unlimited(),
+        ),
+        ForegroundPreparationEligibility::Ineligible
     );
     assert_eq!(
         foreground_preparation_state(
@@ -276,7 +284,7 @@ fn foreground_preparation_excludes_active_and_early_lifecycle_constructs() {
 }
 
 #[test]
-fn foreground_preparation_requires_supported_authored_element_namespaces() {
+fn foreground_preparation_uses_normalized_element_namespaces() {
     let state = |document: &str| {
         foreground_preparation_state(
             "application/xhtml+xml",
@@ -286,13 +294,13 @@ fn foreground_preparation_requires_supported_authored_element_namespaces() {
     };
     assert_eq!(
         state(r#"<html xmlns="urn:not-xhtml"><body><p>Text</p></body></html>"#),
-        ForegroundPreparationEligibility::Unknown
+        ForegroundPreparationEligibility::Eligible
     );
     assert_eq!(
         state(
             r#"<html xmlns="http://www.w3.org/1999/xhtml"><body><custom xmlns="urn:unsupported">Text</custom></body></html>"#
         ),
-        ForegroundPreparationEligibility::Unknown
+        ForegroundPreparationEligibility::Eligible
     );
     assert_eq!(
         state(

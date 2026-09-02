@@ -33,7 +33,7 @@ use crate::resource::{
 use coverage::Coverage;
 use fingerprint::Blake3Hash;
 use reference::{AuthoredReference, HrefReference, XhtmlReferenceIndex};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Resource-count and byte budgets for one full publication analysis.
 ///
@@ -234,7 +234,8 @@ pub enum ResourceClassification {
 /// Eligibility requires complete analysis of a supported XHTML or standalone SVG document and no
 /// executable content or supported active early-lifecycle construct. `Unknown` means eligibility
 /// could not be established from a complete supported analysis; it is not equivalent to
-/// ineligibility.
+/// ineligibility. XHTML support and hazards reflect the extractor's normalized HTML parse rather
+/// than separate strict XML validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ForegroundPreparationEligibility {
     /// Complete supported XHTML or standalone SVG analysis found no excluded construct.
@@ -623,6 +624,7 @@ impl PublicationAnalysis {
                     .push(facts.resource_row());
             }
         }
+        let mut seen_duplicate_fingerprints = HashSet::new();
         let duplicate_fingerprints = resource_facts
             .iter()
             .filter_map(|facts| match facts.fingerprint() {
@@ -636,12 +638,8 @@ impl PublicationAnalysis {
                     .get(hash)
                     .is_some_and(|keys| keys.len() > 1)
             })
-            .fold(Vec::new(), |mut hashes, hash| {
-                if !hashes.contains(&hash) {
-                    hashes.push(hash);
-                }
-                hashes
-            });
+            .filter(|hash| seen_duplicate_fingerprints.insert(*hash))
+            .collect();
         Self {
             limits,
             resources,

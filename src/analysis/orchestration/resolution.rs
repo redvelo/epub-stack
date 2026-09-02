@@ -260,11 +260,17 @@ fn authored_query(href: &AuthoredHref) -> Option<String> {
         .map(|(_, query)| query.to_string())
 }
 
+pub(super) fn facts_for_row(
+    facts: &[ResourceFacts],
+    resource: ResourceRow,
+) -> Option<&ResourceFacts> {
+    facts
+        .get(resource.0)
+        .filter(|facts| facts.resource_row() == resource)
+}
+
 fn fragment_exists(facts: &[ResourceFacts], resource: ResourceRow, fragment: &str) -> Option<bool> {
-    let outcome = facts
-        .iter()
-        .find(|facts| facts.resource_row() == resource)?
-        .content();
+    let outcome = facts_for_row(facts, resource)?.content();
     let fragments = match outcome.value()? {
         ContentFacts::Xhtml(content) => content.fragments(),
         ContentFacts::Svg(content) => content.fragments(),
@@ -283,6 +289,7 @@ pub(super) fn fragment_coverage(
     facts: &[ResourceFacts],
 ) -> ResourceCoverage {
     let mut expected = Vec::new();
+    let mut expected_set = HashSet::new();
     for reference in references {
         let AuthoredReference::Href(reference) = reference else {
             continue;
@@ -290,14 +297,12 @@ pub(super) fn fragment_coverage(
         let HrefTarget::Fragment { resource, .. } = reference.target() else {
             continue;
         };
-        if facts
-            .iter()
-            .find(|facts| facts.resource() == *resource)
+        if facts_for_row(facts, (*resource).into())
             .is_none_or(|facts| matches!(facts.content(), AnalysisOutcome::NotApplicable))
         {
             continue;
         }
-        if !expected.contains(resource) {
+        if expected_set.insert(*resource) {
             expected.push(*resource);
         }
     }
@@ -305,10 +310,7 @@ pub(super) fn fragment_coverage(
     let mut partial = Vec::new();
     let mut unavailable = Vec::new();
     for resource in &expected {
-        let outcome = facts
-            .iter()
-            .find(|facts| facts.resource() == *resource)
-            .map(ResourceFacts::content);
+        let outcome = facts_for_row(facts, (*resource).into()).map(ResourceFacts::content);
         match outcome {
             Some(AnalysisOutcome::Complete(_)) => completed.push(*resource),
             Some(AnalysisOutcome::Partial { issue, .. }) => {

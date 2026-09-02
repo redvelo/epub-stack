@@ -1035,7 +1035,7 @@ impl CssSelector {
     }
 }
 
-/// A half-open range in the rendered text representation defined by Web Annotations.
+/// A point or half-open range in the rendered text representation defined by Web Annotations.
 ///
 /// Resolution requires a browser host because extracted source text is not authoritative for
 /// rendered-text offsets.
@@ -1049,7 +1049,7 @@ pub struct TextPositionSelector {
 
 #[bon::bon]
 impl TextPositionSelector {
-    /// Builds a non-empty half-open text range with bounded valid refinements.
+    /// Builds a text point or half-open range with bounded valid refinements.
     #[builder]
     pub fn new(
         start: u64,
@@ -1057,7 +1057,7 @@ impl TextPositionSelector {
         #[builder(default)] refined_by: Vec<AnnotationSelector>,
     ) -> Result<Self, AnnotationModelError> {
         ensure_valid_refinements(&refined_by)?;
-        if start >= end {
+        if start > end {
             return Err(AnnotationModelError::InvalidField {
                 field: "text position selector range",
                 value: format!("{start}..{end}"),
@@ -2504,7 +2504,7 @@ fn ensure_valid_selector_tree(
                         field: "text position selector range",
                     });
                 };
-                if start >= end {
+                if start > end {
                     return Err(AnnotationModelError::InvalidField {
                         field: "text position selector range",
                         value: format!("{start}..{end}"),
@@ -3763,6 +3763,13 @@ mod tests {
         assert!(
             TextPositionSelector::builder()
                 .start(4)
+                .end(4)
+                .build()
+                .is_ok()
+        );
+        assert!(
+            TextPositionSelector::builder()
+                .start(5)
                 .end(4)
                 .build()
                 .is_err()

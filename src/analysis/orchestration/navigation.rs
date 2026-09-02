@@ -1,5 +1,6 @@
 use super::resolution::*;
 use super::*;
+use std::collections::VecDeque;
 
 pub(super) fn collect_secondary_ncx_references(
     resources: &ResourceIndex,
@@ -68,10 +69,7 @@ pub(super) fn collect_navigation_references(
             None,
         ),
         NavigationSource::EpubNav => {
-            let outcome = facts
-                .iter()
-                .find(|facts| facts.resource_row() == record.key())
-                .map(ResourceFacts::content);
+            let outcome = facts_for_row(facts, record.key()).map(ResourceFacts::content);
             let authored_base = xhtml_pending
                 .get(&record.key())
                 .and_then(|(_, authored_base, _)| authored_base.as_ref());
@@ -203,32 +201,48 @@ pub(super) fn navigation_reference_indices(
         .collect::<Vec<_>>();
     let mut indices = vec![None; links.len()];
     let mut claimed = HashSet::new();
+    let mut matching_navigation = HashMap::<(HrefRole, &AuthoredHref), VecDeque<usize>>::new();
+    for (index, reference) in &navigation {
+        matching_navigation
+            .entry((reference.role(), reference.declared()))
+            .or_default()
+            .push_back(*index);
+    }
 
     for (index, link) in links.iter().enumerate() {
         let Some(kind) = link.navigation().map(navigation_reference_kind) else {
             continue;
         };
-        if let Some((reference_index, _)) = navigation.iter().find(|(index, reference)| {
-            reference.role() == kind
-                && reference.declared() == link.declared()
-                && !claimed.contains(index)
-        }) {
-            indices[index] = Some(*reference_index);
-            claimed.insert(*reference_index);
+        if let Some(reference_index) = matching_navigation
+            .get_mut(&(kind, link.declared()))
+            .and_then(VecDeque::pop_front)
+        {
+            indices[index] = Some(reference_index);
+            claimed.insert(reference_index);
         }
     }
 
+    let mut matching_hyperlinks = HashMap::<&AuthoredHref, VecDeque<usize>>::new();
+    for (index, link) in links.iter().enumerate() {
+        if matches!(link, LinkFact::Hyperlink(_)) {
+            matching_hyperlinks
+                .entry(link.declared())
+                .or_default()
+                .push_back(index);
+        }
+    }
     for (reference_index, reference) in navigation {
         if claimed.contains(&reference_index) {
             continue;
         }
-        if let Some((index, _)) = links.iter().enumerate().find(|(index, link)| {
-            indices[*index].is_none()
-                && matches!(link, LinkFact::Hyperlink(_))
-                && link.declared() == reference.declared()
-        }) {
-            indices[index] = Some(reference_index);
-            claimed.insert(reference_index);
+        let Some(matches) = matching_hyperlinks.get_mut(reference.declared()) else {
+            continue;
+        };
+        while let Some(index) = matches.pop_front() {
+            if indices[index].is_none() {
+                indices[index] = Some(reference_index);
+                break;
+            }
         }
     }
     indices

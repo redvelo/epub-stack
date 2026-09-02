@@ -61,7 +61,6 @@ impl HtmlContentExtractor {
         let text_state = Rc::clone(&state);
 
         let mut bytes_read = 0u64;
-        let mut source = Vec::new();
         let rewrite_result: std::result::Result<(), String> = {
             let mut rewriter = HtmlRewriter::new(
                 Settings::new()
@@ -97,7 +96,6 @@ impl HtmlContentExtractor {
                     Ok(0) => break,
                     Ok(len) => {
                         bytes_read = bytes_read.saturating_add(len as u64);
-                        source.extend_from_slice(&buffer[..len]);
                         rewriter
                             .write(&buffer[..len])
                             .map_err(|err| err.to_string())?
@@ -110,16 +108,7 @@ impl HtmlContentExtractor {
 
         let state = Rc::try_unwrap(state).unwrap().into_inner();
         rewrite_result?;
-        let document = std::str::from_utf8(&source)
-            .ok()
-            .and_then(foreground_preparation_document_scan);
-        Ok((
-            state.finish(
-                document.is_some(),
-                document.is_some_and(|document| document.active_content),
-            ),
-            bytes_read,
-        ))
+        Ok((state.finish(true), bytes_read))
     }
 }
 
@@ -477,16 +466,12 @@ impl ExtractorState {
         }
     }
 
-    pub(super) fn finish(
-        mut self,
-        document_supported: bool,
-        document_hazard: bool,
-    ) -> XhtmlExtraction {
+    pub(super) fn finish(mut self, document_supported: bool) -> XhtmlExtraction {
         self.finish_all_text_blocks();
         self.build_text_stream();
         self.facts.foreground_preparation_document_supported = document_supported;
         self.facts.foreground_preparation_hazard_detected =
-            self.foreground_preparation_hazard_detected || document_hazard;
+            self.foreground_preparation_hazard_detected;
         XhtmlExtraction {
             facts: self.facts,
             accessibility: self.accessibility,
@@ -524,7 +509,7 @@ impl ExtractorState {
         attrs: &ElementAttrs,
         has_end: bool,
     ) {
-        if in_html && !in_svg && foreground_preparation_hazard(element, attrs) {
+        if foreground_preparation_hazard(element, in_svg, in_html, attrs) {
             self.foreground_preparation_hazard_detected = true;
         }
         let element_ordinal = self.next_element_ordinal;
@@ -1270,102 +1255,28 @@ impl ExtractorState {
     }
 }
 
-#[derive(Clone, Copy)]
-struct ForegroundPreparationDocumentScan {
-    active_content: bool,
-}
-
-fn foreground_preparation_document_scan(source: &str) -> Option<ForegroundPreparationDocumentScan> {
-    const XHTML_NAMESPACE: &str = "http://www.w3.org/1999/xhtml";
-    const SVG_NAMESPACE: &str = "http://www.w3.org/2000/svg";
-    const MATHML_NAMESPACE: &str = "http://www.w3.org/1998/Math/MathML";
-
-    let mut xot = xot::Xot::new();
-    let document = xot.parse(source).ok()?;
-    let root = xot.document_element(document).ok()?;
-    let root_name = xot.element(root)?.name();
-    if xot.name_ns_str(root_name) != ("html", XHTML_NAMESPACE) {
-        return None;
-    }
-
-    let mut active_content = false;
-    for node in std::iter::once(root).chain(xot.descendants(root)) {
-        let Some(element) = xot.element(node) else {
-            continue;
-        };
-        let (local_name, namespace) = xot.name_ns_str(element.name());
-        if !matches!(
-            namespace,
-            XHTML_NAMESPACE | SVG_NAMESPACE | MATHML_NAMESPACE
-        ) {
-            return None;
-        }
-        if (namespace == XHTML_NAMESPACE
-            && matches!(
-                local_name,
-                "audio" | "embed" | "iframe" | "object" | "script" | "source" | "track" | "video"
-            ))
-            || (namespace == SVG_NAMESPACE
-                && matches!(
-                    local_name,
-                    "animate"
-                        | "animateColor"
-                        | "animateMotion"
-                        | "animateTransform"
-                        | "discard"
-                        | "script"
-                        | "set"
-                ))
-        {
-            active_content = true;
-        }
-        let mut http_equiv = None;
-        let mut relationship = None;
-        for (name, value) in xot.attributes(node).iter() {
-            let (attribute, attribute_namespace) = xot.name_ns_str(name);
-            if attribute_namespace.is_empty() {
-                if attribute.eq_ignore_ascii_case("autofocus") || attribute.starts_with("on") {
-                    active_content = true;
-                } else if attribute.eq_ignore_ascii_case("http-equiv") {
-                    http_equiv = Some(value.as_str());
-                } else if attribute.eq_ignore_ascii_case("rel") {
-                    relationship = Some(value.as_str());
-                }
-            }
-        }
-        if namespace == XHTML_NAMESPACE
-            && local_name == "meta"
-            && http_equiv.is_some_and(|value| value.trim().eq_ignore_ascii_case("refresh"))
-        {
-            active_content = true;
-        }
-        if namespace == XHTML_NAMESPACE
-            && local_name == "link"
-            && relationship.is_some_and(|value| {
-                value.split_ascii_whitespace().any(|token| {
-                    matches!(
-                        token.to_ascii_lowercase().as_str(),
-                        "dns-prefetch"
-                            | "modulepreload"
-                            | "preconnect"
-                            | "prefetch"
-                            | "preload"
-                            | "prerender"
-                    )
-                })
-            })
-        {
-            active_content = true;
-        }
-    }
-    Some(ForegroundPreparationDocumentScan { active_content })
-}
-
-fn foreground_preparation_hazard(element: &str, attrs: &ElementAttrs) -> bool {
-    matches!(
-        element,
-        "audio" | "video" | "source" | "track" | "iframe" | "object" | "embed"
-    ) || attrs.value("autofocus").is_some()
+fn foreground_preparation_hazard(
+    element: &str,
+    in_svg: bool,
+    in_html: bool,
+    attrs: &ElementAttrs,
+) -> bool {
+    let element = element.rsplit(':').next().unwrap_or(element);
+    let active_attribute = attrs.values().any(|(name, _)| {
+        let name = name.rsplit(':').next().unwrap_or(name);
+        name.eq_ignore_ascii_case("autofocus") || name.starts_with("on")
+    });
+    (in_html
+        && matches!(
+            element,
+            "audio" | "video" | "source" | "track" | "iframe" | "object" | "embed" | "script"
+        ))
+        || matches!(
+            element,
+            "animate" | "animatecolor" | "animatemotion" | "animatetransform" | "discard" | "set"
+        )
+        || (in_svg && element.eq_ignore_ascii_case("script"))
+        || active_attribute
         || (element == "meta"
             && attrs
                 .value("http-equiv")

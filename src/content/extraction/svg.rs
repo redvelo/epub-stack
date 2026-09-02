@@ -933,7 +933,7 @@ fn finish_foreign_object(scan: &mut SvgScan, foreign: ForeignObjectCapture) {
     let captured_accessibility = foreign.captured_accessibility;
     let element_ordinal = foreign.element_ordinal;
     let fragment = foreign.fragment;
-    let extraction = foreign.projector.finish(false, false);
+    let extraction = foreign.projector.finish(false);
     if let Some(authored_base) = extraction.authored_base {
         for pending in scan
             .pending_references
