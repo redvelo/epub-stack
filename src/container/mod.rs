@@ -10,6 +10,6 @@ mod error;
 mod export;
 
 pub use document::{RenditionAccessMode, Rootfile};
-pub use epub_zip::EpubZip;
+pub use epub_zip::{EpubZip, EpubZipEntryLayout};
 pub use error::{ContainerDocumentError, ContainerError, ContainerXmlDecodeError, ExportError};
 pub(crate) use export::{ExportOverlay, export_provider};

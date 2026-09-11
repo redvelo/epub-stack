@@ -35,7 +35,7 @@ use fingerprint::Blake3Hash;
 use reference::{AuthoredReference, HrefReference, XhtmlReferenceIndex};
 use std::collections::{HashMap, HashSet};
 
-/// Resource-count and byte budgets for one full publication analysis.
+/// Resource-count, byte, and SMIL structural budgets for one full publication analysis.
 ///
 /// Each `None` disables that individual limit. Reaching a limit produces partial or unavailable
 /// results recorded by [`AnalysisOutcome`] and [`Coverage`]; it does not imply that the EPUB is
@@ -46,10 +46,12 @@ pub struct AnalysisLimits {
     max_resource_analysis_bytes: Option<u64>,
     max_total_analysis_bytes: Option<u64>,
     max_total_fingerprint_bytes: Option<u64>,
+    max_smil_nodes: Option<usize>,
+    max_smil_nesting: Option<usize>,
 }
 
 impl AnalysisLimits {
-    /// Creates a set of independent resource-count and byte budgets.
+    /// Creates a set of independent resource-count, byte, and SMIL structural budgets.
     ///
     /// The byte limits apply, in order, per analyzed resource, across content analysis,
     /// and across fingerprinting. `None` disables the corresponding budget.
@@ -58,12 +60,16 @@ impl AnalysisLimits {
         max_resource_analysis_bytes: Option<u64>,
         max_total_analysis_bytes: Option<u64>,
         max_total_fingerprint_bytes: Option<u64>,
+        max_smil_nodes: Option<usize>,
+        max_smil_nesting: Option<usize>,
     ) -> Self {
         Self {
             max_analyzed_resources,
             max_resource_analysis_bytes,
             max_total_analysis_bytes,
             max_total_fingerprint_bytes,
+            max_smil_nodes,
+            max_smil_nesting,
         }
     }
 
@@ -85,6 +91,16 @@ impl AnalysisLimits {
     /// Returns the aggregate byte budget for fingerprinting.
     pub fn max_total_fingerprint_bytes(&self) -> Option<u64> {
         self.max_total_fingerprint_bytes
+    }
+
+    /// Returns the maximum number of XML nodes accepted in one SMIL document.
+    pub fn max_smil_nodes(&self) -> Option<usize> {
+        self.max_smil_nodes
+    }
+
+    /// Returns the maximum element nesting depth accepted in one SMIL document.
+    pub fn max_smil_nesting(&self) -> Option<usize> {
+        self.max_smil_nesting
     }
 
     /// Replaces the resource-count budget.
@@ -110,6 +126,18 @@ impl AnalysisLimits {
         self.max_total_fingerprint_bytes = value;
         self
     }
+
+    /// Replaces the per-document SMIL node-count budget.
+    pub fn with_max_smil_nodes(mut self, value: Option<usize>) -> Self {
+        self.max_smil_nodes = value;
+        self
+    }
+
+    /// Replaces the per-document SMIL nesting-depth budget.
+    pub fn with_max_smil_nesting(mut self, value: Option<usize>) -> Self {
+        self.max_smil_nesting = value;
+        self
+    }
 }
 
 impl Default for AnalysisLimits {
@@ -119,6 +147,8 @@ impl Default for AnalysisLimits {
             max_resource_analysis_bytes: Some(32 * 1024 * 1024),
             max_total_analysis_bytes: Some(512 * 1024 * 1024),
             max_total_fingerprint_bytes: Some(8 * 1024 * 1024 * 1024),
+            max_smil_nodes: Some(100_000),
+            max_smil_nesting: Some(256),
         }
     }
 }
@@ -191,6 +221,10 @@ pub enum AnalysisIssue {
     TotalAnalysisLimit,
     /// The run reached its aggregate fingerprint byte budget.
     TotalFingerprintLimit,
+    /// A SMIL document exceeded its configured XML node-count budget.
+    SmilNodeLimit,
+    /// A SMIL document exceeded its configured element nesting-depth budget.
+    SmilNestingLimit,
     /// Expected local bytes were absent.
     Missing,
     /// The provider could not read the resource bytes.

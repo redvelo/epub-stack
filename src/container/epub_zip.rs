@@ -8,9 +8,10 @@ use crate::{
     xml::decode_xml,
 };
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read, Seek};
+use std::ops::Range;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use zip::ZipArchive;
@@ -28,6 +29,67 @@ pub(crate) const CONTAINER_PATH: &str = "META-INF/container.xml";
 const MAX_AUTOMATIC_CONTAINER_BYTES: u64 = 4 * 1024 * 1024;
 
 type Result<T> = std::result::Result<T, ContainerError>;
+type SourceEntryIndex = BTreeMap<Vec<u8>, usize>;
+type SourceDirectory = (SourceEntryIndex, Vec<Vec<u8>>);
+
+/// Physical layout of one source ZIP entry in the reader supplied to [`EpubZip`].
+///
+/// This describes source archive bytes, not portable publication identity. Pending logical
+/// changes that shadow an entry have no source layout through [`EpubZip::source_entry_layout`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpubZipEntryLayout {
+    data_offset: u64,
+    compressed_size: u64,
+    uncompressed_size: u64,
+    crc32: u32,
+    stored: bool,
+    encrypted: bool,
+}
+
+impl EpubZipEntryLayout {
+    /// Returns the absolute byte offset at which the entry's source data begins.
+    pub fn data_offset(&self) -> u64 {
+        self.data_offset
+    }
+
+    /// Returns the source entry's compressed byte length.
+    pub fn compressed_size(&self) -> u64 {
+        self.compressed_size
+    }
+
+    /// Returns the source entry's uncompressed byte length.
+    pub fn uncompressed_size(&self) -> u64 {
+        self.uncompressed_size
+    }
+
+    /// Returns the source entry's declared CRC-32 value.
+    pub fn crc32(&self) -> u32 {
+        self.crc32
+    }
+
+    /// Returns whether the source entry uses the ZIP stored compression method.
+    pub fn is_stored(&self) -> bool {
+        self.stored
+    }
+
+    /// Returns whether the source entry is encrypted.
+    pub fn is_encrypted(&self) -> bool {
+        self.encrypted
+    }
+
+    /// Returns a candidate source data range for a directly stored logical resource.
+    ///
+    /// This checks method, encryption, length equality, and arithmetic only. Callers must bind the
+    /// layout to the same immutable source and recheck physical bounds before reading the range.
+    pub fn stored_data_range(&self) -> Option<Range<u64>> {
+        if !self.stored || self.encrypted || self.compressed_size != self.uncompressed_size {
+            return None;
+        }
+        self.data_offset
+            .checked_add(self.compressed_size)
+            .map(|end| self.data_offset..end)
+    }
+}
 
 /// An EPUB ZIP container that can be read, repaired, and opened as a publication.
 ///
@@ -36,6 +98,8 @@ type Result<T> = std::result::Result<T, ContainerError>;
 #[derive(Debug)]
 pub struct EpubZip<R: Read + Seek> {
     zip: Mutex<ZipArchive<R>>,
+    source_entries: SourceEntryIndex,
+    source_names: Vec<Vec<u8>>,
     container_state: ContainerState,
     container_dirty: bool,
     repairs: BTreeMap<EpubPath, Option<Vec<u8>>>,
@@ -95,7 +159,7 @@ impl<R: Read + Seek> ResourceProvider for EpubZip<R> {
         let mut zip = self
             .zip()
             .map_err(|source| ProviderReadError::backend(path.clone(), source))?;
-        if let Some(index) = zip.index_for_path(path.as_path()) {
+        if let Some(index) = self.source_index(path) {
             let mut zipfile = zip
                 .by_index(index)
                 .map_err(ContainerError::from)
@@ -125,13 +189,134 @@ impl<R: Read + Seek> EpubZip<R> {
     /// Returns an error if `reader` is not a readable ZIP archive.
     pub fn from_reader(reader: R) -> Result<Self> {
         let zip = ZipArchive::new(reader)?;
+        let central_directory_start = zip.central_directory_start();
+        let mut reader = zip.into_inner();
+        let (source_entries, source_names) =
+            Self::read_source_directory(&mut reader, central_directory_start)?;
+        let zip = ZipArchive::new(reader)?;
+        if zip.len() != source_names.len() {
+            return Err(zip::result::ZipError::InvalidArchive(
+                "Source ZIP entry selection did not match the central directory".into(),
+            )
+            .into());
+        }
         let container = EpubZip {
             zip: Mutex::new(zip),
+            source_entries,
+            source_names,
             container_state: ContainerState::Missing,
             container_dirty: false,
             repairs: BTreeMap::new(),
         };
         Ok(container.with_discovered_container_state())
+    }
+
+    fn read_source_directory(reader: &mut R, offset: u64) -> Result<SourceDirectory> {
+        use std::io::SeekFrom;
+
+        reader.seek(SeekFrom::Start(offset))?;
+        let mut selected_by_zip_name = BTreeMap::<Vec<u8>, usize>::new();
+        let mut source_names = Vec::<Vec<u8>>::new();
+        let mut selected_ordinals = Vec::<usize>::new();
+        let mut all_source_names = BTreeSet::new();
+        let mut ordinal = 0usize;
+        loop {
+            let mut signature = [0u8; 4];
+            reader.read_exact(&mut signature)?;
+            if signature != [0x50, 0x4b, 0x01, 0x02] {
+                break;
+            }
+            let mut header = [0u8; 42];
+            reader.read_exact(&mut header)?;
+            let name_len = usize::from(u16::from_le_bytes([header[24], header[25]]));
+            let extra_len = usize::from(u16::from_le_bytes([header[26], header[27]]));
+            let comment_len = i64::from(u16::from_le_bytes([header[28], header[29]]));
+            let mut source_name = vec![0; name_len];
+            reader.read_exact(&mut source_name)?;
+            let mut extra = vec![0; extra_len];
+            reader.read_exact(&mut extra)?;
+            reader.seek(SeekFrom::Current(comment_len))?;
+
+            all_source_names.insert(source_name.clone());
+            let zip_name = Self::unicode_path_name(&source_name, &extra)
+                .unwrap_or_else(|| source_name.clone());
+            if let Some(index) = selected_by_zip_name.get(&zip_name).copied() {
+                if source_names[index] != source_name {
+                    return Err(zip::result::ZipError::InvalidArchive(
+                        "Unicode path aliases collide across distinct raw ZIP names".into(),
+                    )
+                    .into());
+                }
+                source_names[index] = source_name;
+                selected_ordinals[index] = ordinal;
+            } else {
+                let index = source_names.len();
+                selected_by_zip_name.insert(zip_name, index);
+                source_names.push(source_name);
+                selected_ordinals.push(ordinal);
+            }
+            ordinal = ordinal.checked_add(1).ok_or_else(|| {
+                zip::result::ZipError::InvalidArchive("Too many central directory entries".into())
+            })?;
+        }
+
+        let selected_source_names = source_names.iter().cloned().collect::<BTreeSet<_>>();
+        if selected_source_names != all_source_names {
+            return Err(zip::result::ZipError::InvalidArchive(
+                "Unicode path aliases collapse distinct raw ZIP names".into(),
+            )
+            .into());
+        }
+        let mut by_source_order = selected_ordinals
+            .iter()
+            .copied()
+            .enumerate()
+            .collect::<Vec<_>>();
+        by_source_order.sort_by_key(|(_, ordinal)| *ordinal);
+        let mut source_entries = BTreeMap::new();
+        for (index, _) in by_source_order {
+            source_entries.insert(source_names[index].clone(), index);
+        }
+        Ok((source_entries, source_names))
+    }
+
+    fn unicode_path_name(source_name: &[u8], extra: &[u8]) -> Option<Vec<u8>> {
+        let mut remaining = extra;
+        let mut selected = source_name.to_vec();
+        let mut changed = false;
+        while remaining.len() >= 4 {
+            let header_id = u16::from_le_bytes([remaining[0], remaining[1]]);
+            let len = usize::from(u16::from_le_bytes([remaining[2], remaining[3]]));
+            remaining = &remaining[4..];
+            if remaining.len() < len {
+                break;
+            }
+            let field = &remaining[..len];
+            if header_id == 0x7075
+                && field.len() >= 5
+                && u32::from_le_bytes(field[1..5].try_into().ok()?) == Self::zip_crc32(&selected)
+            {
+                selected = field[5..].to_vec();
+                changed = true;
+            }
+            remaining = &remaining[len..];
+        }
+        changed.then_some(selected)
+    }
+
+    fn zip_crc32(bytes: &[u8]) -> u32 {
+        let mut crc = u32::MAX;
+        for byte in bytes {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
+            }
+        }
+        !crc
+    }
+
+    fn source_index(&self, path: &EpubPath) -> Option<usize> {
+        self.source_entries.get(path.as_str().as_bytes()).copied()
     }
 
     fn with_discovered_container_state(mut self) -> Self {
@@ -167,19 +352,55 @@ impl<R: Read + Seek> EpubZip<R> {
 
     fn with_entry_reader<T>(
         &self,
-        name: impl AsRef<Path>,
+        name: &str,
         read: impl FnOnce(&mut dyn Read) -> Result<T>,
     ) -> Result<T> {
-        let path = name.as_ref();
         let mut zip = self.zip()?;
-        if let Some(index) = zip.index_for_path(path) {
+        if let Some(index) = self.source_entries.get(name.as_bytes()).copied() {
             let mut zipfile = zip.by_index(index)?;
             read(&mut zipfile)
         } else {
             Err(ContainerError::MissingEntry {
-                path: path.to_path_buf(),
+                path: Path::new(name).to_path_buf(),
             })
         }
+    }
+
+    /// Returns the selected source ZIP entry's physical layout when source bytes back the path.
+    ///
+    /// Lookup uses the same exact raw UTF-8 name selected by logical provider reads. Missing
+    /// entries and entries shadowed by a pending replacement, removal, or generated container
+    /// document return `None`. The offsets are absolute to the exact reader supplied to this
+    /// value and must not be applied to another archive. Layout metadata does not certify source
+    /// bounds or payload integrity; hosts must validate the immutable source before direct reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns a ZIP error when the selected entry's local header is malformed or unreadable, or
+    /// [`ContainerError::ZipLockPoisoned`] when archive access is unavailable.
+    pub fn source_entry_layout(&self, path: &EpubPath) -> Result<Option<EpubZipEntryLayout>> {
+        if (path.as_str() == CONTAINER_PATH && self.container_dirty)
+            || self.repairs.contains_key(path)
+        {
+            return Ok(None);
+        }
+
+        let mut zip = self.zip()?;
+        let Some(index) = self.source_index(path) else {
+            return Ok(None);
+        };
+        let file = zip.by_index_raw(index)?;
+        let data_offset = file.data_start().ok_or_else(|| {
+            zip::result::ZipError::InvalidArchive("ZIP entry data offset was not resolved".into())
+        })?;
+        Ok(Some(EpubZipEntryLayout {
+            data_offset,
+            compressed_size: file.compressed_size(),
+            uncompressed_size: file.size(),
+            crc32: file.crc32(),
+            stored: file.compression() == zip::CompressionMethod::Stored,
+            encrypted: file.encrypted(),
+        }))
     }
 
     /// Returns decoded text for the logical `META-INF/container.xml` entry.
@@ -430,14 +651,16 @@ impl<R: Read + Seek> EpubZip<R> {
             .zip()
             .map_err(ResourceProviderIndexError::enumeration)?;
         let mut entries = Vec::new();
-        for idx in 0..zip.len() {
+        for (name, idx) in &self.source_entries {
             let file = zip
-                .by_index(idx)
+                .by_index_raw(*idx)
                 .map_err(ResourceProviderIndexError::enumeration)?;
-            let name = file.name().to_string();
+            debug_assert_eq!(self.source_names.get(*idx), Some(name));
+            let name =
+                std::str::from_utf8(name).map_err(|_| ResourceProviderIndexError::InvalidPath)?;
             if !name.is_empty() && !name.ends_with('/') {
-                let path = EpubPath::new(name.as_str())
-                    .map_err(|_| ResourceProviderIndexError::InvalidPath)?;
+                let path =
+                    EpubPath::new(name).map_err(|_| ResourceProviderIndexError::InvalidPath)?;
                 if path.as_str() != name {
                     return Err(ResourceProviderIndexError::InvalidPath);
                 }
@@ -479,7 +702,7 @@ mod tests {
     use std::io::{Cursor, Write};
 
     use super::{
-        CONTAINER_PATH, ContainerDocumentError, ContainerError, EpubZip,
+        CONTAINER_PATH, ContainerDocumentError, ContainerError, EpubZip, EpubZipEntryLayout,
         MAX_AUTOMATIC_CONTAINER_BYTES, MIMETYPE, RenditionAccessMode, Rootfile,
     };
     use crate::{
@@ -491,8 +714,8 @@ mod tests {
         },
         semantics::EpubString,
     };
-    use zip::ZipWriter;
     use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
     const CONTAINER_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
     <container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"
            xmlns:rendition="http://www.idpf.org/2013/rendition"
@@ -558,6 +781,85 @@ mod tests {
         }
         cursor.set_position(0);
         cursor
+    }
+
+    fn entry_archive(name: &str, contents: &[u8], options: SimpleFileOptions) -> Vec<u8> {
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut zip = ZipWriter::new(&mut cursor);
+            zip.start_file(name, options).unwrap();
+            zip.write_all(contents).unwrap();
+            zip.finish().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    fn replace_all(bytes: &mut [u8], from: &[u8], to: &[u8]) -> usize {
+        assert_eq!(from.len(), to.len());
+        let mut replaced = 0;
+        let mut start = 0;
+        while let Some(offset) = bytes[start..]
+            .windows(from.len())
+            .position(|candidate| candidate == from)
+        {
+            let offset = start + offset;
+            bytes[offset..offset + from.len()].copy_from_slice(to);
+            replaced += 1;
+            start = offset + from.len();
+        }
+        replaced
+    }
+
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = u32::MAX;
+        for byte in bytes {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
+            }
+        }
+        !crc
+    }
+
+    fn add_unicode_path_aliases(bytes: &mut Vec<u8>, aliases: &[&str]) {
+        let mut central = bytes
+            .windows(4)
+            .position(|candidate| candidate == [0x50, 0x4b, 0x01, 0x02])
+            .unwrap();
+        let mut added = 0u32;
+        for alias in aliases {
+            assert_eq!(&bytes[central..central + 4], &[0x50, 0x4b, 0x01, 0x02]);
+            let name_len = usize::from(u16::from_le_bytes([
+                bytes[central + 28],
+                bytes[central + 29],
+            ]));
+            let extra_len = u16::from_le_bytes([bytes[central + 30], bytes[central + 31]]);
+            let comment_len = usize::from(u16::from_le_bytes([
+                bytes[central + 32],
+                bytes[central + 33],
+            ]));
+            let source_name = &bytes[central + 46..central + 46 + name_len];
+            let mut unicode_path = vec![1];
+            unicode_path.extend_from_slice(&crc32(source_name).to_le_bytes());
+            unicode_path.extend_from_slice(alias.as_bytes());
+            let mut field = 0x7075u16.to_le_bytes().to_vec();
+            field.extend_from_slice(&(unicode_path.len() as u16).to_le_bytes());
+            field.extend_from_slice(&unicode_path);
+            bytes[central + 30..central + 32]
+                .copy_from_slice(&(extra_len + field.len() as u16).to_le_bytes());
+            bytes.splice(
+                central + 46 + name_len..central + 46 + name_len,
+                field.iter().copied(),
+            );
+            added += field.len() as u32;
+            central += 46 + name_len + usize::from(extra_len) + field.len() + comment_len;
+        }
+        let eocd = bytes
+            .windows(4)
+            .rposition(|candidate| candidate == [0x50, 0x4b, 0x05, 0x06])
+            .unwrap();
+        let central_size = u32::from_le_bytes(bytes[eocd + 12..eocd + 16].try_into().unwrap());
+        bytes[eocd + 12..eocd + 16].copy_from_slice(&(central_size + added).to_le_bytes());
     }
 
     fn multiple_rendition_epub() -> Cursor<Vec<u8>> {
@@ -972,5 +1274,317 @@ mod tests {
             reopened.resource(ResourceSelector::path("EPUB/nav.xhtml").unwrap()),
             Err(ResourceLookupError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn stored_source_layout_identifies_exact_bytes_and_crc() {
+        let contents = b"123456789";
+        let bytes = entry_archive(
+            "EPUB/audio.mp3",
+            contents,
+            SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+        );
+        let archive = EpubZip::from_reader(Cursor::new(bytes.clone())).unwrap();
+        let layout = archive
+            .source_entry_layout(&EpubPath::new("EPUB/audio.mp3").unwrap())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(layout.compressed_size(), contents.len() as u64);
+        assert_eq!(layout.uncompressed_size(), contents.len() as u64);
+        assert_eq!(layout.crc32(), 0xcbf4_3926);
+        assert!(layout.is_stored());
+        assert!(!layout.is_encrypted());
+        let range = layout.stored_data_range().unwrap();
+        assert_eq!(&bytes[range.start as usize..range.end as usize], contents);
+    }
+
+    #[test]
+    fn compressed_and_encrypted_source_layouts_are_not_direct_ranges() {
+        let compressed = entry_archive(
+            "EPUB/audio.mp3",
+            b"compressible audio bytes compressible audio bytes",
+            SimpleFileOptions::default().compression_method(CompressionMethod::Deflated),
+        );
+        let archive = EpubZip::from_reader(Cursor::new(compressed)).unwrap();
+        let layout = archive
+            .source_entry_layout(&EpubPath::new("EPUB/audio.mp3").unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(!layout.is_stored());
+        assert!(!layout.is_encrypted());
+        assert_eq!(layout.stored_data_range(), None);
+
+        let mut encrypted = entry_archive(
+            "EPUB/audio.mp3",
+            b"encrypted marker fixture",
+            SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+        );
+        for (signature, flag_offset) in [
+            (&[0x50, 0x4b, 0x03, 0x04][..], 6),
+            (&[0x50, 0x4b, 0x01, 0x02][..], 8),
+        ] {
+            let header = encrypted
+                .windows(signature.len())
+                .position(|candidate| candidate == signature)
+                .unwrap();
+            encrypted[header + flag_offset] |= 1;
+        }
+        let archive = EpubZip::from_reader(Cursor::new(encrypted)).unwrap();
+        let layout = archive
+            .source_entry_layout(&EpubPath::new("EPUB/audio.mp3").unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(layout.is_stored());
+        assert!(layout.is_encrypted());
+        assert_eq!(layout.stored_data_range(), None);
+    }
+
+    #[test]
+    fn source_layout_is_absent_when_logical_bytes_do_not_use_the_source() {
+        let audio = EpubPath::new("EPUB/audio.mp3").unwrap();
+        let missing = EpubPath::new("EPUB/missing.mp3").unwrap();
+        let mut archive = EpubZip::from_reader(fixture_archive(
+            &[],
+            &[(CONTAINER_PATH, CONTAINER_XML), (audio.as_str(), "source")],
+        ))
+        .unwrap();
+
+        assert_eq!(archive.source_entry_layout(&missing).unwrap(), None);
+        archive.upsert_entry(audio.clone(), b"replacement".to_vec());
+        assert_eq!(archive.source_entry_layout(&audio).unwrap(), None);
+
+        let mut archive = EpubZip::from_reader(fixture_archive(
+            &[],
+            &[(CONTAINER_PATH, CONTAINER_XML), (audio.as_str(), "source")],
+        ))
+        .unwrap();
+        archive.remove_entry(audio.clone());
+        assert_eq!(archive.source_entry_layout(&audio).unwrap(), None);
+
+        let container = EpubPath::new(CONTAINER_PATH).unwrap();
+        let mut archive =
+            EpubZip::from_reader(fixture_archive(&[], &[(CONTAINER_PATH, CONTAINER_XML)])).unwrap();
+        archive.clear_rootfiles();
+        assert_eq!(archive.source_entry_layout(&container).unwrap(), None);
+    }
+
+    #[test]
+    fn source_layout_and_logical_reads_select_the_same_duplicate() {
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut zip = ZipWriter::new(&mut cursor);
+            let options =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            zip.start_file("EPUB/first.mp3", options).unwrap();
+            zip.write_all(b"first").unwrap();
+            zip.start_file("EPUB/later.mp3", options).unwrap();
+            zip.write_all(b"second").unwrap();
+            zip.finish().unwrap();
+        }
+        let mut bytes = cursor.into_inner();
+        assert_eq!(
+            replace_all(&mut bytes, b"EPUB/later.mp3", b"EPUB/first.mp3"),
+            2
+        );
+        let archive = EpubZip::from_reader(Cursor::new(bytes.clone())).unwrap();
+        let path = EpubPath::new("EPUB/first.mp3").unwrap();
+        assert_eq!(archive.entry_bytes(&path).unwrap(), b"second");
+        let range = archive
+            .source_entry_layout(&path)
+            .unwrap()
+            .unwrap()
+            .stored_data_range()
+            .unwrap();
+        assert_eq!(&bytes[range.start as usize..range.end as usize], b"second");
+    }
+
+    #[test]
+    fn provider_index_rejects_non_utf8_raw_names_without_aliasing_reads() {
+        let mut bytes = entry_archive(
+            "EPUB/x.mp3",
+            b"audio",
+            SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+        );
+        assert_eq!(replace_all(&mut bytes, b"EPUB/x.mp3", b"EPUB/\xff.mp3"), 2);
+        let archive = EpubZip::from_reader(Cursor::new(bytes)).unwrap();
+        assert!(matches!(
+            archive.index(&ResourceProviderIndexLimits::default()),
+            Err(crate::resource::provider::ResourceProviderIndexError::InvalidPath)
+        ));
+        let path = EpubPath::new("EPUB/x.mp3").unwrap();
+        assert!(archive.entry_bytes(&path).is_err());
+        assert_eq!(archive.source_entry_layout(&path).unwrap(), None);
+    }
+
+    #[test]
+    fn unicode_path_extra_fields_do_not_override_raw_utf8_identity() {
+        let raw_name = b"EPUB/raw.mp3";
+        let alias = "EPUB/alias.mp3";
+        let mut bytes = entry_archive(
+            std::str::from_utf8(raw_name).unwrap(),
+            b"audio",
+            SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+        );
+        add_unicode_path_aliases(&mut bytes, &[alias]);
+
+        let archive = EpubZip::from_reader(Cursor::new(bytes)).unwrap();
+        let raw_path = EpubPath::new(std::str::from_utf8(raw_name).unwrap()).unwrap();
+        let alias_path = EpubPath::new(alias).unwrap();
+        assert_eq!(archive.entry_bytes(&raw_path).unwrap(), b"audio");
+        assert!(archive.source_entry_layout(&raw_path).unwrap().is_some());
+        assert!(archive.entry_bytes(&alias_path).is_err());
+        assert_eq!(archive.source_entry_layout(&alias_path).unwrap(), None);
+        archive
+            .index(&ResourceProviderIndexLimits::default())
+            .unwrap();
+    }
+
+    #[test]
+    fn unicode_alias_collisions_are_rejected_instead_of_dropping_raw_names() {
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut writer = ZipWriter::new(&mut cursor);
+            writer
+                .start_file("first", SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(b"first").unwrap();
+            writer
+                .start_file("later", SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(b"later").unwrap();
+            writer.finish().unwrap();
+        }
+        let mut bytes = cursor.into_inner();
+        add_unicode_path_aliases(&mut bytes, &["alias", "alias"]);
+        assert!(matches!(
+            EpubZip::from_reader(Cursor::new(bytes)),
+            Err(ContainerError::Zip { .. })
+        ));
+    }
+
+    #[test]
+    fn malformed_local_header_keeps_raw_identity_despite_unicode_alias() {
+        let mut bytes = entry_archive(
+            "raw-name",
+            b"audio",
+            SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+        );
+        add_unicode_path_aliases(&mut bytes, &["alias"]);
+        bytes[0..4].copy_from_slice(b"nope");
+        let archive = EpubZip::from_reader(Cursor::new(bytes)).unwrap();
+        assert!(matches!(
+            archive.source_entry_layout(&EpubPath::new("raw-name").unwrap()),
+            Err(ContainerError::Zip { .. })
+        ));
+        assert_eq!(
+            archive
+                .source_entry_layout(&EpubPath::new("alias").unwrap())
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn empty_zip64_descriptor_and_prepended_entries_report_absolute_ranges() {
+        let cases = [
+            entry_archive(
+                "empty",
+                b"",
+                SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+            ),
+            entry_archive(
+                "zip64",
+                b"zip64",
+                SimpleFileOptions::default()
+                    .compression_method(CompressionMethod::Stored)
+                    .large_file(true),
+            ),
+            {
+                let mut writer = ZipWriter::new_stream(Vec::new());
+                writer
+                    .start_file(
+                        "descriptor",
+                        SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+                    )
+                    .unwrap();
+                writer.write_all(b"descriptor").unwrap();
+                writer.finish().unwrap().into_inner()
+            },
+            {
+                let mut cursor = Cursor::new(b"prepended bytes".to_vec());
+                cursor.set_position(cursor.get_ref().len() as u64);
+                {
+                    let mut writer = ZipWriter::new(&mut cursor);
+                    writer
+                        .start_file(
+                            "prepended",
+                            SimpleFileOptions::default()
+                                .compression_method(CompressionMethod::Stored),
+                        )
+                        .unwrap();
+                    writer.write_all(b"payload").unwrap();
+                    writer.finish().unwrap();
+                }
+                cursor.into_inner()
+            },
+        ];
+        let expected = [
+            ("empty", &b""[..]),
+            ("zip64", &b"zip64"[..]),
+            ("descriptor", &b"descriptor"[..]),
+            ("prepended", &b"payload"[..]),
+        ];
+
+        for (bytes, (name, contents)) in cases.into_iter().zip(expected) {
+            let archive = EpubZip::from_reader(Cursor::new(bytes.clone())).unwrap();
+            let range = archive
+                .source_entry_layout(&EpubPath::new(name).unwrap())
+                .unwrap()
+                .unwrap()
+                .stored_data_range()
+                .unwrap();
+            assert_eq!(&bytes[range.start as usize..range.end as usize], contents);
+            if name == "prepended" {
+                assert!(range.start >= b"prepended bytes".len() as u64);
+            }
+        }
+    }
+
+    #[test]
+    fn corrupt_local_header_returns_a_typed_zip_error() {
+        let mut bytes = entry_archive(
+            "EPUB/audio.mp3",
+            b"audio",
+            SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+        );
+        bytes[0..4].copy_from_slice(b"nope");
+        let archive = EpubZip::from_reader(Cursor::new(bytes)).unwrap();
+        assert!(matches!(
+            archive.source_entry_layout(&EpubPath::new("EPUB/audio.mp3").unwrap()),
+            Err(ContainerError::Zip { .. })
+        ));
+    }
+
+    #[test]
+    fn stored_data_range_checks_overflow_and_eligibility() {
+        let base = EpubZipEntryLayout {
+            data_offset: u64::MAX,
+            compressed_size: 1,
+            uncompressed_size: 1,
+            crc32: 0,
+            stored: true,
+            encrypted: false,
+        };
+        assert_eq!(base.stored_data_range(), None);
+        assert_eq!(
+            EpubZipEntryLayout {
+                compressed_size: 0,
+                uncompressed_size: 0,
+                ..base
+            }
+            .stored_data_range(),
+            Some(u64::MAX..u64::MAX)
+        );
     }
 }

@@ -737,6 +737,8 @@ fn analysis_issue_label(issue: AnalysisIssue) -> &'static str {
         AnalysisIssue::PerResourceAnalysisLimit => "per_resource_analysis_limit",
         AnalysisIssue::TotalAnalysisLimit => "total_analysis_limit",
         AnalysisIssue::TotalFingerprintLimit => "total_fingerprint_limit",
+        AnalysisIssue::SmilNodeLimit => "smil_node_limit",
+        AnalysisIssue::SmilNestingLimit => "smil_nesting_limit",
         AnalysisIssue::Missing => "missing",
         AnalysisIssue::Unreadable => "unreadable",
         AnalysisIssue::Unsupported => "unsupported",

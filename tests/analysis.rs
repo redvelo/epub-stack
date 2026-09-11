@@ -58,7 +58,7 @@ fn foreground_preparation_state(
 
 #[test]
 fn foreground_preparation_uses_complete_normalized_static_xhtml() {
-    let unlimited = || AnalysisLimits::new(None, None, None, None);
+    let unlimited = || AnalysisLimits::new(None, None, None, None, None, None);
     let static_document = r#"<html xmlns="http://www.w3.org/1999/xhtml"><head><link rel="stylesheet" href="book.css"/></head><body><img src="cover.jpg"/><p>Static</p></body></html>"#;
     assert_eq!(
         foreground_preparation_state("application/xhtml+xml", static_document, unlimited()),
@@ -92,7 +92,7 @@ fn foreground_preparation_uses_complete_normalized_static_xhtml() {
         foreground_preparation_state(
             "application/xhtml+xml",
             static_document,
-            AnalysisLimits::new(None, Some(8), None, None),
+            AnalysisLimits::new(None, Some(8), None, None, None, None),
         ),
         ForegroundPreparationEligibility::Unknown
     );
@@ -112,7 +112,7 @@ fn foreground_preparation_requires_complete_static_svg() {
         foreground_preparation_state(
             "image/svg+xml",
             document,
-            AnalysisLimits::new(None, None, None, None),
+            AnalysisLimits::new(None, None, None, None, None, None),
         )
     };
 
@@ -187,7 +187,7 @@ fn foreground_preparation_requires_complete_static_svg() {
         foreground_preparation_state(
             "image/svg+xml",
             r#"<svg xmlns="http://www.w3.org/2000/svg"><text>truncated by budget</text></svg>"#,
-            AnalysisLimits::new(None, Some(16), None, None),
+            AnalysisLimits::new(None, Some(16), None, None, None, None),
         ),
         ForegroundPreparationEligibility::Unknown
     );
@@ -275,7 +275,7 @@ fn foreground_preparation_excludes_active_and_early_lifecycle_constructs() {
             foreground_preparation_state(
                 "application/xhtml+xml",
                 &document,
-                AnalysisLimits::new(None, None, None, None),
+                AnalysisLimits::new(None, None, None, None, None, None),
             ),
             ForegroundPreparationEligibility::Ineligible,
             "construct should be excluded: {construct}"
@@ -289,7 +289,7 @@ fn foreground_preparation_uses_normalized_element_namespaces() {
         foreground_preparation_state(
             "application/xhtml+xml",
             document,
-            AnalysisLimits::new(None, None, None, None),
+            AnalysisLimits::new(None, None, None, None, None, None),
         )
     };
     assert_eq!(
@@ -338,7 +338,7 @@ fn foreground_preparation_excludes_active_inline_svg_constructs() {
             foreground_preparation_state(
                 "application/xhtml+xml",
                 &document,
-                AnalysisLimits::new(None, None, None, None),
+                AnalysisLimits::new(None, None, None, None, None, None),
             ),
             ForegroundPreparationEligibility::Ineligible,
             "active SVG construct should be excluded: {construct}"
@@ -349,7 +349,7 @@ fn foreground_preparation_excludes_active_inline_svg_constructs() {
         foreground_preparation_state(
             "application/xhtml+xml",
             r#"<html xmlns="http://www.w3.org/1999/xhtml" xmlns:svg="http://www.w3.org/2000/svg"><body><svg:svg><svg:animate/></svg:svg></body></html>"#,
-            AnalysisLimits::new(None, None, None, None),
+            AnalysisLimits::new(None, None, None, None, None, None),
         ),
         ForegroundPreparationEligibility::Ineligible
     );
@@ -406,6 +406,57 @@ fn media_overlay_associations_join_reading_order_targets_and_smil_playback_facts
     let children = parallel.children().collect::<Vec<_>>();
     assert!(children[0].text_reference().is_some());
     assert!(children[1].audio_reference().is_some());
+}
+
+#[test]
+fn publication_analysis_applies_and_retains_smil_structural_limits() {
+    const PACKAGE: &[u8] = br#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+      <metadata/><manifest>
+        <item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml" media-overlay="overlay"/>
+        <item id="overlay" href="overlay.smil" media-type="application/smil+xml"/>
+      </manifest><spine><itemref idref="chapter"/></spine>
+    </package>"#;
+    let analyze = |limits| {
+        publication(
+            PACKAGE,
+            [
+                ("EPUB/chapter.xhtml", b"<html><body/></html>".to_vec()),
+                (
+                    "EPUB/overlay.smil",
+                    br#"<smil xmlns="http://www.w3.org/ns/SMIL"><body><seq><par/></seq></body></smil>"#.to_vec(),
+                ),
+            ],
+        )
+        .analyze_with_limits(limits)
+    };
+
+    for (limits, expected_issue) in [
+        (
+            AnalysisLimits::new(None, None, None, None, Some(3), Some(64)),
+            AnalysisIssue::SmilNodeLimit,
+        ),
+        (
+            AnalysisLimits::new(None, None, None, None, Some(64), Some(2)),
+            AnalysisIssue::SmilNestingLimit,
+        ),
+    ] {
+        let expected_nodes = limits.max_smil_nodes();
+        let expected_nesting = limits.max_smil_nesting();
+        let analysis = analyze(limits);
+        assert_eq!(analysis.limits().max_smil_nodes(), expected_nodes);
+        assert_eq!(analysis.limits().max_smil_nesting(), expected_nesting);
+        let association = analysis.media_overlay_associations().next().unwrap();
+        assert_eq!(
+            association
+                .overlay_resource_facts()
+                .unwrap()
+                .content()
+                .issue(),
+            Some(expected_issue)
+        );
+        assert!(association.smil_facts().is_none());
+        assert_eq!(association.roots().count(), 0);
+    }
 }
 
 #[test]
@@ -844,7 +895,8 @@ fn coverage_partitions_have_stable_expected_universes_for_every_budget() {
             ("EPUB/data.bin", blob.to_vec()),
         ],
     );
-    let baseline = book.analyze_with_limits(AnalysisLimits::new(None, None, None, None));
+    let baseline =
+        book.analyze_with_limits(AnalysisLimits::new(None, None, None, None, None, None));
     let local = baseline
         .resources()
         .resources()
@@ -899,7 +951,8 @@ fn coverage_partitions_have_stable_expected_universes_for_every_budget() {
     assert!(remote_facts.inspection().is_not_applicable());
     assert!(remote_facts.fingerprint().is_not_applicable());
 
-    let no_resources = book.analyze_with_limits(AnalysisLimits::new(Some(0), None, None, None));
+    let no_resources =
+        book.analyze_with_limits(AnalysisLimits::new(Some(0), None, None, None, None, None));
     assert_all_partitions(&no_resources);
     assert_coverage(
         no_resources.coverage().classification(),
@@ -957,25 +1010,25 @@ fn coverage_partitions_have_stable_expected_universes_for_every_budget() {
 
     let cases = [
         (
-            AnalysisLimits::new(Some(local.len() - 1), None, None, None),
+            AnalysisLimits::new(Some(local.len() - 1), None, None, None, None, None),
             (2, &[][..], &[AnalysisIssue::ResourceLimit][..]),
             (2, &[][..], &[AnalysisIssue::ResourceLimit][..]),
             (2, &[][..], &[AnalysisIssue::ResourceLimit][..]),
         ),
         (
-            AnalysisLimits::new(None, Some(largest - 1), None, None),
+            AnalysisLimits::new(None, Some(largest - 1), None, None, None, None),
             (2, &[][..], &[AnalysisIssue::PerResourceAnalysisLimit][..]),
             (2, &[AnalysisIssue::PerResourceAnalysisLimit][..], &[][..]),
             (3, &[][..], &[][..]),
         ),
         (
-            AnalysisLimits::new(None, None, Some(total_bytes - 1), None),
+            AnalysisLimits::new(None, None, Some(total_bytes - 1), None, None, None),
             (2, &[][..], &[AnalysisIssue::TotalAnalysisLimit][..]),
             (2, &[AnalysisIssue::TotalAnalysisLimit][..], &[][..]),
             (3, &[][..], &[][..]),
         ),
         (
-            AnalysisLimits::new(None, None, None, Some(total_bytes - 1)),
+            AnalysisLimits::new(None, None, None, Some(total_bytes - 1), None, None),
             (3, &[][..], &[][..]),
             (3, &[][..], &[][..]),
             (2, &[][..], &[AnalysisIssue::TotalFingerprintLimit][..]),
@@ -1035,10 +1088,10 @@ fn coverage_partitions_have_stable_expected_universes_for_every_budget() {
     // Each exact boundary completes; each corresponding boundary-minus-one case above
     // exposes one precisely classified incomplete producer.
     for limits in [
-        AnalysisLimits::new(Some(local.len()), None, None, None),
-        AnalysisLimits::new(None, Some(largest), None, None),
-        AnalysisLimits::new(None, None, Some(total_bytes), None),
-        AnalysisLimits::new(None, None, None, Some(total_bytes)),
+        AnalysisLimits::new(Some(local.len()), None, None, None, None, None),
+        AnalysisLimits::new(None, Some(largest), None, None, None, None),
+        AnalysisLimits::new(None, None, Some(total_bytes), None, None, None),
+        AnalysisLimits::new(None, None, None, Some(total_bytes), None, None),
     ] {
         let boundary = book.analyze_with_limits(limits);
         assert_all_partitions(&boundary);

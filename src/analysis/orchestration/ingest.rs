@@ -67,7 +67,7 @@ pub(super) fn ingest_analysis_resource<R: ResourceProvider>(
         }
     });
     let result = publication.read_resource_for_analysis(record.address(), |reader| {
-        Ok(ingest_resource_reader(
+        Ok(ingest_resource_reader_with_smil_limits(
             reader,
             IngestPlan {
                 inspection_hint,
@@ -86,6 +86,10 @@ pub(super) fn ingest_analysis_resource<R: ResourceProvider>(
                     exceeded: AnalysisIssue::TotalFingerprintLimit,
                 },
             },
+            crate::media_overlay::smil::SmilParseLimits::new(
+                limits.max_smil_nodes().unwrap_or(usize::MAX),
+                limits.max_smil_nesting().unwrap_or(usize::MAX),
+            ),
         ))
     });
     result.unwrap_or_else(|_| {
@@ -198,7 +202,20 @@ pub(crate) struct IngestPlan {
     pub(crate) fingerprint_budget: StreamBudget,
 }
 
+#[cfg(test)]
 pub(crate) fn ingest_resource_reader(reader: &mut dyn Read, plan: IngestPlan) -> ResourceIngest {
+    ingest_resource_reader_with_smil_limits(
+        reader,
+        plan,
+        crate::media_overlay::smil::SmilParseLimits::default(),
+    )
+}
+
+fn ingest_resource_reader_with_smil_limits(
+    reader: &mut dyn Read,
+    plan: IngestPlan,
+    smil_limits: crate::media_overlay::smil::SmilParseLimits,
+) -> ResourceIngest {
     const PROBE_BYTES: u64 = 64 * 1024;
 
     let IngestPlan {
@@ -328,6 +345,7 @@ pub(crate) fn ingest_resource_reader(reader: &mut dyn Read, plan: IngestPlan) ->
             Some(SemanticFormat::Smil) => {
                 let result = crate::media_overlay::smil::extract_smil_facts_from_reader(
                     BufReader::new(&mut semantic),
+                    smil_limits,
                 )
                 .map_err(smil_analysis_issue);
                 extractions.push(ExtractionOutcome::Smil(result));
@@ -533,9 +551,8 @@ fn smil_analysis_issue(error: SmilError) -> AnalysisIssue {
             AnalysisIssue::Malformed
         }
         SmilError::Io { .. } => AnalysisIssue::Unreadable,
-        SmilError::NodeLimitExceeded { .. } | SmilError::NestingLimitExceeded { .. } => {
-            AnalysisIssue::Unsupported
-        }
+        SmilError::NodeLimitExceeded { .. } => AnalysisIssue::SmilNodeLimit,
+        SmilError::NestingLimitExceeded { .. } => AnalysisIssue::SmilNestingLimit,
         _ => AnalysisIssue::Malformed,
     }
 }

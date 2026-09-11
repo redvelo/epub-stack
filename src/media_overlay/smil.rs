@@ -147,10 +147,6 @@ impl SmilParseLimits {
             max_nesting,
         }
     }
-
-    const fn unbounded() -> Self {
-        Self::new(usize::MAX, usize::MAX)
-    }
 }
 
 impl Default for SmilParseLimits {
@@ -1467,14 +1463,16 @@ pub(crate) struct SmilPendingReference {
     pub(crate) attribute: &'static str,
 }
 
-pub(crate) fn extract_smil_facts_from_reader<R: BufRead>(input: R) -> Result<SmilExtraction> {
-    parse_smil_with_limits(input, SmilParseLimits::unbounded())
-        .map(SmilDocument::into_analysis_parts)
+pub(crate) fn extract_smil_facts_from_reader<R: BufRead>(
+    input: R,
+    limits: SmilParseLimits,
+) -> Result<SmilExtraction> {
+    parse_smil_with_limits(input, limits).map(SmilDocument::into_analysis_parts)
 }
 
 #[cfg(test)]
 fn extract_smil_facts(xml: &str) -> Result<SmilExtraction> {
-    extract_smil_facts_from_reader(xml.as_bytes())
+    extract_smil_facts_from_reader(xml.as_bytes(), SmilParseLimits::default())
 }
 
 impl SmilDocument {
@@ -1894,7 +1892,7 @@ mod tests {
     }
 
     #[test]
-    fn analysis_projection_does_not_inherit_standalone_structural_limits() {
+    fn analysis_projection_enforces_structural_limits() {
         let mut deep = String::from(r#"<smil xmlns="http://www.w3.org/ns/SMIL"><body>"#);
         for _ in 0..257 {
             deep.push_str("<seq>");
@@ -1908,7 +1906,10 @@ mod tests {
             SmilDocument::parse(&deep),
             Err(SmilError::NestingLimitExceeded { .. })
         ));
-        assert_eq!(extract_smil_facts(&deep).unwrap().facts.nodes().len(), 259);
+        assert!(matches!(
+            extract_smil_facts(&deep),
+            Err(SmilError::NestingLimitExceeded { .. })
+        ));
 
         let mut broad = String::from(r#"<smil xmlns="http://www.w3.org/ns/SMIL"><body>"#);
         for _ in 0..100_000 {
@@ -1919,10 +1920,10 @@ mod tests {
             SmilDocument::parse(&broad),
             Err(SmilError::NodeLimitExceeded { .. })
         ));
-        assert_eq!(
-            extract_smil_facts(&broad).unwrap().facts.nodes().len(),
-            100_000
-        );
+        assert!(matches!(
+            extract_smil_facts(&broad),
+            Err(SmilError::NodeLimitExceeded { .. })
+        ));
     }
 
     #[test]
@@ -1931,7 +1932,9 @@ mod tests {
         let mut bytes = vec![0xff, 0xfe];
         bytes.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
 
-        let extraction = extract_smil_facts_from_reader(std::io::Cursor::new(bytes)).unwrap();
+        let extraction =
+            extract_smil_facts_from_reader(std::io::Cursor::new(bytes), SmilParseLimits::default())
+                .unwrap();
         assert_eq!(extraction.facts.roots().len(), 1);
     }
 
