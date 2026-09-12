@@ -35,7 +35,11 @@ fn print_xhtml_resources(analysis: &PublicationAnalysis) -> Result<(), Box<dyn s
     println!("\nXHTML resources");
     let mut found = false;
     for resource_facts in analysis.resource_facts() {
-        let Some(ContentFacts::Xhtml(facts)) = resource_facts.content().value() else {
+        let Some(facts) = resource_facts
+            .content()
+            .value()
+            .and_then(ContentFacts::as_xhtml)
+        else {
             continue;
         };
         found = true;
@@ -412,7 +416,11 @@ fn print_svg_resources(analysis: &PublicationAnalysis) -> Result<(), Box<dyn std
     println!("\nSVG resources");
     let mut found = false;
     for resource_facts in analysis.resource_facts() {
-        let Some(ContentFacts::Svg(facts)) = resource_facts.content().value() else {
+        let Some(facts) = resource_facts
+            .content()
+            .value()
+            .and_then(ContentFacts::as_svg)
+        else {
             continue;
         };
         found = true;

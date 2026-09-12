@@ -17,7 +17,7 @@ mod metadata;
 use crate::analysis::ResourceFacts;
 use crate::analysis::inspection::{MediaTrack, WebVtt};
 use crate::analysis::reference::ReferenceSlot;
-use crate::content::{ContentFacts, StructureFact};
+use crate::content::StructureFact;
 use crate::media_overlay::{MediaOverlayAssociationRef, SmilFacts};
 use crate::navigation::{Navigation, NavigationDocument, NavigationPoint, NavigationSource};
 use crate::package::{
@@ -727,7 +727,7 @@ fn collect_content(
         let Some(content) = resource_facts.content().value() else {
             continue;
         };
-        if !matches!(content, ContentFacts::Xhtml(_) | ContentFacts::Svg(_)) {
+        if content.as_xhtml().is_none() && content.as_svg().is_none() {
             continue;
         }
         for fact in by_resource.remove(&resource).unwrap_or_default() {

@@ -59,7 +59,9 @@ impl PublicationAnalysis {
                 self.resources().declaration(*declaration).ok(),
                 resource.and_then(|key| self.resources().resource(key).ok()),
             ),
-            ManifestTarget::Missing | ManifestTarget::Ambiguous { .. } => (None, None),
+            ManifestTarget::InvalidManifestIdref
+            | ManifestTarget::Missing
+            | ManifestTarget::Ambiguous { .. } => (None, None),
         };
         let overlay_resource_facts =
             overlay_resource.and_then(|resource| self.facts_for_row(resource.row()).ok());
@@ -206,7 +208,9 @@ impl PublicationAnalysis {
             },
             AuthoredReference::Manifest(reference) => matches!(
                 reference.target(),
-                ManifestTarget::Missing | ManifestTarget::Ambiguous { .. }
+                ManifestTarget::InvalidManifestIdref
+                    | ManifestTarget::Missing
+                    | ManifestTarget::Ambiguous { .. }
             ),
         })
     }

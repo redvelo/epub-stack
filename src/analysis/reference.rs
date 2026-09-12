@@ -148,6 +148,8 @@ pub enum ManifestTarget {
         /// The declaration's snapshot-local resource target.
         resource: Option<ResourceOrdinal>,
     },
+    /// The authored IDREF is not a valid normalized manifest ID.
+    InvalidManifestIdref,
     /// No declaration has the authored ID.
     Missing,
     /// Multiple declarations have the authored ID.

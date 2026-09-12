@@ -36,7 +36,7 @@ use crate::package::{Package, collection::Collection};
 use crate::publication::Epub;
 use crate::resource::provider::ResourceProvider;
 use crate::resource::{
-    AuthoredHref, AuthoredIdRef, DeclarationTargetRow, EpubPath, ManifestDeclarationRef,
+    AuthoredHref, AuthoredIdRef, DeclarationTargetRow, EpubPath, ManifestIdrefResolution,
     ParsedHref, ProviderPresence, ResolvedHref, ResourceAddress, ResourceIndex, ResourceRef,
     ResourceRow, parse_href,
 };
@@ -264,7 +264,7 @@ pub(crate) fn analyze<R: ResourceProvider>(
                             accessibility_occurrences
                                 .extend(accessibility.into_iter().map(|fact| (key, fact)));
                             xhtml_pending.insert(key, (links, authored_base, associations));
-                            AnalysisOutcome::Complete(ContentFacts::Xhtml(facts))
+                            AnalysisOutcome::Complete(ContentFacts::from_xhtml(facts))
                         }
                         Err(issue) => AnalysisOutcome::Unavailable(issue),
                     };
@@ -274,7 +274,7 @@ pub(crate) fn analyze<R: ResourceProvider>(
                     content = match result {
                         Ok(extraction) => {
                             smil_references.insert(key, extraction.references);
-                            AnalysisOutcome::Complete(ContentFacts::Smil(extraction.facts))
+                            AnalysisOutcome::Complete(ContentFacts::from_smil(extraction.facts))
                         }
                         Err(issue) => AnalysisOutcome::Unavailable(issue),
                     };
@@ -304,7 +304,7 @@ pub(crate) fn analyze<R: ResourceProvider>(
                             accessibility_occurrences.extend(
                                 extraction.accessibility.into_iter().map(|fact| (key, fact)),
                             );
-                            let value = ContentFacts::Svg(extraction.facts);
+                            let value = ContentFacts::from_svg(extraction.facts);
                             if let Some(issue) = issue {
                                 AnalysisOutcome::Partial { value, issue }
                             } else {

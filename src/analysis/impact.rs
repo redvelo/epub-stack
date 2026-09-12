@@ -327,7 +327,7 @@ fn manifest_id_targets(
         ManifestTarget::Ambiguous { candidates } => {
             candidates.iter().any(|key| declarations.contains(key))
         }
-        ManifestTarget::Missing => false,
+        ManifestTarget::InvalidManifestIdref | ManifestTarget::Missing => false,
     }
 }
 

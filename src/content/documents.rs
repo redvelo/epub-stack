@@ -4,38 +4,64 @@ use crate::media_overlay::SmilFacts;
 
 /// Text, structure, and playback facts extracted from a supported content resource.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(clippy::large_enum_variant)]
-pub enum ContentFacts {
-    /// XHTML text, fragments, viewport metadata, structure, media, forms, and scripts.
-    Xhtml(XhtmlFacts),
-    /// Standalone SVG semantic facts.
-    Svg(SvgFacts),
-    /// SMIL semantic facts.
-    Smil(SmilFacts),
+pub struct ContentFacts {
+    representation: ContentFactsRepresentation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ContentFactsRepresentation {
+    Xhtml(Box<XhtmlFacts>),
+    Svg(Box<SvgFacts>),
+    Smil(Box<SmilFacts>),
 }
 
 impl ContentFacts {
+    pub(crate) fn from_xhtml(facts: XhtmlFacts) -> Self {
+        Self {
+            representation: ContentFactsRepresentation::Xhtml(Box::new(facts)),
+        }
+    }
+
+    pub(crate) fn from_svg(facts: SvgFacts) -> Self {
+        Self {
+            representation: ContentFactsRepresentation::Svg(Box::new(facts)),
+        }
+    }
+
+    pub(crate) fn from_smil(facts: SmilFacts) -> Self {
+        Self {
+            representation: ContentFactsRepresentation::Smil(Box::new(facts)),
+        }
+    }
+
     /// Borrows XHTML facts when this is XHTML content.
     pub fn as_xhtml(&self) -> Option<&XhtmlFacts> {
-        match self {
-            Self::Xhtml(facts) => Some(facts),
-            Self::Svg(_) | Self::Smil(_) => None,
+        match &self.representation {
+            ContentFactsRepresentation::Xhtml(facts) => Some(facts),
+            ContentFactsRepresentation::Svg(_) | ContentFactsRepresentation::Smil(_) => None,
         }
     }
 
     /// Borrows SVG facts when this is standalone SVG content.
     pub fn as_svg(&self) -> Option<&SvgFacts> {
-        match self {
-            Self::Svg(facts) => Some(facts),
-            Self::Xhtml(_) | Self::Smil(_) => None,
+        match &self.representation {
+            ContentFactsRepresentation::Svg(facts) => Some(facts),
+            ContentFactsRepresentation::Xhtml(_) | ContentFactsRepresentation::Smil(_) => None,
         }
     }
 
     /// Borrows SMIL facts when this is SMIL content.
     pub fn as_smil(&self) -> Option<&SmilFacts> {
-        match self {
-            Self::Smil(facts) => Some(facts),
-            Self::Xhtml(_) | Self::Svg(_) => None,
+        match &self.representation {
+            ContentFactsRepresentation::Smil(facts) => Some(facts),
+            ContentFactsRepresentation::Xhtml(_) | ContentFactsRepresentation::Svg(_) => None,
+        }
+    }
+
+    pub(crate) fn as_smil_mut(&mut self) -> Option<&mut SmilFacts> {
+        match &mut self.representation {
+            ContentFactsRepresentation::Smil(facts) => Some(facts),
+            ContentFactsRepresentation::Xhtml(_) | ContentFactsRepresentation::Svg(_) => None,
         }
     }
 
@@ -44,10 +70,10 @@ impl ContentFacts {
     /// XHTML and standalone SVG are supported. SVG includes scripts in nested `foreignObject`
     /// XHTML; SMIL returns `None` because this projection does not apply to it.
     pub fn executable_content_detected(&self) -> Option<bool> {
-        match self {
-            Self::Xhtml(facts) => Some(facts.has_executable_content()),
-            Self::Svg(facts) => Some(facts.has_executable_content()),
-            Self::Smil(_) => None,
+        match &self.representation {
+            ContentFactsRepresentation::Xhtml(facts) => Some(facts.has_executable_content()),
+            ContentFactsRepresentation::Svg(facts) => Some(facts.has_executable_content()),
+            ContentFactsRepresentation::Smil(_) => None,
         }
     }
 }

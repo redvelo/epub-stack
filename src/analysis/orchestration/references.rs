@@ -31,32 +31,25 @@ pub(super) fn collect_manifest_references(
 }
 
 fn manifest_id_target(resources: &ResourceIndex, idref: &AuthoredIdRef) -> ManifestTarget {
-    let candidates = resources
-        .declarations_with_id(idref.as_str())
-        .ok()
-        .into_iter()
-        .flatten()
-        .map(ManifestDeclarationRef::key)
-        .collect::<Vec<_>>();
-    match candidates.as_slice() {
-        [] => ManifestTarget::Missing,
-        [declaration] => {
-            let resource =
-                resources
-                    .declaration((*declaration).into())
-                    .ok()
-                    .and_then(|declaration| match declaration.target_row() {
-                        DeclarationTargetRow::Resource(resource) => Some(*resource),
-                        DeclarationTargetRow::MissingHref
-                        | DeclarationTargetRow::InvalidHref(_) => None,
-                    });
+    match resources.resolve_manifest_idref(idref.as_str()) {
+        ManifestIdrefResolution::Invalid => ManifestTarget::InvalidManifestIdref,
+        ManifestIdrefResolution::Missing => ManifestTarget::Missing,
+        ManifestIdrefResolution::Unique(declaration) => {
+            let resource = match resources
+                .declaration(declaration.into())
+                .expect("resolved manifest row belongs to this index")
+                .target_row()
+            {
+                DeclarationTargetRow::Resource(resource) => Some(*resource),
+                DeclarationTargetRow::MissingHref | DeclarationTargetRow::InvalidHref(_) => None,
+            };
             ManifestTarget::Declaration {
-                declaration: (*declaration).into(),
+                declaration: declaration.into(),
                 resource: resource.map(Into::into),
             }
         }
-        _ => ManifestTarget::Ambiguous {
-            candidates: candidates.into_iter().map(Into::into).collect(),
+        ManifestIdrefResolution::Ambiguous(candidates) => ManifestTarget::Ambiguous {
+            candidates: candidates.iter().copied().map(Into::into).collect(),
         },
     }
 }
@@ -421,7 +414,11 @@ pub(crate) fn collect_smil_references(
             );
             resolved.push((pending.node, pending.kind, id));
         }
-        if let Some(ContentFacts::Smil(content)) = facts[index].content_mut().value_mut() {
+        if let Some(content) = facts[index]
+            .content_mut()
+            .value_mut()
+            .and_then(ContentFacts::as_smil_mut)
+        {
             for (node, kind, reference) in resolved {
                 match kind {
                     HrefRole::SmilText => content.set_text_reference(node, reference),

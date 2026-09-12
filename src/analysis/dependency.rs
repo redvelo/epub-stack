@@ -275,7 +275,9 @@ impl PublicationAnalysis {
                         unresolved.push(reference.clone());
                     }
                 }
-                ManifestTarget::Missing | ManifestTarget::Ambiguous { .. } => {
+                ManifestTarget::InvalidManifestIdref
+                | ManifestTarget::Missing
+                | ManifestTarget::Ambiguous { .. } => {
                     unresolved.push(reference.clone());
                 }
             },

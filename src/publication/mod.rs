@@ -2515,10 +2515,9 @@ mod test {
         );
 
         let analysis = epub.analyze();
-        assert!(analysis.resource_facts().any(|facts| matches!(
-            facts.content(),
-            AnalysisOutcome::Complete(ContentFacts::Smil(_))
-        )));
+        assert!(analysis.resource_facts().any(|facts| {
+            matches!(facts.content(), AnalysisOutcome::Complete(content) if content.as_smil().is_some())
+        }));
         assert!(
             analysis
                 .accessibility_observations()
@@ -2924,10 +2923,9 @@ mod test {
 
         let epub = Epub::from_provider(container, "EPUB/package.opf").unwrap();
         let analysis = epub.analyze();
-        assert!(analysis.resource_facts().any(|facts| matches!(
-            facts.content(),
-            AnalysisOutcome::Complete(ContentFacts::Smil(_))
-        )));
+        assert!(analysis.resource_facts().any(|facts| {
+            matches!(facts.content(), AnalysisOutcome::Complete(content) if content.as_smil().is_some())
+        }));
     }
 
     #[test]
@@ -3544,7 +3542,7 @@ mod test {
             .map(|resource| {
                 let content = if resource.ordinal() == overlay {
                     AnalysisOutcome::Partial {
-                        value: ContentFacts::Smil(SmilFacts::new(
+                        value: ContentFacts::from_smil(SmilFacts::new(
                             Vec::new(),
                             Vec::new(),
                             Vec::new(),

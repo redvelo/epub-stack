@@ -3,9 +3,16 @@
 use epub_stack::{
     Epub, NavigationHrefTargetFacts, NavigationLoadingOutcome, NavigationTargetOutcomeFacts,
     PublicationFacts,
+    analysis::reference::{ManifestRole, ManifestTarget},
     resource::{
-        ProviderPresence,
-        facts::{ManifestTargetFacts, ReadingOrderTargetFacts, SelectionFacts, SelectionSource},
+        ManifestOrdinal, ProviderPresence,
+        facts::{
+            ManifestFallbackDeclaration, ManifestFallbackFacts, ManifestFallbackTargetFacts,
+            ManifestFallbackTopologyError, ManifestFallbackTraversal,
+            ManifestFallbackTraversalOutcome, ManifestFallbackUnresolvedReason,
+            ManifestFallbackValidationError, ManifestTargetFacts, ReadingOrderTargetFacts,
+            SelectionFacts, SelectionSource,
+        },
         provider::MemoryResourceProvider,
     },
 };
@@ -252,6 +259,353 @@ fn facts_preserve_alignment_duplicates_states_and_canonical_json() {
 }
 
 #[test]
+fn manifest_fallback_facts_are_aligned_and_preserve_declaration_resolution() {
+    let package = r#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata/><manifest>
+    <item id="start" href="shared.xhtml" media-type="application/example" fallback=" middle "/>
+    <item id="middle" href="shared.xhtml" media-type="application/other" fallback="end"/>
+    <item id="end" href="end.xhtml" media-type="application/final"/>
+    <item id="invalid-edge" href="invalid.bin" media-type="application/octet-stream" fallback="1bad"/>
+    <item id="missing-edge" href="missing.bin" media-type="application/octet-stream" fallback="unknown"/>
+    <item id="ambiguous-edge" href="ambiguous.bin" media-type="application/octet-stream" fallback="dup"/>
+    <item id="dup" href="duplicate.xhtml" media-type="application/one"/>
+    <item id="dup" href="./duplicate.xhtml" media-type="application/two"/>
+    <item id="self" href="self.bin" media-type="application/octet-stream" fallback="self"/>
+    <item id="cycle-a" href="a.bin" media-type="application/octet-stream" fallback="cycle-b"/>
+    <item id="cycle-b" href="b.bin" media-type="application/octet-stream" fallback="cycle-a"/>
+    <item id="prefix" href="prefix.bin" media-type="application/octet-stream" fallback="cycle-a"/>
+  </manifest><spine/></package>"#;
+    let facts = open(package, []);
+    let fallbacks = &facts.resource_index.manifest_fallbacks;
+    let declarations = facts
+        .package
+        .manifest()
+        .items()
+        .iter()
+        .map(|item| ManifestFallbackDeclaration::new(item.id(), item.fallback()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(facts.package.manifest().items().len(), fallbacks.len());
+    assert_eq!(fallbacks.validate_against(&declarations), Ok(()));
+    let expected = [
+        ManifestFallbackTargetFacts::Declaration {
+            declaration: ManifestOrdinal(1),
+        },
+        ManifestFallbackTargetFacts::Declaration {
+            declaration: ManifestOrdinal(2),
+        },
+        ManifestFallbackTargetFacts::Absent,
+        ManifestFallbackTargetFacts::InvalidManifestIdref,
+        ManifestFallbackTargetFacts::MissingManifestId,
+        ManifestFallbackTargetFacts::AmbiguousManifestId,
+        ManifestFallbackTargetFacts::Absent,
+        ManifestFallbackTargetFacts::Absent,
+        ManifestFallbackTargetFacts::Declaration {
+            declaration: ManifestOrdinal(8),
+        },
+        ManifestFallbackTargetFacts::Declaration {
+            declaration: ManifestOrdinal(10),
+        },
+        ManifestFallbackTargetFacts::Declaration {
+            declaration: ManifestOrdinal(9),
+        },
+        ManifestFallbackTargetFacts::Declaration {
+            declaration: ManifestOrdinal(9),
+        },
+    ];
+    for (index, expected) in expected.iter().enumerate() {
+        assert_eq!(fallbacks.get(ManifestOrdinal(index as u32)), Some(expected));
+    }
+    assert_eq!(
+        facts
+            .resource_index
+            .resources
+            .iter()
+            .filter(|resource| resource.declarations.len() == 2)
+            .count(),
+        2
+    );
+
+    let chain = fallbacks.traverse(ManifestOrdinal(0)).unwrap();
+    assert_eq!(
+        chain.declarations,
+        vec![ManifestOrdinal(0), ManifestOrdinal(1), ManifestOrdinal(2)]
+    );
+    assert_eq!(chain.outcome, ManifestFallbackTraversalOutcome::End);
+
+    for (ordinal, expected) in [
+        (3, ManifestFallbackUnresolvedReason::InvalidManifestIdref),
+        (4, ManifestFallbackUnresolvedReason::MissingManifestId),
+        (5, ManifestFallbackUnresolvedReason::AmbiguousManifestId),
+    ] {
+        let traversal = fallbacks.traverse(ManifestOrdinal(ordinal)).unwrap();
+        assert_eq!(traversal.declarations, vec![ManifestOrdinal(ordinal)]);
+        assert_eq!(
+            traversal.outcome,
+            ManifestFallbackTraversalOutcome::UnresolvedReference {
+                declaration: ManifestOrdinal(ordinal),
+                reason: expected,
+            }
+        );
+    }
+
+    let self_cycle = fallbacks.traverse(ManifestOrdinal(8)).unwrap();
+    assert_eq!(self_cycle.declarations, vec![ManifestOrdinal(8)]);
+    assert_eq!(
+        self_cycle.outcome,
+        ManifestFallbackTraversalOutcome::Cycle {
+            repeated_declaration: ManifestOrdinal(8),
+        }
+    );
+
+    let multi_node_cycle = fallbacks.traverse(ManifestOrdinal(9)).unwrap();
+    assert_eq!(
+        multi_node_cycle.declarations,
+        vec![ManifestOrdinal(9), ManifestOrdinal(10)]
+    );
+    assert_eq!(
+        multi_node_cycle.outcome,
+        ManifestFallbackTraversalOutcome::Cycle {
+            repeated_declaration: ManifestOrdinal(9),
+        }
+    );
+
+    let prefixed_cycle = fallbacks.traverse(ManifestOrdinal(11)).unwrap();
+    assert_eq!(
+        prefixed_cycle.declarations,
+        vec![ManifestOrdinal(11), ManifestOrdinal(9), ManifestOrdinal(10)]
+    );
+    assert_eq!(
+        prefixed_cycle.outcome,
+        ManifestFallbackTraversalOutcome::Cycle {
+            repeated_declaration: ManifestOrdinal(9),
+        }
+    );
+}
+
+#[test]
+fn manifest_fallback_validation_recomputes_all_authored_resolution_states() {
+    let declarations = [
+        ManifestFallbackDeclaration::new(Some(" start "), Some(" target ")),
+        ManifestFallbackDeclaration::new(Some("target"), None),
+        ManifestFallbackDeclaration::new(Some("dup"), Some("1bad")),
+        ManifestFallbackDeclaration::new(Some("dup"), Some("missing")),
+        ManifestFallbackDeclaration::new(Some("last"), Some("dup")),
+    ];
+    let valid: ManifestFallbackFacts = serde_json::from_value(serde_json::json!([
+        { "state": "declaration", "declaration": 1 },
+        { "state": "absent" },
+        { "state": "invalid-manifest-idref" },
+        { "state": "missing-manifest-id" },
+        { "state": "ambiguous-manifest-id" }
+    ]))
+    .unwrap();
+    assert_eq!(valid.validate_against(&declarations), Ok(()));
+
+    let changed: ManifestFallbackFacts = serde_json::from_value(serde_json::json!([
+        { "state": "declaration", "declaration": 0 },
+        { "state": "absent" },
+        { "state": "invalid-manifest-idref" },
+        { "state": "missing-manifest-id" },
+        { "state": "ambiguous-manifest-id" }
+    ]))
+    .unwrap();
+    assert_eq!(
+        changed.validate_against(&declarations),
+        Err(ManifestFallbackValidationError::TargetMismatch {
+            declaration: ManifestOrdinal(0)
+        })
+    );
+}
+
+#[test]
+fn manifest_fallback_traversal_reports_out_of_range_topology() {
+    let fallbacks: ManifestFallbackFacts = serde_json::from_value(serde_json::json!([
+        { "state": "declaration", "declaration": 7 }
+    ]))
+    .unwrap();
+
+    assert_eq!(
+        fallbacks.traverse(ManifestOrdinal(0)),
+        Err(ManifestFallbackTopologyError::EdgeOutOfRange {
+            declaration: ManifestOrdinal(0),
+            target: ManifestOrdinal(7),
+        })
+    );
+    assert_eq!(
+        fallbacks.traverse(ManifestOrdinal(9)),
+        Err(ManifestFallbackTopologyError::StartOutOfRange {
+            start: ManifestOrdinal(9),
+        })
+    );
+}
+
+#[test]
+fn manifest_fallback_facts_round_trip_with_exact_array_shape_and_reject_unknown_fields() {
+    let fallbacks: ManifestFallbackFacts = serde_json::from_value(serde_json::json!([
+        { "state": "declaration", "declaration": 1 },
+        { "state": "absent" }
+    ]))
+    .unwrap();
+    let encoded = serde_json::to_value(&fallbacks).unwrap();
+    assert_eq!(
+        encoded,
+        serde_json::json!([
+            { "state": "declaration", "declaration": 1 },
+            { "state": "absent" }
+        ])
+    );
+    let decoded: ManifestFallbackFacts = serde_json::from_value(encoded).unwrap();
+    assert_eq!(decoded, fallbacks);
+
+    let traversal = decoded.traverse(ManifestOrdinal(0)).unwrap();
+    assert_eq!(
+        traversal,
+        ManifestFallbackTraversal {
+            declarations: vec![ManifestOrdinal(0), ManifestOrdinal(1)],
+            outcome: ManifestFallbackTraversalOutcome::End,
+        }
+    );
+    let traversal_json = serde_json::to_value(&traversal).unwrap();
+    assert_eq!(
+        traversal_json,
+        serde_json::json!({
+            "declarations": [0, 1],
+            "outcome": { "state": "end" }
+        })
+    );
+    assert!(
+        serde_json::from_value::<ManifestFallbackFacts>(serde_json::json!([
+            { "state": "absent", "unexpected": true }
+        ]))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<ManifestFallbackFacts>(serde_json::json!([
+            { "state": "declaration", "declaration": 0, "unexpected": true }
+        ]))
+        .is_err()
+    );
+}
+
+#[test]
+fn manifest_idref_resolution_agrees_between_fallback_facts_and_analysis() {
+    let package = r#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata/><manifest>
+    <item id="empty" href="empty.bin" media-type="application/octet-stream" fallback=""/>
+    <item id="xml-space-only" href="space.bin" media-type="application/octet-stream" fallback=" &#x9;&#xA;&#xD; "/>
+    <item id="non-xml-space" href="nbsp.bin" media-type="application/octet-stream" fallback="&#xA0;target&#xA0;"/>
+    <item id="unicode-edge" href="unicode.bin" media-type="application/octet-stream" fallback="Δelta"/>
+    <item id="malformed" href="malformed.bin" media-type="application/octet-stream" fallback="1bad"/>
+    <item id="missing" href="missing.bin" media-type="application/octet-stream" fallback="unknown"/>
+    <item id="ambiguous" href="ambiguous.bin" media-type="application/octet-stream" fallback="dup"/>
+    <item id="missing-href-edge" href="edge.bin" media-type="application/octet-stream" fallback="no-href"/>
+    <item id="invalid-href-edge" href="edge2.bin" media-type="application/octet-stream" fallback="invalid-href"/>
+    <item id="xml-space" href="trim.bin" media-type="application/octet-stream" fallback=" &#x9;target&#xA; "/>
+    <item id="target" href="target.bin" media-type="application/octet-stream"/>
+    <item id="Δelta" href="unicode-target.bin" media-type="application/octet-stream"/>
+    <item id="no-href" media-type="application/octet-stream"/>
+    <item id="invalid-href" href="bad href" media-type="application/octet-stream"/>
+    <item id="dup" href="one.bin" media-type="application/octet-stream"/>
+    <item id="dup" href="two.bin" media-type="application/octet-stream"/>
+  </manifest><spine/></package>"#;
+    let provider =
+        MemoryResourceProvider::from_entries([("EPUB/package.opf", package.as_bytes().to_vec())])
+            .unwrap();
+    let epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+    let facts = epub.facts().unwrap();
+    let analysis = epub.analyze();
+    let expected = [
+        ManifestFallbackTargetFacts::InvalidManifestIdref,
+        ManifestFallbackTargetFacts::InvalidManifestIdref,
+        ManifestFallbackTargetFacts::InvalidManifestIdref,
+        ManifestFallbackTargetFacts::Declaration {
+            declaration: ManifestOrdinal(11),
+        },
+        ManifestFallbackTargetFacts::InvalidManifestIdref,
+        ManifestFallbackTargetFacts::MissingManifestId,
+        ManifestFallbackTargetFacts::AmbiguousManifestId,
+        ManifestFallbackTargetFacts::Declaration {
+            declaration: ManifestOrdinal(12),
+        },
+        ManifestFallbackTargetFacts::Declaration {
+            declaration: ManifestOrdinal(13),
+        },
+        ManifestFallbackTargetFacts::Declaration {
+            declaration: ManifestOrdinal(10),
+        },
+    ];
+
+    for (index, expected_fact) in expected.iter().enumerate() {
+        let ordinal = ManifestOrdinal(index as u32);
+        assert_eq!(
+            facts.resource_index.manifest_fallbacks.get(ordinal),
+            Some(expected_fact)
+        );
+        let reference = analysis
+            .references_from_declaration(ordinal)
+            .unwrap()
+            .find(|reference| reference.role() == ManifestRole::Fallback)
+            .unwrap();
+        match (expected_fact, reference.target()) {
+            (
+                ManifestFallbackTargetFacts::InvalidManifestIdref,
+                ManifestTarget::InvalidManifestIdref,
+            )
+            | (ManifestFallbackTargetFacts::MissingManifestId, ManifestTarget::Missing)
+            | (
+                ManifestFallbackTargetFacts::AmbiguousManifestId,
+                ManifestTarget::Ambiguous { .. },
+            ) => {}
+            (
+                ManifestFallbackTargetFacts::Declaration { declaration },
+                ManifestTarget::Declaration {
+                    declaration: analyzed,
+                    resource,
+                },
+            ) => {
+                assert_eq!(analyzed, declaration);
+                if matches!(declaration.0, 12 | 13) {
+                    assert_eq!(*resource, None);
+                }
+            }
+            pair => panic!("fallback facts and analysis disagree: {pair:?}"),
+        }
+    }
+}
+
+#[test]
+fn manifest_fallback_serialization_is_linear_for_duplicate_ids() {
+    fn encoded_len(count: usize) -> usize {
+        let mut package = String::from(
+            r#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0"><metadata/><manifest>"#,
+        );
+        for index in 0..count {
+            package.push_str(&format!(
+                r#"<item id="source{index}" href="source{index}.bin" media-type="application/octet-stream" fallback="dup"/>"#
+            ));
+        }
+        for index in 0..count {
+            package.push_str(&format!(
+                r#"<item id="dup" href="duplicate{index}.bin" media-type="application/octet-stream"/>"#
+            ));
+        }
+        package.push_str("</manifest><spine/></package>");
+        let facts = open(&package, []);
+        let encoded = serde_json::to_string(&facts.resource_index.manifest_fallbacks).unwrap();
+        assert!(!encoded.contains("candidates"));
+        encoded.len()
+    }
+
+    let small = encoded_len(64);
+    let large = encoded_len(256);
+    assert!(
+        large <= small * 5,
+        "fallback facts grew non-linearly: {small} -> {large}"
+    );
+}
+
+#[test]
 fn facts_report_selected_and_absent_structural_resources() {
     let package = r#"<package xmlns="http://www.idpf.org/2007/opf" version="2.0">
   <metadata><meta name="cover" content="cover"/></metadata>
@@ -295,12 +649,16 @@ fn facts_report_selected_and_absent_structural_resources() {
 
 #[test]
 fn publication_facts_exports_without_unsafe_u64_numbers() {
-    let types = specta::Types::default().register::<PublicationFacts>();
+    let types = specta::Types::default()
+        .register::<PublicationFacts>()
+        .register::<ManifestFallbackTraversal>();
     let output = specta_typescript::Typescript::default()
         .export(&types, specta_serde::Format)
         .unwrap();
 
     assert!(output.contains("export type PublicationFacts"));
+    assert!(output.contains("export type ManifestFallbackTargetFacts"));
+    assert!(output.contains("export type ManifestFallbackTraversalOutcome"));
     assert!(output.contains("sizeBytes: string | null"));
     assert!(output.contains("export type MediaType = EpubString"));
     assert!(!output.contains("sizeBytes: number"));

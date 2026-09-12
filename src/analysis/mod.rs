@@ -341,24 +341,24 @@ impl ResourceFacts {
     /// Classifies this physical resource for conservative foreground frame preparation.
     pub fn foreground_preparation_eligibility(&self) -> ForegroundPreparationEligibility {
         match &self.content {
-            AnalysisOutcome::Complete(ContentFacts::Xhtml(facts)) => {
-                if !facts.foreground_preparation_document_supported {
-                    ForegroundPreparationEligibility::Unknown
-                } else if facts.supports_foreground_preparation() {
-                    ForegroundPreparationEligibility::Eligible
+            AnalysisOutcome::Complete(content) => {
+                if let Some(facts) = content.as_xhtml() {
+                    if !facts.foreground_preparation_document_supported {
+                        ForegroundPreparationEligibility::Unknown
+                    } else if facts.supports_foreground_preparation() {
+                        ForegroundPreparationEligibility::Eligible
+                    } else {
+                        ForegroundPreparationEligibility::Ineligible
+                    }
+                } else if let Some(facts) = content.as_svg() {
+                    if facts.supports_foreground_preparation() {
+                        ForegroundPreparationEligibility::Eligible
+                    } else {
+                        ForegroundPreparationEligibility::Ineligible
+                    }
                 } else {
                     ForegroundPreparationEligibility::Ineligible
                 }
-            }
-            AnalysisOutcome::Complete(ContentFacts::Svg(facts)) => {
-                if facts.supports_foreground_preparation() {
-                    ForegroundPreparationEligibility::Eligible
-                } else {
-                    ForegroundPreparationEligibility::Ineligible
-                }
-            }
-            AnalysisOutcome::Complete(ContentFacts::Smil(_)) => {
-                ForegroundPreparationEligibility::Ineligible
             }
             AnalysisOutcome::Partial { .. } | AnalysisOutcome::Unavailable(_) => {
                 ForegroundPreparationEligibility::Unknown
@@ -546,10 +546,11 @@ impl PublicationAnalysis {
         });
         let resource_facts = || self.resources.resources().zip(&self.resource_facts);
         let structure = resource_facts().flat_map(|(resource, facts)| {
-            let structure = match facts.content().value() {
-                Some(ContentFacts::Xhtml(facts)) => facts.structure(),
-                Some(ContentFacts::Svg(_) | ContentFacts::Smil(_)) | None => &[],
-            };
+            let structure = facts
+                .content()
+                .value()
+                .and_then(ContentFacts::as_xhtml)
+                .map_or(&[][..], XhtmlFacts::structure);
             structure
                 .iter()
                 .map(move |fact| AccessibilityObservationRef::Structure { resource, fact })

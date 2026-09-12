@@ -465,10 +465,10 @@ fn record_executable_state(
 }
 
 fn record_content_occurrences(counts: &mut ContentOccurrenceCounts, content: &ContentFacts) {
-    match content {
-        ContentFacts::Xhtml(facts) => record_xhtml_occurrences(counts, facts),
-        ContentFacts::Svg(facts) => record_svg_occurrences(counts, facts),
-        ContentFacts::Smil(_) => {}
+    if let Some(facts) = content.as_xhtml() {
+        record_xhtml_occurrences(counts, facts);
+    } else if let Some(facts) = content.as_svg() {
+        record_svg_occurrences(counts, facts);
     }
 }
 

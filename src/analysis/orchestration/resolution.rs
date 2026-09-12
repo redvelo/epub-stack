@@ -271,11 +271,11 @@ pub(super) fn facts_for_row(
 
 fn fragment_exists(facts: &[ResourceFacts], resource: ResourceRow, fragment: &str) -> Option<bool> {
     let outcome = facts_for_row(facts, resource)?.content();
-    let fragments = match outcome.value()? {
-        ContentFacts::Xhtml(content) => content.fragments(),
-        ContentFacts::Svg(content) => content.fragments(),
-        ContentFacts::Smil(_) => return None,
-    };
+    let content = outcome.value()?;
+    let fragments = content
+        .as_xhtml()
+        .map(|facts| facts.fragments())
+        .or_else(|| content.as_svg().map(|facts| facts.fragments()))?;
     let found = fragments.iter().any(|fact| fact.id() == fragment);
     match outcome {
         AnalysisOutcome::Complete(_) => Some(found),

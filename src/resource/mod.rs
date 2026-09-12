@@ -444,6 +444,17 @@ ordinal!(
     ManifestOrdinal,
     "A zero-based manifest declaration position in one snapshot."
 );
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for ManifestOrdinal {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        <u32 as serde::Deserialize>::deserialize(deserializer).map(Self)
+    }
+}
+
 ordinal!(
     ReadingOrderOrdinal,
     "A zero-based reading-order occurrence position in one snapshot."
@@ -558,6 +569,14 @@ struct ManifestDeclarationRow {
     properties: Vec<ManifestPropertyToken>,
     fallback: Option<AuthoredIdRef>,
     media_overlay: Option<AuthoredIdRef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManifestIdrefResolution<'a> {
+    Invalid,
+    Missing,
+    Unique(ManifestRow),
+    Ambiguous(&'a [ManifestRow]),
 }
 
 impl ManifestDeclarationRow {
@@ -1665,6 +1684,16 @@ impl ResourceIndex {
                 index: self,
                 row: *row,
             }))
+    }
+    pub(crate) fn resolve_manifest_idref(&self, value: &str) -> ManifestIdrefResolution<'_> {
+        let Ok(value) = normalize_manifest_id(value) else {
+            return ManifestIdrefResolution::Invalid;
+        };
+        match self.by_id.get(value).map(Vec::as_slice).unwrap_or_default() {
+            [] => ManifestIdrefResolution::Missing,
+            [row] => ManifestIdrefResolution::Unique(*row),
+            rows => ManifestIdrefResolution::Ambiguous(rows),
+        }
     }
     /// Iterates the resource at an exact resolved address.
     ///
