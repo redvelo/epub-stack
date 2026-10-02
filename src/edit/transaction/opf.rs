@@ -1,781 +1,287 @@
 use super::*;
 
+fn same_manifest(left: &Package, right: &Package) -> bool {
+    left.manifest() == right.manifest()
+}
+
+fn same_metadata(left: &Package, right: &Package) -> bool {
+    left.metadata() == right.metadata()
+}
+
+fn same_spine(left: &Package, right: &Package) -> bool {
+    left.spine().itemrefs() == right.spine().itemrefs()
+}
+
 impl<'a, R: ResourceProvider> EpubEdit<'a, R> {
-    /// Stages a non-NAV manifest item at the end of the package manifest.
-    pub fn add_manifest_item(mut self, item: ManifestItem) -> Result<Self> {
-        let item_id = required_manifest_item_id(&item)?.to_string();
-        if item.has_property(KnownManifestProperty::Nav) {
-            return Err(EditError::UnsupportedSemanticEdit {
-                message: format!(
-                    "add_manifest_item does not support nav manifest item {}",
-                    item_id
-                ),
+    fn staged_package(&self) -> Package {
+        self.package_override
+            .clone()
+            .unwrap_or_else(|| self.epub.package.clone())
+    }
+
+    fn reject_navigation_manifest_item(package: &Package, item: &ManifestItem) -> Result<()> {
+        let id = item.id();
+        let is_ncx = package
+            .spine()
+            .toc()
+            .is_some_and(|toc| id.is_some_and(|id| manifest_ids_equal(toc, id)));
+        if item.has_property(KnownManifestProperty::Nav) || is_ncx {
+            return Err(EditError::NavigationManifestItem {
+                id: id.map(ToString::to_string),
             });
         }
-        let mut staged_package = self
-            .package_override
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| self.epub.package.clone());
-        staged_package.add_manifest_item(item.clone())?;
+        Ok(())
+    }
 
-        let package_path = self.epub.package_path.clone();
-        let package_path_for_mutate = package_path.clone();
-        let package_path_for_verify = package_path.clone();
+    /// Rewrites package XML and checks that the reparsed package agrees with `expected`.
+    fn apply_package_edit(
+        mut self,
+        expected: Package,
+        same: fn(&Package, &Package) -> bool,
+        mutate: impl FnOnce(&mut Xot, Node, &EpubPath) -> Result<()>,
+    ) -> Result<Self> {
+        let package_path = self.epub.resources.package_path().clone();
         let size_bytes = self.stage_package_edit(
-            |xot, doc| {
-                append_manifest_item_to_package_xml(xot, doc, &item, &package_path_for_mutate)
-            },
+            |xot, doc| mutate(xot, doc, &package_path),
             |package| {
-                if package.manifest_item_by_id(&item_id).is_none() {
-                    return Err(EditError::StructuralXml {
-                        path: package_path_for_verify,
-                        message: format!("manifest item {item_id} was not present after edit"),
-                    });
+                if same(package, &expected) {
+                    Ok(())
+                } else {
+                    Err(EditError::model_mismatch(&package_path))
                 }
-                Ok(())
             },
         )?;
         self.edit_changes
             .push(EditChange::RewriteStructuralResource {
-                path: self.epub.package_path.clone(),
-                kind: StructuralEditKind::Package,
+                path: package_path,
+                kind: StructuralResourceKind::Package,
                 size_bytes,
             });
         Ok(self)
     }
 
-    /// Stages removal of one uniquely selected manifest item not used by the spine.
-    pub fn remove_manifest_item(
-        mut self,
-        selector: impl Into<ManifestItemSelector>,
-    ) -> Result<Self> {
-        let selector = selector.into();
-        let mut staged_package = self
-            .package_override
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| self.epub.package.clone());
-        let selected = unique_manifest_item(&staged_package, &selector)?;
-        let id = selected_manifest_item_id(selected)?.to_string();
-        if selected.has_property(KnownManifestProperty::Nav)
-            || staged_package
-                .spine()
-                .toc()
-                .is_some_and(|toc| toc.as_str() == id.as_str())
-        {
-            return Err(EditError::UnsupportedSemanticEdit {
-                message: format!(
-                    "remove_manifest_item does not support selected navigation manifest item {}",
-                    id
-                ),
+    /// Stages a non-NAV manifest item at the end of the package manifest.
+    pub fn add_manifest_item(self, item: ManifestItem) -> Result<Self> {
+        required_manifest_item_id(&item)?;
+        if item.has_property(KnownManifestProperty::Nav) {
+            return Err(EditError::NavigationManifestItem {
+                id: item.id().map(ToString::to_string),
             });
         }
-        staged_package.remove_manifest_item(&id)?;
+        let mut expected = self.staged_package();
+        expected.add_manifest_item(item.clone())?;
+        self.apply_package_edit(expected, same_manifest, |xot, doc, path| {
+            append_manifest_item_to_package_xml(xot, doc, &item, path)
+        })
+    }
 
-        let package_path = self.epub.package_path.clone();
-        let package_path_for_mutate = package_path.clone();
-        let package_path_for_verify = package_path.clone();
-        let id_for_mutate = id.clone();
-        let id_for_verify = id.clone();
-        let size_bytes = self.stage_package_edit(
-            |xot, doc| {
-                remove_manifest_item_from_package_xml(
-                    xot,
-                    doc,
-                    &id_for_mutate,
-                    &package_path_for_mutate,
-                )
-            },
-            |package| {
-                if package.manifest_item_by_id(&id_for_verify).is_some() {
-                    return Err(EditError::StructuralXml {
-                        path: package_path_for_verify,
-                        message: format!(
-                            "manifest item {id_for_verify} was still present after edit"
-                        ),
-                    });
-                }
-                Ok(())
-            },
-        )?;
-        self.edit_changes
-            .push(EditChange::RewriteStructuralResource {
-                path: self.epub.package_path.clone(),
-                kind: StructuralEditKind::Package,
-                size_bytes,
-            });
-        Ok(self)
+    /// Stages removal of one uniquely selected manifest item not used by the spine.
+    pub fn remove_manifest_item(self, selector: impl Into<ManifestItemSelector>) -> Result<Self> {
+        let mut expected = self.staged_package();
+        let (index, selected) = unique_manifest_item(&expected, &selector.into())?;
+        Self::reject_navigation_manifest_item(&expected, selected)?;
+        expected.remove_manifest_item_at(index)?;
+        self.apply_package_edit(expected, same_manifest, |xot, doc, path| {
+            remove_manifest_item_at_from_package_xml(xot, doc, index, path)
+        })
     }
 
     /// Stages replacement of one uniquely selected non-NAV manifest item.
     pub fn replace_manifest_item(
-        mut self,
+        self,
         selector: impl Into<ManifestItemSelector>,
         item: ManifestItem,
     ) -> Result<Self> {
-        let item_id_for_verify = required_manifest_item_id(&item)?.to_string();
-        let selector = selector.into();
-        let mut staged_package = self
-            .package_override
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| self.epub.package.clone());
-        let selected = unique_manifest_item(&staged_package, &selector)?;
-        let id = selected_manifest_item_id(selected)?.to_string();
-        if selected.has_property(KnownManifestProperty::Nav)
-            || staged_package
-                .spine()
-                .toc()
-                .is_some_and(|toc| toc.as_str() == id.as_str())
-            || item.has_property(KnownManifestProperty::Nav)
-        {
-            return Err(EditError::UnsupportedSemanticEdit {
-                message: format!(
-                    "replace_manifest_item does not support selected navigation manifest item {}",
-                    id
-                ),
+        required_manifest_item_id(&item)?;
+        let mut expected = self.staged_package();
+        let (index, selected) = unique_manifest_item(&expected, &selector.into())?;
+        Self::reject_navigation_manifest_item(&expected, selected)?;
+        if item.has_property(KnownManifestProperty::Nav) {
+            return Err(EditError::NavigationManifestItem {
+                id: item.id().map(ToString::to_string),
             });
         }
-        staged_package.replace_manifest_item(&id, item.clone())?;
-
-        let package_path = self.epub.package_path.clone();
-        let package_path_for_mutate = package_path.clone();
-        let package_path_for_verify = package_path.clone();
-        let id_for_mutate = id.clone();
-        let item_for_mutate = item.clone();
-        let size_bytes = self.stage_package_edit(
-            |xot, doc| {
-                replace_manifest_item_in_package_xml(
-                    xot,
-                    doc,
-                    &id_for_mutate,
-                    &item_for_mutate,
-                    &package_path_for_mutate,
-                )
-            },
-            |package| {
-                let Some(replaced) = package.manifest_item_by_id(&item_id_for_verify) else {
-                    return Err(EditError::StructuralXml {
-                        path: package_path_for_verify,
-                        message: format!(
-                            "manifest item {item_id_for_verify} was not present after edit"
-                        ),
-                    });
-                };
-                if replaced != &item {
-                    return Err(EditError::StructuralXml {
-                        path: package_path_for_verify,
-                        message: format!(
-                            "manifest item {item_id_for_verify} did not match replacement"
-                        ),
-                    });
-                }
-                Ok(())
-            },
-        )?;
-        self.edit_changes
-            .push(EditChange::RewriteStructuralResource {
-                path: self.epub.package_path.clone(),
-                kind: StructuralEditKind::Package,
-                size_bytes,
-            });
-        Ok(self)
+        expected.replace_manifest_item_at(index, item.clone())?;
+        self.apply_package_edit(expected, same_manifest, |xot, doc, path| {
+            replace_manifest_item_at_in_package_xml(xot, doc, index, &item, path)
+        })
     }
 
     /// Stages a Dublin Core element at the end of package metadata.
-    pub fn add_metadata_element(mut self, element: MetadataElement) -> Result<Self> {
-        let mut staged_package = self
-            .package_override
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| self.epub.package.clone());
-        staged_package.metadata_mut().add_element(element.clone());
-
-        let package_path = self.epub.package_path.clone();
-        let package_path_for_mutate = package_path.clone();
-        let package_path_for_verify = package_path.clone();
-        let element_for_mutate = element.clone();
-        let size_bytes = self.stage_package_edit(
-            |xot, doc| {
-                append_metadata_element_to_package_xml(
-                    xot,
-                    doc,
-                    &element_for_mutate,
-                    &package_path_for_mutate,
-                )
-            },
-            |package| {
-                if package.metadata() != staged_package.metadata() {
-                    return Err(EditError::StructuralXml {
-                        path: package_path_for_verify,
-                        message: format!(
-                            "metadata element {} was not appended",
-                            element.local_name()
-                        ),
-                    });
-                }
-                Ok(())
-            },
-        )?;
-        self.edit_changes
-            .push(EditChange::RewriteStructuralResource {
-                path: self.epub.package_path.clone(),
-                kind: StructuralEditKind::Package,
-                size_bytes,
-            });
-        Ok(self)
+    pub fn add_metadata_element(self, kind: DcElement, element: Element) -> Result<Self> {
+        let mut expected = self.staged_package();
+        expected.metadata_mut().add_element(kind, element.clone());
+        self.apply_package_edit(expected, same_metadata, |xot, doc, path| {
+            append_metadata_element_to_package_xml(xot, doc, kind, &element, path)
+        })
     }
 
     /// Stages an EPUB 3 `meta` element at the end of package metadata.
-    pub fn add_meta(mut self, meta: Meta) -> Result<Self> {
-        let mut staged_package = self
-            .package_override
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| self.epub.package.clone());
-        staged_package.metadata_mut().add_meta(meta.clone());
-
-        let package_path = self.epub.package_path.clone();
-        let package_path_for_mutate = package_path.clone();
-        let package_path_for_verify = package_path.clone();
-        let meta_for_mutate = meta.clone();
-        let size_bytes = self.stage_package_edit(
-            |xot, doc| {
-                append_meta_to_package_xml(xot, doc, &meta_for_mutate, &package_path_for_mutate)
-            },
-            |package| {
-                if package.metadata() != staged_package.metadata() {
-                    return Err(EditError::StructuralXml {
-                        path: package_path_for_verify,
-                        message: "metadata meta was not appended".to_string(),
-                    });
-                }
-                Ok(())
-            },
-        )?;
-        self.edit_changes
-            .push(EditChange::RewriteStructuralResource {
-                path: self.epub.package_path.clone(),
-                kind: StructuralEditKind::Package,
-                size_bytes,
-            });
-        Ok(self)
+    pub fn add_meta(self, meta: Meta) -> Result<Self> {
+        let mut expected = self.staged_package();
+        expected.metadata_mut().add_meta(meta.clone());
+        self.apply_package_edit(expected, same_metadata, |xot, doc, path| {
+            append_meta_to_package_xml(xot, doc, &meta, path)
+        })
     }
 
     /// Stages a `link` element at the end of package metadata.
-    pub fn add_metadata_link(mut self, link: MetadataLink) -> Result<Self> {
-        let mut staged_package = self
-            .package_override
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| self.epub.package.clone());
-        staged_package.metadata_mut().add_link(link.clone());
-
-        let package_path = self.epub.package_path.clone();
-        let package_path_for_mutate = package_path.clone();
-        let package_path_for_verify = package_path.clone();
-        let link_for_mutate = link.clone();
-        let size_bytes = self.stage_package_edit(
-            |xot, doc| {
-                append_metadata_link_to_package_xml(
-                    xot,
-                    doc,
-                    &link_for_mutate,
-                    &package_path_for_mutate,
-                )
-            },
-            |package| {
-                if package.metadata() != staged_package.metadata() {
-                    return Err(EditError::StructuralXml {
-                        path: package_path_for_verify,
-                        message: "metadata link was not appended".to_string(),
-                    });
-                }
-                Ok(())
-            },
-        )?;
-        self.edit_changes
-            .push(EditChange::RewriteStructuralResource {
-                path: self.epub.package_path.clone(),
-                kind: StructuralEditKind::Package,
-                size_bytes,
-            });
-        Ok(self)
+    pub fn add_metadata_link(self, link: MetadataLink) -> Result<Self> {
+        let mut expected = self.staged_package();
+        expected.metadata_mut().add_link(link.clone());
+        self.apply_package_edit(expected, same_metadata, |xot, doc, path| {
+            append_metadata_link_to_package_xml(xot, doc, &link, path)
+        })
     }
 
     /// Stages removal of one uniquely selected Dublin Core metadata element.
-    pub fn remove_metadata_element(mut self, selector: MetadataElementSelector) -> Result<Self> {
-        let mut staged_package = self
-            .package_override
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| self.epub.package.clone());
-        let (local_name, index) = unique_metadata_element(&staged_package, &selector)?;
-        staged_package
-            .metadata_mut()
-            .remove_element_at(local_name, index)?;
-
-        let package_path = self.epub.package_path.clone();
-        let package_path_for_mutate = package_path.clone();
-        let package_path_for_verify = package_path.clone();
-        let size_bytes = self.stage_package_edit(
-            |xot, doc| {
-                remove_metadata_element_from_package_xml(
-                    xot,
-                    doc,
-                    local_name,
-                    index,
-                    &package_path_for_mutate,
-                )
-            },
-            |package| {
-                if package.metadata() != staged_package.metadata() {
-                    return Err(EditError::StructuralXml {
-                        path: package_path_for_verify,
-                        message: format!("metadata {local_name} was not removed"),
-                    });
-                }
-                Ok(())
-            },
-        )?;
-        self.edit_changes
-            .push(EditChange::RewriteStructuralResource {
-                path: self.epub.package_path.clone(),
-                kind: StructuralEditKind::Package,
-                size_bytes,
-            });
-        Ok(self)
+    pub fn remove_metadata_element(self, selector: MetadataElementSelector) -> Result<Self> {
+        let mut expected = self.staged_package();
+        let index = unique_metadata_element(&expected, &selector)?;
+        let element = selector.element;
+        expected.metadata_mut().remove_element_at(element, index)?;
+        self.apply_package_edit(expected, same_metadata, |xot, doc, path| {
+            remove_metadata_element_from_package_xml(xot, doc, element.local_name(), index, path)
+        })
     }
 
-    /// Stages replacement of one Dublin Core element with another of the same kind.
+    /// Stages replacement of one uniquely selected Dublin Core element.
     pub fn replace_metadata_element(
-        mut self,
+        self,
         selector: MetadataElementSelector,
-        element: MetadataElement,
+        value: Element,
     ) -> Result<Self> {
-        let mut staged_package = self
-            .package_override
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| self.epub.package.clone());
-        let (local_name, index) = unique_metadata_element(&staged_package, &selector)?;
-        if element.local_name() != local_name {
-            return Err(EditError::UnsupportedSemanticEdit {
-                message: format!(
-                    "replace_metadata_element selector targets {local_name} but replacement is {}",
-                    element.local_name()
-                ),
-            });
-        }
-        staged_package
+        let mut expected = self.staged_package();
+        let index = unique_metadata_element(&expected, &selector)?;
+        let element = selector.element;
+        expected
             .metadata_mut()
-            .replace_element_at(local_name, index, element.clone())?;
-
-        let package_path = self.epub.package_path.clone();
-        let package_path_for_mutate = package_path.clone();
-        let package_path_for_verify = package_path.clone();
-        let element_for_mutate = element.clone();
-        let size_bytes = self.stage_package_edit(
-            |xot, doc| {
-                replace_metadata_element_in_package_xml(
-                    xot,
-                    doc,
-                    local_name,
-                    index,
-                    &element_for_mutate,
-                    &package_path_for_mutate,
-                )
-            },
-            |package| {
-                if package.metadata() != staged_package.metadata() {
-                    return Err(EditError::StructuralXml {
-                        path: package_path_for_verify,
-                        message: format!("metadata {local_name} was not replaced"),
-                    });
-                }
-                Ok(())
-            },
-        )?;
-        self.edit_changes
-            .push(EditChange::RewriteStructuralResource {
-                path: self.epub.package_path.clone(),
-                kind: StructuralEditKind::Package,
-                size_bytes,
-            });
-        Ok(self)
+            .replace_element_at(element, index, value.clone())?;
+        self.apply_package_edit(expected, same_metadata, |xot, doc, path| {
+            replace_metadata_element_in_package_xml(
+                xot,
+                doc,
+                element.local_name(),
+                index,
+                &value,
+                path,
+            )
+        })
     }
 
     /// Stages removal of one uniquely selected EPUB 3 metadata `meta` element.
-    pub fn remove_meta(mut self, selector: MetaSelector) -> Result<Self> {
-        let mut staged_package = self
-            .package_override
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| self.epub.package.clone());
-        let index = unique_meta(&staged_package, &selector)?;
-        staged_package.metadata_mut().remove_meta_at(index)?;
-
-        let package_path = self.epub.package_path.clone();
-        let package_path_for_mutate = package_path.clone();
-        let package_path_for_verify = package_path.clone();
-        let size_bytes = self.stage_package_edit(
-            |xot, doc| remove_meta_from_package_xml(xot, doc, index, &package_path_for_mutate),
-            |package| {
-                if package.metadata() != staged_package.metadata() {
-                    return Err(EditError::StructuralXml {
-                        path: package_path_for_verify,
-                        message: "metadata meta was not removed".to_string(),
-                    });
-                }
-                Ok(())
-            },
-        )?;
-        self.edit_changes
-            .push(EditChange::RewriteStructuralResource {
-                path: self.epub.package_path.clone(),
-                kind: StructuralEditKind::Package,
-                size_bytes,
-            });
-        Ok(self)
+    pub fn remove_meta(self, selector: MetaSelector) -> Result<Self> {
+        let mut expected = self.staged_package();
+        let index = unique_meta(&expected, &selector)?;
+        expected.metadata_mut().remove_meta_at(index)?;
+        self.apply_package_edit(expected, same_metadata, |xot, doc, path| {
+            remove_meta_from_package_xml(xot, doc, index, path)
+        })
     }
 
     /// Stages replacement of one uniquely selected EPUB 3 metadata `meta` element.
-    pub fn replace_meta(mut self, selector: MetaSelector, meta: Meta) -> Result<Self> {
-        let mut staged_package = self
-            .package_override
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| self.epub.package.clone());
-        let index = unique_meta(&staged_package, &selector)?;
-        staged_package
+    pub fn replace_meta(self, selector: MetaSelector, meta: Meta) -> Result<Self> {
+        let mut expected = self.staged_package();
+        let index = unique_meta(&expected, &selector)?;
+        expected
             .metadata_mut()
             .replace_meta_at(index, meta.clone())?;
-
-        let package_path = self.epub.package_path.clone();
-        let package_path_for_mutate = package_path.clone();
-        let package_path_for_verify = package_path.clone();
-        let meta_for_mutate = meta.clone();
-        let size_bytes = self.stage_package_edit(
-            |xot, doc| {
-                replace_meta_in_package_xml(
-                    xot,
-                    doc,
-                    index,
-                    &meta_for_mutate,
-                    &package_path_for_mutate,
-                )
-            },
-            |package| {
-                if package.metadata() != staged_package.metadata() {
-                    return Err(EditError::StructuralXml {
-                        path: package_path_for_verify,
-                        message: "metadata meta was not replaced".to_string(),
-                    });
-                }
-                Ok(())
-            },
-        )?;
-        self.edit_changes
-            .push(EditChange::RewriteStructuralResource {
-                path: self.epub.package_path.clone(),
-                kind: StructuralEditKind::Package,
-                size_bytes,
-            });
-        Ok(self)
+        self.apply_package_edit(expected, same_metadata, |xot, doc, path| {
+            replace_meta_in_package_xml(xot, doc, index, &meta, path)
+        })
     }
 
     /// Stages removal of one uniquely selected package metadata `link` element.
-    pub fn remove_metadata_link(mut self, selector: MetadataLinkSelector) -> Result<Self> {
-        let mut staged_package = self
-            .package_override
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| self.epub.package.clone());
-        let index = unique_metadata_link(&staged_package, &selector)?;
-        staged_package.metadata_mut().remove_link_at(index)?;
-
-        let package_path = self.epub.package_path.clone();
-        let package_path_for_mutate = package_path.clone();
-        let package_path_for_verify = package_path.clone();
-        let size_bytes = self.stage_package_edit(
-            |xot, doc| {
-                remove_metadata_link_from_package_xml(xot, doc, index, &package_path_for_mutate)
-            },
-            |package| {
-                if package.metadata() != staged_package.metadata() {
-                    return Err(EditError::StructuralXml {
-                        path: package_path_for_verify,
-                        message: "metadata link was not removed".to_string(),
-                    });
-                }
-                Ok(())
-            },
-        )?;
-        self.edit_changes
-            .push(EditChange::RewriteStructuralResource {
-                path: self.epub.package_path.clone(),
-                kind: StructuralEditKind::Package,
-                size_bytes,
-            });
-        Ok(self)
+    pub fn remove_metadata_link(self, selector: MetadataLinkSelector) -> Result<Self> {
+        let mut expected = self.staged_package();
+        let index = unique_metadata_link(&expected, &selector)?;
+        expected.metadata_mut().remove_link_at(index)?;
+        self.apply_package_edit(expected, same_metadata, |xot, doc, path| {
+            remove_metadata_link_from_package_xml(xot, doc, index, path)
+        })
     }
 
     /// Stages replacement of one uniquely selected package metadata `link` element.
     pub fn replace_metadata_link(
-        mut self,
+        self,
         selector: MetadataLinkSelector,
         link: MetadataLink,
     ) -> Result<Self> {
-        let mut staged_package = self
-            .package_override
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| self.epub.package.clone());
-        let index = unique_metadata_link(&staged_package, &selector)?;
-        staged_package
+        let mut expected = self.staged_package();
+        let index = unique_metadata_link(&expected, &selector)?;
+        expected
             .metadata_mut()
             .replace_link_at(index, link.clone())?;
-
-        let package_path = self.epub.package_path.clone();
-        let package_path_for_mutate = package_path.clone();
-        let package_path_for_verify = package_path.clone();
-        let link_for_mutate = link.clone();
-        let size_bytes = self.stage_package_edit(
-            |xot, doc| {
-                replace_metadata_link_in_package_xml(
-                    xot,
-                    doc,
-                    index,
-                    &link_for_mutate,
-                    &package_path_for_mutate,
-                )
-            },
-            |package| {
-                if package.metadata() != staged_package.metadata() {
-                    return Err(EditError::StructuralXml {
-                        path: package_path_for_verify,
-                        message: "metadata link was not replaced".to_string(),
-                    });
-                }
-                Ok(())
-            },
-        )?;
-        self.edit_changes
-            .push(EditChange::RewriteStructuralResource {
-                path: self.epub.package_path.clone(),
-                kind: StructuralEditKind::Package,
-                size_bytes,
-            });
-        Ok(self)
+        self.apply_package_edit(expected, same_metadata, |xot, doc, path| {
+            replace_metadata_link_in_package_xml(xot, doc, index, &link, path)
+        })
     }
 
     /// Stages an itemref at the end of the spine for an existing manifest target.
-    pub fn add_spine_itemref(mut self, itemref: ItemRef) -> Result<Self> {
-        let idref_for_verify = required_spine_itemref_idref(&itemref)?.to_string();
-        let mut staged_package = self
-            .package_override
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| self.epub.package.clone());
-        staged_package.add_spine_itemref(itemref.clone())?;
-
-        let package_path = self.epub.package_path.clone();
-        let package_path_for_mutate = package_path.clone();
-        let package_path_for_verify = package_path.clone();
-        let itemref_for_mutate = itemref.clone();
-        let itemref_for_verify = itemref.clone();
-        let expected_index = staged_package.spine().itemrefs().len() - 1;
-        let size_bytes = self.stage_package_edit(
-            |xot, doc| {
-                append_spine_itemref_to_package_xml(
-                    xot,
-                    doc,
-                    &itemref_for_mutate,
-                    &package_path_for_mutate,
-                )
-            },
-            |package| {
-                if package.spine().itemrefs().get(expected_index) != Some(&itemref_for_verify) {
-                    return Err(EditError::StructuralXml {
-                        path: package_path_for_verify,
-                        message: format!("spine itemref {idref_for_verify} was not appended"),
-                    });
-                }
-                Ok(())
-            },
-        )?;
-        self.edit_changes
-            .push(EditChange::RewriteStructuralResource {
-                path: self.epub.package_path.clone(),
-                kind: StructuralEditKind::Package,
-                size_bytes,
-            });
-        Ok(self)
+    pub fn add_spine_itemref(self, itemref: ItemRef) -> Result<Self> {
+        required_spine_itemref_idref(&itemref)?;
+        let mut expected = self.staged_package();
+        expected.add_spine_itemref(itemref.clone())?;
+        self.apply_package_edit(expected, same_spine, |xot, doc, path| {
+            append_spine_itemref_to_package_xml(xot, doc, &itemref, path)
+        })
     }
 
     /// Stages removal of one uniquely selected spine itemref.
-    pub fn remove_spine_itemref(
-        mut self,
-        selector: impl Into<SpineItemRefSelector>,
-    ) -> Result<Self> {
-        let selector = selector.into();
-        let mut staged_package = self
-            .package_override
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| self.epub.package.clone());
-        let (index, selected) = unique_spine_itemref(&staged_package, &selector)?;
-        let selected_idref = selected
-            .idref()
-            .ok_or(SpineItemRefLookupError::MissingIdref(index))?
-            .to_string();
-        staged_package.remove_spine_itemref_at(index)?;
-
-        let package_path = self.epub.package_path.clone();
-        let package_path_for_mutate = package_path.clone();
-        let package_path_for_verify = package_path.clone();
-        let size_bytes = self.stage_package_edit(
-            |xot, doc| {
-                remove_spine_itemref_from_package_xml(xot, doc, index, &package_path_for_mutate)
-            },
-            |package| {
-                if package.spine().itemrefs() != staged_package.spine().itemrefs() {
-                    return Err(EditError::StructuralXml {
-                        path: package_path_for_verify,
-                        message: format!("spine itemref {selected_idref} was not removed"),
-                    });
-                }
-                Ok(())
-            },
-        )?;
-        self.edit_changes
-            .push(EditChange::RewriteStructuralResource {
-                path: self.epub.package_path.clone(),
-                kind: StructuralEditKind::Package,
-                size_bytes,
-            });
-        Ok(self)
+    pub fn remove_spine_itemref(self, selector: impl Into<SpineItemRefSelector>) -> Result<Self> {
+        let mut expected = self.staged_package();
+        let (index, _, _) = unique_spine_itemref(&expected, &selector.into())?;
+        expected.remove_spine_itemref_at(index)?;
+        self.apply_package_edit(expected, same_spine, |xot, doc, path| {
+            remove_spine_itemref_from_package_xml(xot, doc, index, path)
+        })
     }
 
     /// Stages replacement of one uniquely selected spine itemref with a resolvable itemref.
     pub fn replace_spine_itemref(
-        mut self,
+        self,
         selector: impl Into<SpineItemRefSelector>,
         itemref: ItemRef,
     ) -> Result<Self> {
         required_spine_itemref_idref(&itemref)?;
-        let selector = selector.into();
-        let mut staged_package = self
-            .package_override
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| self.epub.package.clone());
-        let (index, selected) = unique_spine_itemref(&staged_package, &selector)?;
-        let selected_idref = selected
-            .idref()
-            .ok_or(SpineItemRefLookupError::MissingIdref(index))?
-            .to_string();
-        staged_package.replace_spine_itemref_at(index, itemref.clone())?;
-
-        let package_path = self.epub.package_path.clone();
-        let package_path_for_mutate = package_path.clone();
-        let package_path_for_verify = package_path.clone();
-        let itemref_for_mutate = itemref.clone();
-        let size_bytes = self.stage_package_edit(
-            |xot, doc| {
-                replace_spine_itemref_in_package_xml(
-                    xot,
-                    doc,
-                    index,
-                    &itemref_for_mutate,
-                    &package_path_for_mutate,
-                )
-            },
-            |package| {
-                if package.spine().itemrefs() != staged_package.spine().itemrefs() {
-                    return Err(EditError::StructuralXml {
-                        path: package_path_for_verify,
-                        message: format!("spine itemref {selected_idref} was not replaced"),
-                    });
-                }
-                Ok(())
-            },
-        )?;
-        self.edit_changes
-            .push(EditChange::RewriteStructuralResource {
-                path: self.epub.package_path.clone(),
-                kind: StructuralEditKind::Package,
-                size_bytes,
-            });
-        Ok(self)
+        let mut expected = self.staged_package();
+        let (index, _, _) = unique_spine_itemref(&expected, &selector.into())?;
+        expected.replace_spine_itemref_at(index, itemref.clone())?;
+        self.apply_package_edit(expected, same_spine, |xot, doc, path| {
+            replace_spine_itemref_in_package_xml(xot, doc, index, &itemref, path)
+        })
     }
 
     /// Stages moving one selected itemref to a zero-based final spine index.
     pub fn move_spine_itemref(
-        mut self,
+        self,
         selector: impl Into<SpineItemRefSelector>,
         index: usize,
     ) -> Result<Self> {
-        let selector = selector.into();
-        let mut staged_package = self
-            .package_override
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| self.epub.package.clone());
-        let (from_index, selected) = unique_spine_itemref(&staged_package, &selector)?;
-        let selected_idref = selected
-            .idref()
-            .ok_or(SpineItemRefLookupError::MissingIdref(from_index))?
-            .to_string();
-        staged_package.move_spine_itemref(from_index, index)?;
-
-        let package_path = self.epub.package_path.clone();
-        let package_path_for_mutate = package_path.clone();
-        let package_path_for_verify = package_path.clone();
-        let size_bytes = self.stage_package_edit(
-            |xot, doc| {
-                move_spine_itemref_in_package_xml(
-                    xot,
-                    doc,
-                    from_index,
-                    index,
-                    &package_path_for_mutate,
-                )
-            },
-            |package| {
-                if package.spine().itemrefs() != staged_package.spine().itemrefs() {
-                    return Err(EditError::StructuralXml {
-                        path: package_path_for_verify,
-                        message: format!("spine itemref {selected_idref} was not moved"),
-                    });
-                }
-                Ok(())
-            },
-        )?;
-        self.edit_changes
-            .push(EditChange::RewriteStructuralResource {
-                path: self.epub.package_path.clone(),
-                kind: StructuralEditKind::Package,
-                size_bytes,
-            });
-        Ok(self)
+        let mut expected = self.staged_package();
+        let (from_index, _, _) = unique_spine_itemref(&expected, &selector.into())?;
+        expected.move_spine_itemref(from_index, index)?;
+        self.apply_package_edit(expected, same_spine, |xot, doc, path| {
+            move_spine_itemref_in_package_xml(xot, doc, from_index, index, path)
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        container::EpubZip,
-        resource::{ReadingOrderTarget, provider::MemoryResourceProvider},
-    };
+    use crate::package::metadata::DcElement;
+    use crate::{container::EpubZip, resource::provider::MemoryResourceProvider};
     use std::io::{Cursor, Read, Write};
     use zip::write::SimpleFileOptions;
     use zip::{ZipArchive, ZipWriter};
 
     fn memory_provider_epub() -> Epub<MemoryResourceProvider> {
-        Epub::from_provider(memory_provider(), "EPUB/package.opf").unwrap()
+        Epub::from_provider(
+            memory_provider(),
+            EpubPath::new("EPUB/package.opf").unwrap(),
+        )
+        .unwrap()
     }
 
     fn memory_provider() -> MemoryResourceProvider {
@@ -844,6 +350,20 @@ mod tests {
             ("EPUB/images/cover.jpg", b"jpeg".to_vec()),
         ])
         .unwrap()
+    }
+
+    fn duplicate_manifest_id_edit_epub() -> Epub<EpubZip<Cursor<Vec<u8>>>> {
+        package_source_edit_epub(
+            r#"<package xmlns="http://www.idpf.org/2007/opf" xmlns:dc="http://purl.org/dc/elements/1.1/" version="3.0" unique-identifier="uid">
+  <metadata><dc:title>T</dc:title><dc:identifier id="uid">id</dc:identifier><dc:language>en</dc:language></metadata>
+  <manifest>
+    <item id="chap" href="text/chapter.xhtml" media-type="application/xhtml+xml" />
+    <item id="duplicate" href="images/first.jpg" media-type="image/jpeg" marker="first" />
+    <item id="duplicate" href="images/second.jpg" media-type="image/jpeg" marker="second" />
+  </manifest>
+  <spine><itemref idref="chap" /></spine>
+</package>"#,
+        )
     }
 
     fn memory_provider_with_two_spine_items() -> MemoryResourceProvider {
@@ -1013,7 +533,7 @@ mod tests {
         let mut epub = package_source_edit_epub(package);
         epub.edit()
             .replace_spine_itemref(
-                SpineItemRefSelector::index(0),
+                SpineItemRefSelector::Ordinal(crate::resource::ReadingOrderOrdinal::from_index(0)),
                 ItemRef::new("chap").unwrap().with_linear(Linear::No),
             )
             .unwrap()
@@ -1032,14 +552,15 @@ mod tests {
             .id(EpubString::try_new("extra").unwrap())
             .href(EpubHref::try_new("extra.xhtml").unwrap())
             .media_type(EpubString::try_new("application/xhtml+xml").unwrap().into())
-            .build();
+            .build()
+            .unwrap();
 
         let report = epub
             .edit()
             .add_manifest_item(item)
             .unwrap()
             .upsert_resource(
-                "EPUB/extra.xhtml",
+                EpubPath::new("EPUB/extra.xhtml").unwrap(),
                 b"<html><body>Extra</body></html>".to_vec(),
             )
             .unwrap()
@@ -1047,44 +568,42 @@ mod tests {
             .unwrap()
             .commit();
 
-        assert!(report.changes().iter().any(|change| matches!(
+        assert!(report.iter().any(|change| matches!(
             change,
             EditChange::RewriteStructuralResource { path, .. }
                 if path.as_str() == "EPUB/package.opf"
         )));
         assert!(epub.package().manifest_item_by_id("extra").is_some());
         assert_eq!(
-            epub.resource(ResourceSelector::manifest_href("extra.xhtml").unwrap())
-                .unwrap()
-                .bytes()
+            epub.bytes(&EpubPath::new("EPUB/extra.xhtml").unwrap())
                 .unwrap(),
             b"<html><body>Extra</body></html>".to_vec()
         );
         assert!(
-            epub.resource(ResourceSelector::path("EPUB/package.opf").unwrap())
-                .unwrap()
-                .utf8_text()
+            epub.utf8_text(&EpubPath::new("EPUB/package.opf").unwrap())
                 .unwrap()
                 .contains("media-type=\"application/xhtml+xml\"")
         );
     }
 
     #[test]
-    fn edit_add_manifest_item_rejects_later_raw_opf_overwrite() {
+    fn raw_opf_overwrite_is_rejected_when_staged() {
         let mut epub = memory_provider_epub();
         let item = ManifestItem::builder()
             .id(EpubString::try_new("extra").unwrap())
             .href(EpubHref::try_new("extra.xhtml").unwrap())
             .media_type(EpubString::try_new("application/xhtml+xml").unwrap().into())
-            .build();
+            .build()
+            .unwrap();
 
         let err = epub
             .edit()
             .add_manifest_item(item)
             .unwrap()
-            .upsert_resource("EPUB/package.opf", b"not opf".to_vec())
-            .unwrap()
-            .preview()
+            .upsert_resource(
+                EpubPath::new("EPUB/package.opf").unwrap(),
+                b"not opf".to_vec(),
+            )
             .unwrap_err();
 
         assert!(matches!(
@@ -1098,27 +617,21 @@ mod tests {
     }
 
     #[test]
-    fn edit_add_manifest_item_rejects_second_semantic_edit_after_raw_opf_overwrite() {
+    fn raw_opf_overwrite_after_semantic_edit_is_rejected() {
         let mut epub = memory_provider_epub();
         let package_bytes = epub.package().to_normalized_xml().unwrap().into_bytes();
         let first = ManifestItem::builder()
             .id(EpubString::try_new("extra-a").unwrap())
             .href(EpubHref::try_new("extra-a.xhtml").unwrap())
             .media_type(EpubString::try_new("application/xhtml+xml").unwrap().into())
-            .build();
-        let second = ManifestItem::builder()
-            .id(EpubString::try_new("extra-b").unwrap())
-            .href(EpubHref::try_new("extra-b.xhtml").unwrap())
-            .media_type(EpubString::try_new("application/xhtml+xml").unwrap().into())
-            .build();
+            .build()
+            .unwrap();
 
         let err = epub
             .edit()
             .add_manifest_item(first)
             .unwrap()
-            .upsert_resource("EPUB/package.opf", package_bytes)
-            .unwrap()
-            .add_manifest_item(second)
+            .upsert_resource(EpubPath::new("EPUB/package.opf").unwrap(), package_bytes)
             .unwrap_err();
 
         assert!(matches!(
@@ -1129,24 +642,16 @@ mod tests {
             }
         ));
         assert!(epub.package().manifest_item_by_id("extra-a").is_none());
-        assert!(epub.package().manifest_item_by_id("extra-b").is_none());
     }
 
     #[test]
-    fn edit_add_manifest_item_rejects_prior_raw_opf_edit() {
+    fn raw_opf_edit_is_rejected_when_staged() {
         let mut epub = memory_provider_epub();
         let package_bytes = epub.package().to_normalized_xml().unwrap().into_bytes();
-        let item = ManifestItem::builder()
-            .id(EpubString::try_new("extra").unwrap())
-            .href(EpubHref::try_new("extra.xhtml").unwrap())
-            .media_type(EpubString::try_new("application/xhtml+xml").unwrap().into())
-            .build();
 
         let err = epub
             .edit()
-            .upsert_resource("EPUB/package.opf", package_bytes)
-            .unwrap()
-            .add_manifest_item(item)
+            .upsert_resource(EpubPath::new("EPUB/package.opf").unwrap(), package_bytes)
             .unwrap_err();
 
         assert!(matches!(
@@ -1156,7 +661,6 @@ mod tests {
                 ..
             }
         ));
-        assert!(epub.package().manifest_item_by_id("extra").is_none());
     }
 
     #[test]
@@ -1167,13 +671,14 @@ mod tests {
             .href(EpubHref::try_new("new-nav.xhtml").unwrap())
             .media_type(EpubString::try_new("application/xhtml+xml").unwrap().into())
             .properties(vec![KnownManifestProperty::Nav.into()])
-            .build();
+            .build()
+            .unwrap();
 
         let err = epub.edit().add_manifest_item(item).unwrap_err();
 
         assert!(matches!(
             err,
-            crate::edit::EditError::UnsupportedSemanticEdit { .. }
+            crate::edit::EditError::NavigationManifestItem { .. }
         ));
         assert!(epub.package().manifest_item_by_id("new-nav").is_none());
     }
@@ -1181,11 +686,12 @@ mod tests {
     #[test]
     fn edit_remove_manifest_item_rewrites_opf_and_stages_provider_only_resource() {
         let provider = memory_provider_with_extra_manifest_item();
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
 
         let preview = epub
             .edit()
-            .remove_manifest_item(ManifestItemSelector::authored_href(AuthoredHref::new(
+            .remove_manifest_item(ManifestItemSelector::AuthoredHref(AuthoredHref::new(
                 "images/cover.jpg",
             )))
             .unwrap()
@@ -1199,25 +705,21 @@ mod tests {
         )));
         let cover = preview
             .resources()
-            .select(&ResourceSelector::path("EPUB/images/cover.jpg").unwrap())
+            .resource_by_path(&EpubPath::new("EPUB/images/cover.jpg").unwrap())
             .unwrap();
-        assert!(!cover.is_manifest_resource());
+        assert!(cover.declarations().len() == 0);
 
         preview.commit();
 
         assert!(epub.package().manifest_item_by_id("img").is_none());
         assert!(
-            epub.resource(ResourceSelector::path("EPUB/package.opf").unwrap())
-                .unwrap()
-                .utf8_text()
+            epub.utf8_text(&EpubPath::new("EPUB/package.opf").unwrap())
                 .unwrap()
                 .contains("id=\"chap\"")
         );
         assert!(
             !epub
-                .resource(ResourceSelector::path("EPUB/package.opf").unwrap())
-                .unwrap()
-                .utf8_text()
+                .utf8_text(&EpubPath::new("EPUB/package.opf").unwrap())
                 .unwrap()
                 .contains("id=\"img\"")
         );
@@ -1229,7 +731,7 @@ mod tests {
 
         let err = epub
             .edit()
-            .remove_manifest_item(ManifestItemSelector::href(
+            .remove_manifest_item(ManifestItemSelector::Href(
                 EpubHref::try_new("text/chapter.xhtml").unwrap(),
             ))
             .unwrap_err();
@@ -1248,25 +750,26 @@ mod tests {
 
         let err = epub
             .edit()
-            .remove_manifest_item(ManifestItemSelector::id(
+            .remove_manifest_item(ManifestItemSelector::Id(
                 EpubString::try_new("nav").unwrap(),
             ))
             .unwrap_err();
 
         assert!(matches!(
             err,
-            crate::edit::EditError::UnsupportedSemanticEdit { .. }
+            crate::edit::EditError::NavigationManifestItem { .. }
         ));
     }
 
     #[test]
     fn edit_remove_manifest_item_rejects_ambiguous_authored_href() {
         let provider = memory_provider_with_duplicate_manifest_hrefs();
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
 
         let err = epub
             .edit()
-            .remove_manifest_item(ManifestItemSelector::authored_href(AuthoredHref::new(
+            .remove_manifest_item(ManifestItemSelector::AuthoredHref(AuthoredHref::new(
                 "images/cover.jpg",
             )))
             .unwrap_err();
@@ -1274,32 +777,36 @@ mod tests {
         assert!(matches!(
             err,
             EditError::Selection {
-                target: "manifest item",
-                selector,
+                target: SelectionTarget::ManifestItem(ManifestItemSelector::AuthoredHref(_)),
                 failure: SelectionFailure::Ambiguous,
-            } if selector == "authored href images/cover.jpg"
+            }
         ));
     }
 
     #[test]
     fn edit_replace_manifest_item_rewrites_opf_and_preserves_unknown_attrs() {
         let provider = memory_provider_with_extra_manifest_item();
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
         let replacement = ManifestItem::builder()
             .id(EpubString::try_new("img2").unwrap())
             .href(EpubHref::try_new("images/new-cover.jpg").unwrap())
             .media_type(EpubString::try_new("image/jpeg").unwrap().into())
             .properties(vec![KnownManifestProperty::CoverImage.into()])
-            .build();
+            .build()
+            .unwrap();
 
         let preview = epub
             .edit()
             .replace_manifest_item(
-                ManifestItemSelector::id(EpubString::try_new("img").unwrap()),
+                ManifestItemSelector::Id(EpubString::try_new("img").unwrap()),
                 replacement,
             )
             .unwrap()
-            .upsert_resource("EPUB/images/new-cover.jpg", b"newjpeg".to_vec())
+            .upsert_resource(
+                EpubPath::new("EPUB/images/new-cover.jpg").unwrap(),
+                b"newjpeg".to_vec(),
+            )
             .unwrap()
             .preview()
             .unwrap();
@@ -1315,9 +822,7 @@ mod tests {
         assert!(epub.package().manifest_item_by_id("img").is_none());
         assert!(epub.package().manifest_item_by_id("img2").is_some());
         let package_xml = epub
-            .resource(ResourceSelector::path("EPUB/package.opf").unwrap())
-            .unwrap()
-            .utf8_text()
+            .utf8_text(&EpubPath::new("EPUB/package.opf").unwrap())
             .unwrap();
         assert!(package_xml.contains("id=\"img2\""));
         assert!(package_xml.contains("href=\"images/new-cover.jpg\""));
@@ -1326,19 +831,113 @@ mod tests {
     }
 
     #[test]
+    fn edit_replace_manifest_item_by_href_preserves_duplicate_id_row_alignment() {
+        let mut epub = duplicate_manifest_id_edit_epub();
+        let replacement = ManifestItem::builder()
+            .id(EpubString::try_new("duplicate").unwrap())
+            .href(EpubHref::try_new("images/replacement.jpg").unwrap())
+            .media_type(MediaType::try_from("image/jpeg").unwrap())
+            .build()
+            .unwrap();
+
+        let preview = epub
+            .edit()
+            .replace_manifest_item(
+                ManifestItemSelector::Href(EpubHref::try_new("images/second.jpg").unwrap()),
+                replacement.clone(),
+            )
+            .unwrap()
+            .preview()
+            .unwrap();
+
+        assert_eq!(
+            preview.package().manifest().items()[1]
+                .authored_href()
+                .unwrap()
+                .as_str(),
+            "images/first.jpg"
+        );
+        assert_eq!(&preview.package().manifest().items()[2], &replacement);
+        let preview_xml = preview
+            .resource_changes
+            .entry(&EpubPath::new("EPUB/package.opf").unwrap())
+            .unwrap()
+            .unwrap();
+        let preview_xml = std::str::from_utf8(preview_xml).unwrap();
+        assert!(preview_xml.contains("href=\"images/first.jpg\""));
+        assert!(preview_xml.contains("href=\"images/replacement.jpg\""));
+        assert!(!preview_xml.contains("href=\"images/second.jpg\""));
+        assert!(
+            preview_xml.find("marker=\"first\"").unwrap()
+                < preview_xml.find("href=\"images/replacement.jpg\"").unwrap()
+        );
+
+        preview.commit();
+        assert_eq!(
+            epub.package().manifest().items()[1]
+                .authored_href()
+                .unwrap()
+                .as_str(),
+            "images/first.jpg"
+        );
+        assert_eq!(&epub.package().manifest().items()[2], &replacement);
+    }
+
+    #[test]
+    fn edit_remove_manifest_item_by_href_preserves_duplicate_id_row_alignment() {
+        let mut epub = duplicate_manifest_id_edit_epub();
+
+        let preview = epub
+            .edit()
+            .remove_manifest_item(ManifestItemSelector::Href(
+                EpubHref::try_new("images/second.jpg").unwrap(),
+            ))
+            .unwrap()
+            .preview()
+            .unwrap();
+
+        let items = preview.package().manifest().items();
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            items[1].authored_href().unwrap().as_str(),
+            "images/first.jpg"
+        );
+        let preview_xml = preview
+            .resource_changes
+            .entry(&EpubPath::new("EPUB/package.opf").unwrap())
+            .unwrap()
+            .unwrap();
+        let preview_xml = std::str::from_utf8(preview_xml).unwrap();
+        assert!(preview_xml.contains("marker=\"first\""));
+        assert!(!preview_xml.contains("marker=\"second\""));
+
+        preview.commit();
+        assert_eq!(epub.package().manifest().items().len(), 2);
+        assert_eq!(
+            epub.package().manifest().items()[1]
+                .authored_href()
+                .unwrap()
+                .as_str(),
+            "images/first.jpg"
+        );
+    }
+
+    #[test]
     fn edit_replace_manifest_item_rejects_duplicate_href() {
         let provider = memory_provider_with_extra_manifest_item();
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
         let replacement = ManifestItem::builder()
             .id(EpubString::try_new("img2").unwrap())
             .href(EpubHref::try_new("text/chapter.xhtml").unwrap())
             .media_type(EpubString::try_new("image/jpeg").unwrap().into())
-            .build();
+            .build()
+            .unwrap();
 
         let err = epub
             .edit()
             .replace_manifest_item(
-                ManifestItemSelector::id(EpubString::try_new("img").unwrap()),
+                ManifestItemSelector::Id(EpubString::try_new("img").unwrap()),
                 replacement,
             )
             .unwrap_err();
@@ -1358,19 +957,20 @@ mod tests {
             .id(EpubString::try_new("nav2").unwrap())
             .href(EpubHref::try_new("nav2.xhtml").unwrap())
             .media_type(EpubString::try_new("application/xhtml+xml").unwrap().into())
-            .build();
+            .build()
+            .unwrap();
 
         let err = epub
             .edit()
             .replace_manifest_item(
-                ManifestItemSelector::id(EpubString::try_new("nav").unwrap()),
+                ManifestItemSelector::Id(EpubString::try_new("nav").unwrap()),
                 replacement,
             )
             .unwrap_err();
 
         assert!(matches!(
             err,
-            crate::edit::EditError::UnsupportedSemanticEdit { .. }
+            crate::edit::EditError::NavigationManifestItem { .. }
         ));
     }
 
@@ -1379,13 +979,13 @@ mod tests {
         let mut epub = ncx_only_edit_epub();
         let error = epub
             .edit()
-            .remove_manifest_item(ManifestItemSelector::id(
+            .remove_manifest_item(ManifestItemSelector::Id(
                 EpubString::try_new("ncx").unwrap(),
             ))
             .unwrap_err();
         assert!(matches!(
             error,
-            crate::edit::EditError::UnsupportedSemanticEdit { .. }
+            crate::edit::EditError::NavigationManifestItem { .. }
         ));
 
         let replacement = ManifestItem::builder()
@@ -1396,17 +996,18 @@ mod tests {
                     .unwrap()
                     .into(),
             )
-            .build();
+            .build()
+            .unwrap();
         let error = epub
             .edit()
             .replace_manifest_item(
-                ManifestItemSelector::id(EpubString::try_new("ncx").unwrap()),
+                ManifestItemSelector::Id(EpubString::try_new("ncx").unwrap()),
                 replacement,
             )
             .unwrap_err();
         assert!(matches!(
             error,
-            crate::edit::EditError::UnsupportedSemanticEdit { .. }
+            crate::edit::EditError::NavigationManifestItem { .. }
         ));
     }
 
@@ -1419,23 +1020,24 @@ mod tests {
             .build();
 
         epub.edit()
-            .add_metadata_element(MetadataElement::Title(title))
+            .add_metadata_element(DcElement::Title, title)
             .unwrap()
             .preview()
             .unwrap()
             .commit();
 
-        assert_eq!(epub.package().metadata().title().len(), 2);
         assert_eq!(
-            epub.package().metadata().title()[1]
+            epub.package().metadata().elements(DcElement::Title).len(),
+            2
+        );
+        assert_eq!(
+            epub.package().metadata().elements(DcElement::Title)[1]
                 .content()
                 .map(EpubString::as_str),
             Some("Alternate Title")
         );
         let package_xml = epub
-            .resource(ResourceSelector::path("EPUB/package.opf").unwrap())
-            .unwrap()
-            .utf8_text()
+            .utf8_text(&EpubPath::new("EPUB/package.opf").unwrap())
             .unwrap();
         assert!(package_xml.contains("Alternate Title"));
     }
@@ -1444,7 +1046,7 @@ mod tests {
     fn edit_add_meta_appends_epub3_meta() {
         let mut epub = memory_provider_epub();
         let meta = Meta::new(
-            MetaPropertyToken::raw("dcterms:modified").unwrap(),
+            MetaPropertyToken::try_new("dcterms:modified").unwrap(),
             EpubString::try_new("2026-06-28T00:00:00Z").unwrap(),
         );
 
@@ -1460,9 +1062,7 @@ mod tests {
                 && meta.content().map(EpubString::as_str) == Some("2026-06-28T00:00:00Z")
         }));
         let package_xml = epub
-            .resource(ResourceSelector::path("EPUB/package.opf").unwrap())
-            .unwrap()
-            .utf8_text()
+            .utf8_text(&EpubPath::new("EPUB/package.opf").unwrap())
             .unwrap();
         assert!(package_xml.contains("property=\"dcterms:modified\""));
         assert!(package_xml.contains("2026-06-28T00:00:00Z"));
@@ -1479,7 +1079,10 @@ mod tests {
             .build();
 
         epub.edit()
-            .upsert_resource("EPUB/records/onix.xml", b"<record/>".to_vec())
+            .upsert_resource(
+                EpubPath::new("EPUB/records/onix.xml").unwrap(),
+                b"<record/>".to_vec(),
+            )
             .unwrap()
             .add_metadata_link(link)
             .unwrap()
@@ -1489,9 +1092,7 @@ mod tests {
 
         assert_eq!(epub.package().metadata().link().len(), 1);
         let package_xml = epub
-            .resource(ResourceSelector::path("EPUB/package.opf").unwrap())
-            .unwrap()
-            .utf8_text()
+            .utf8_text(&EpubPath::new("EPUB/package.opf").unwrap())
             .unwrap();
         assert!(package_xml.contains("href=\"records/onix.xml\""));
         assert!(package_xml.contains("rel=\"record\""));
@@ -1519,11 +1120,12 @@ mod tests {
             ),
         ])
         .unwrap();
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
 
         epub.edit()
             .add_meta(Meta::new(
-                MetaPropertyToken::raw("dcterms:modified").unwrap(),
+                MetaPropertyToken::try_new("dcterms:modified").unwrap(),
                 EpubString::try_new("2026-06-28T00:00:00Z").unwrap(),
             ))
             .unwrap()
@@ -1532,9 +1134,7 @@ mod tests {
             .commit();
 
         let package_xml = epub
-            .resource(ResourceSelector::path("EPUB/package.opf").unwrap())
-            .unwrap()
-            .utf8_text()
+            .utf8_text(&EpubPath::new("EPUB/package.opf").unwrap())
             .unwrap();
         assert!(package_xml.contains("custom:thing"));
         assert!(package_xml.contains("custom:attr=\"keep\""));
@@ -1544,7 +1144,8 @@ mod tests {
     #[test]
     fn edit_add_metadata_handles_prefixed_opf_package() {
         let provider = memory_provider_with_prefixed_opf_package();
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
         let title = Element::builder()
             .content(EpubString::try_new("Titre secondaire").unwrap())
             .xml_lang(EpubString::try_new("fr").unwrap())
@@ -1556,10 +1157,10 @@ mod tests {
             .build();
 
         epub.edit()
-            .add_metadata_element(MetadataElement::Title(title))
+            .add_metadata_element(DcElement::Title, title)
             .unwrap()
             .add_meta(Meta::new(
-                MetaPropertyToken::raw("dcterms:modified").unwrap(),
+                MetaPropertyToken::try_new("dcterms:modified").unwrap(),
                 EpubString::try_new("2026-06-28T00:00:00Z").unwrap(),
             ))
             .unwrap()
@@ -1569,16 +1170,17 @@ mod tests {
             .unwrap()
             .commit();
 
-        assert_eq!(epub.package().metadata().title().len(), 2);
+        assert_eq!(
+            epub.package().metadata().elements(DcElement::Title).len(),
+            2
+        );
         assert!(epub.package().metadata().meta().iter().any(|meta| {
             meta.property().map(|property| property.as_str()) == Some("dcterms:modified")
                 && meta.content().map(EpubString::as_str) == Some("2026-06-28T00:00:00Z")
         }));
         assert_eq!(epub.package().metadata().link().len(), 1);
         let package_xml = epub
-            .resource(ResourceSelector::path("EPUB/package.opf").unwrap())
-            .unwrap()
-            .utf8_text()
+            .utf8_text(&EpubPath::new("EPUB/package.opf").unwrap())
             .unwrap();
         assert!(package_xml.contains("opf:package"));
         assert!(package_xml.contains("Titre secondaire"));
@@ -1607,7 +1209,8 @@ mod tests {
             ),
         ])
         .unwrap();
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
         let replacement = Element::builder()
             .content(EpubString::try_new("Replacement").unwrap())
             .id(EpubString::try_new("title2").unwrap())
@@ -1615,10 +1218,11 @@ mod tests {
 
         epub.edit()
             .replace_metadata_element(
-                MetadataElementSelector::title(MetadataNodeSelector::id(
-                    EpubString::try_new("title").unwrap(),
-                )),
-                MetadataElement::Title(replacement),
+                MetadataElementSelector {
+                    element: DcElement::Title,
+                    node: MetadataNodeSelector::Id(EpubString::try_new("title").unwrap()),
+                },
+                replacement,
             )
             .unwrap()
             .preview()
@@ -1626,15 +1230,13 @@ mod tests {
             .commit();
 
         assert_eq!(
-            epub.package().metadata().title()[0]
+            epub.package().metadata().elements(DcElement::Title)[0]
                 .content()
                 .map(EpubString::as_str),
             Some("Replacement")
         );
         let package_xml = epub
-            .resource(ResourceSelector::path("EPUB/package.opf").unwrap())
-            .unwrap()
-            .utf8_text()
+            .utf8_text(&EpubPath::new("EPUB/package.opf").unwrap())
             .unwrap();
         assert!(package_xml.contains("id=\"title2\""));
         assert!(package_xml.contains("custom:attr=\"keep\""));
@@ -1647,15 +1249,21 @@ mod tests {
         let mut epub = memory_provider_epub();
         let preview = epub
             .edit()
-            .remove_metadata_element(MetadataElementSelector::title(MetadataNodeSelector::index(
-                0,
-            )))
+            .remove_metadata_element(MetadataElementSelector {
+                element: DcElement::Title,
+                node: MetadataNodeSelector::Index(0),
+            })
             .unwrap()
             .preview()
             .unwrap();
 
         preview.commit();
-        assert!(epub.package().metadata().title().is_empty());
+        assert!(
+            epub.package()
+                .metadata()
+                .elements(DcElement::Title)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1665,19 +1273,19 @@ mod tests {
         let err = epub
             .edit()
             .add_meta(Meta::new(
-                MetaPropertyToken::raw("belongs-to-collection").unwrap(),
+                MetaPropertyToken::try_new("belongs-to-collection").unwrap(),
                 EpubString::try_new("A").unwrap(),
             ))
             .unwrap()
             .add_meta(Meta::new(
-                MetaPropertyToken::raw("belongs-to-collection").unwrap(),
+                MetaPropertyToken::try_new("belongs-to-collection").unwrap(),
                 EpubString::try_new("B").unwrap(),
             ))
             .unwrap()
             .replace_meta(
-                MetaSelector::property(EpubString::try_new("belongs-to-collection").unwrap()),
+                MetaSelector::Property(EpubString::try_new("belongs-to-collection").unwrap()),
                 Meta::new(
-                    MetaPropertyToken::raw("belongs-to-collection").unwrap(),
+                    MetaPropertyToken::try_new("belongs-to-collection").unwrap(),
                     EpubString::try_new("C").unwrap(),
                 ),
             )
@@ -1686,22 +1294,21 @@ mod tests {
         assert!(matches!(
             err,
             EditError::Selection {
-                target: "metadata",
-                selector,
+                target: SelectionTarget::Meta(MetaSelector::Property(_)),
                 failure: SelectionFailure::Ambiguous,
-            } if selector == "meta property belongs-to-collection"
+            }
         ));
 
         epub.edit()
             .add_meta(Meta::new(
-                MetaPropertyToken::raw("dcterms:modified").unwrap(),
+                MetaPropertyToken::try_new("dcterms:modified").unwrap(),
                 EpubString::try_new("2026-06-28T00:00:00Z").unwrap(),
             ))
             .unwrap()
             .replace_meta(
-                MetaSelector::property(EpubString::try_new("dcterms:modified").unwrap()),
+                MetaSelector::Property(EpubString::try_new("dcterms:modified").unwrap()),
                 Meta::new(
-                    MetaPropertyToken::raw("dcterms:modified").unwrap(),
+                    MetaPropertyToken::try_new("dcterms:modified").unwrap(),
                     EpubString::try_new("2026-06-29T00:00:00Z").unwrap(),
                 ),
             )
@@ -1728,7 +1335,7 @@ mod tests {
         epub.edit()
             .add_metadata_link(link)
             .unwrap()
-            .remove_metadata_link(MetadataLinkSelector::authored_href(AuthoredHref::new(
+            .remove_metadata_link(MetadataLinkSelector::AuthoredHref(AuthoredHref::new(
                 "https://example.com/onix.xml",
             )))
             .unwrap()
@@ -1738,9 +1345,7 @@ mod tests {
 
         assert!(epub.package().metadata().link().is_empty());
         let package_xml = epub
-            .resource(ResourceSelector::path("EPUB/package.opf").unwrap())
-            .unwrap()
-            .utf8_text()
+            .utf8_text(&EpubPath::new("EPUB/package.opf").unwrap())
             .unwrap();
         assert!(!package_xml.contains("https://example.com/onix.xml"));
     }
@@ -1763,18 +1368,18 @@ mod tests {
 
         epub.edit()
             .add_meta(Meta::new(
-                MetaPropertyToken::raw("dcterms:modified").unwrap(),
+                MetaPropertyToken::try_new("dcterms:modified").unwrap(),
                 EpubString::try_new("2026-06-28T00:00:00Z").unwrap(),
             ))
             .unwrap()
             .add_metadata_link(first_link)
             .unwrap()
-            .remove_meta(MetaSelector::property(
+            .remove_meta(MetaSelector::Property(
                 EpubString::try_new("dcterms:modified").unwrap(),
             ))
             .unwrap()
             .replace_metadata_link(
-                MetadataLinkSelector::id(EpubString::try_new("record").unwrap()),
+                MetadataLinkSelector::Id(EpubString::try_new("record").unwrap()),
                 replacement_link,
             )
             .unwrap()
@@ -1791,9 +1396,7 @@ mod tests {
             Some("record2")
         );
         let package_xml = epub
-            .resource(ResourceSelector::path("EPUB/package.opf").unwrap())
-            .unwrap()
-            .utf8_text()
+            .utf8_text(&EpubPath::new("EPUB/package.opf").unwrap())
             .unwrap();
         assert!(!package_xml.contains("2026-06-28T00:00:00Z"));
         assert!(!package_xml.contains("https://example.com/old.xml"));
@@ -1821,13 +1424,14 @@ mod tests {
             ),
         ])
         .unwrap();
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
 
         epub.edit()
             .replace_meta(
-                MetaSelector::index(0),
+                MetaSelector::Index(0),
                 Meta::new(
-                    MetaPropertyToken::raw("dcterms:modified").unwrap(),
+                    MetaPropertyToken::try_new("dcterms:modified").unwrap(),
                     EpubString::try_new("2026-06-29T00:00:00Z").unwrap(),
                 ),
             )
@@ -1842,9 +1446,7 @@ mod tests {
                 && meta.content().map(EpubString::as_str) == Some("2026-06-29T00:00:00Z")
         }));
         let package_xml = epub
-            .resource(ResourceSelector::path("EPUB/package.opf").unwrap())
-            .unwrap()
-            .utf8_text()
+            .utf8_text(&EpubPath::new("EPUB/package.opf").unwrap())
             .unwrap();
         assert!(package_xml.contains("name=\"cover\""));
         assert!(package_xml.contains("content=\"cover-image\""));
@@ -1855,15 +1457,19 @@ mod tests {
     #[test]
     fn edit_replace_metadata_handles_prefixed_opf_package() {
         let provider = memory_provider_with_prefixed_opf_package();
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
         let replacement = Element::builder()
             .content(EpubString::try_new("Titre remplace").unwrap())
             .build();
 
         epub.edit()
             .replace_metadata_element(
-                MetadataElementSelector::title(MetadataNodeSelector::index(0)),
-                MetadataElement::Title(replacement),
+                MetadataElementSelector {
+                    element: DcElement::Title,
+                    node: MetadataNodeSelector::Index(0),
+                },
+                replacement,
             )
             .unwrap()
             .preview()
@@ -1871,15 +1477,13 @@ mod tests {
             .commit();
 
         assert_eq!(
-            epub.package().metadata().title()[0]
+            epub.package().metadata().elements(DcElement::Title)[0]
                 .content()
                 .map(EpubString::as_str),
             Some("Titre remplace")
         );
         let package_xml = epub
-            .resource(ResourceSelector::path("EPUB/package.opf").unwrap())
-            .unwrap()
-            .utf8_text()
+            .utf8_text(&EpubPath::new("EPUB/package.opf").unwrap())
             .unwrap();
         assert!(package_xml.contains("opf:package"));
         assert!(package_xml.contains("Titre remplace"));
@@ -1888,18 +1492,20 @@ mod tests {
     #[test]
     fn edit_manifest_and_spine_handle_prefixed_opf_package() {
         let provider = memory_provider_with_prefixed_opf_package();
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
         let item = ManifestItem::builder()
             .id(EpubString::try_new("chap2").unwrap())
             .href(EpubHref::try_new("text/chapter2.xhtml").unwrap())
             .media_type(EpubString::try_new("application/xhtml+xml").unwrap().into())
-            .build();
+            .build()
+            .unwrap();
 
         epub.edit()
             .add_manifest_item(item)
             .unwrap()
             .upsert_resource(
-                "EPUB/text/chapter2.xhtml",
+                EpubPath::new("EPUB/text/chapter2.xhtml").unwrap(),
                 b"<html><body>Chapter 2</body></html>".to_vec(),
             )
             .unwrap()
@@ -1911,16 +1517,9 @@ mod tests {
 
         assert!(epub.package().manifest_item_by_id("chap2").is_some());
         assert_eq!(epub.package().spine().itemrefs().len(), 2);
-        assert_eq!(
-            epub.package().spine().itemrefs()[1]
-                .idref()
-                .map(EpubString::as_str),
-            Some("chap2")
-        );
+        assert_eq!(epub.package().spine().itemrefs()[1].idref(), Some("chap2"));
         let package_xml = epub
-            .resource(ResourceSelector::path("EPUB/package.opf").unwrap())
-            .unwrap()
-            .utf8_text()
+            .utf8_text(&EpubPath::new("EPUB/package.opf").unwrap())
             .unwrap();
         assert!(package_xml.contains("opf:package"));
         assert!(package_xml.contains("id=\"chap2\""));
@@ -1947,12 +1546,13 @@ mod tests {
             ),
         ])
         .unwrap();
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
 
         let err = epub
             .edit()
             .add_meta(Meta::new(
-                MetaPropertyToken::raw("dcterms:modified").unwrap(),
+                MetaPropertyToken::try_new("dcterms:modified").unwrap(),
                 EpubString::try_new("2026-06-28T00:00:00Z").unwrap(),
             ))
             .unwrap_err();
@@ -1975,14 +1575,15 @@ mod tests {
             .id(EpubString::try_new("chap2").unwrap())
             .href(EpubHref::try_new("text/chapter2.xhtml").unwrap())
             .media_type(EpubString::try_new("application/xhtml+xml").unwrap().into())
-            .build();
+            .build()
+            .unwrap();
         let itemref = ItemRef::new("chap2").unwrap();
 
         epub.edit()
             .add_manifest_item(manifest_item)
             .unwrap()
             .upsert_resource(
-                "EPUB/text/chapter2.xhtml",
+                EpubPath::new("EPUB/text/chapter2.xhtml").unwrap(),
                 b"<html><body>Chapter 2</body></html>".to_vec(),
             )
             .unwrap()
@@ -1993,11 +1594,9 @@ mod tests {
             .commit();
 
         assert_eq!(epub.package().spine().itemrefs().len(), 2);
-        assert_eq!(epub.reading_order().count(), 2);
+        assert_eq!(epub.resources().reading_order().count(), 2);
         assert!(
-            epub.resource(ResourceSelector::path("EPUB/package.opf").unwrap())
-                .unwrap()
-                .utf8_text()
+            epub.utf8_text(&EpubPath::new("EPUB/package.opf").unwrap())
                 .unwrap()
                 .contains("idref=\"chap2\"")
         );
@@ -2010,13 +1609,14 @@ mod tests {
             .id(EpubString::try_new("chap2").unwrap())
             .href(EpubHref::try_new("text/chapter2.xhtml").unwrap())
             .media_type(EpubString::try_new("application/xhtml+xml").unwrap().into())
-            .build();
+            .build()
+            .unwrap();
 
         epub.edit()
             .add_manifest_item(manifest_item)
             .unwrap()
             .upsert_resource(
-                "EPUB/text/chapter2.xhtml",
+                EpubPath::new("EPUB/text/chapter2.xhtml").unwrap(),
                 b"<html><body>Chapter 2</body></html>".to_vec(),
             )
             .unwrap()
@@ -2027,9 +1627,7 @@ mod tests {
             .commit();
 
         let package_xml = epub
-            .resource(ResourceSelector::path("EPUB/package.opf").unwrap())
-            .unwrap()
-            .utf8_text()
+            .utf8_text(&EpubPath::new("EPUB/package.opf").unwrap())
             .unwrap();
         assert!(package_xml.contains("idref=\"chap2\""));
         assert!(!package_xml.contains("linear=\"yes\""));
@@ -2042,13 +1640,14 @@ mod tests {
             .id(EpubString::try_new("chap2").unwrap())
             .href(EpubHref::try_new("text/chapter2.xhtml").unwrap())
             .media_type(EpubString::try_new("application/xhtml+xml").unwrap().into())
-            .build();
+            .build()
+            .unwrap();
 
         epub.edit()
             .add_manifest_item(manifest_item)
             .unwrap()
             .upsert_resource(
-                "EPUB/text/chapter2.xhtml",
+                EpubPath::new("EPUB/text/chapter2.xhtml").unwrap(),
                 b"<html><body>Chapter 2</body></html>".to_vec(),
             )
             .unwrap()
@@ -2059,9 +1658,7 @@ mod tests {
             .commit();
 
         let package_xml = epub
-            .resource(ResourceSelector::path("EPUB/package.opf").unwrap())
-            .unwrap()
-            .utf8_text()
+            .utf8_text(&EpubPath::new("EPUB/package.opf").unwrap())
             .unwrap();
         assert!(package_xml.contains("idref=\"chap2\""));
         assert!(package_xml.contains("linear=\"no\""));
@@ -2087,26 +1684,22 @@ mod tests {
     #[test]
     fn edit_remove_spine_itemref_by_index_rewrites_opf() {
         let provider = memory_provider_with_two_spine_items();
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
 
         epub.edit()
-            .remove_spine_itemref(SpineItemRefSelector::index(1))
+            .remove_spine_itemref(SpineItemRefSelector::Ordinal(
+                crate::resource::ReadingOrderOrdinal::from_index(1),
+            ))
             .unwrap()
             .preview()
             .unwrap()
             .commit();
 
         assert_eq!(epub.package().spine().itemrefs().len(), 1);
-        assert_eq!(
-            epub.package().spine().itemrefs()[0]
-                .idref()
-                .map(EpubString::as_str),
-            Some("chap")
-        );
+        assert_eq!(epub.package().spine().itemrefs()[0].idref(), Some("chap"));
         let package_xml = epub
-            .resource(ResourceSelector::path("EPUB/package.opf").unwrap())
-            .unwrap()
-            .utf8_text()
+            .utf8_text(&EpubPath::new("EPUB/package.opf").unwrap())
             .unwrap();
         assert!(package_xml.contains("idref=\"chap\""));
         assert!(!package_xml.contains("idref=\"chap2\""));
@@ -2118,7 +1711,9 @@ mod tests {
 
         let preview = epub
             .edit()
-            .remove_spine_itemref(SpineItemRefSelector::index(0))
+            .remove_spine_itemref(SpineItemRefSelector::Ordinal(
+                crate::resource::ReadingOrderOrdinal::from_index(0),
+            ))
             .unwrap()
             .preview()
             .unwrap();
@@ -2126,9 +1721,7 @@ mod tests {
         preview.commit();
         assert!(epub.package().spine().itemrefs().is_empty());
         let package_xml = epub
-            .resource(ResourceSelector::path("EPUB/package.opf").unwrap())
-            .unwrap()
-            .utf8_text()
+            .utf8_text(&EpubPath::new("EPUB/package.opf").unwrap())
             .unwrap();
         assert!(!package_xml.contains("<itemref"));
     }
@@ -2136,11 +1729,12 @@ mod tests {
     #[test]
     fn edit_remove_spine_itemref_rejects_ambiguous_idref() {
         let provider = memory_provider_with_duplicate_spine_itemrefs();
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
 
         let err = epub
             .edit()
-            .remove_spine_itemref(SpineItemRefSelector::idref(
+            .remove_spine_itemref(SpineItemRefSelector::Idref(
                 EpubString::try_new("chap").unwrap(),
             ))
             .unwrap_err();
@@ -2148,33 +1742,31 @@ mod tests {
         assert!(matches!(
             err,
             EditError::Selection {
-                target: "spine itemref",
-                selector,
+                target: SelectionTarget::SpineItemRef(SpineItemRefSelector::Idref(_)),
                 failure: SelectionFailure::Ambiguous,
-            } if selector == "idref chap"
+            }
         ));
     }
 
     #[test]
     fn edit_replace_spine_itemref_rewrites_opf() {
         let provider = memory_provider_with_two_spine_items();
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
         let replacement = ItemRef::new("chap").unwrap().with_id("again").unwrap();
 
         epub.edit()
-            .replace_spine_itemref(SpineItemRefSelector::index(1), replacement)
+            .replace_spine_itemref(
+                SpineItemRefSelector::Ordinal(crate::resource::ReadingOrderOrdinal::from_index(1)),
+                replacement,
+            )
             .unwrap()
             .preview()
             .unwrap()
             .commit();
 
         assert_eq!(epub.package().spine().itemrefs().len(), 2);
-        assert_eq!(
-            epub.package().spine().itemrefs()[1]
-                .idref()
-                .map(EpubString::as_str),
-            Some("chap")
-        );
+        assert_eq!(epub.package().spine().itemrefs()[1].idref(), Some("chap"));
         assert_eq!(
             epub.package().spine().itemrefs()[1]
                 .id()
@@ -2182,9 +1774,7 @@ mod tests {
             Some("again")
         );
         let package_xml = epub
-            .resource(ResourceSelector::path("EPUB/package.opf").unwrap())
-            .unwrap()
-            .utf8_text()
+            .utf8_text(&EpubPath::new("EPUB/package.opf").unwrap())
             .unwrap();
         assert!(package_xml.contains("id=\"again\""));
         assert!(!package_xml.contains("idref=\"chap2\""));
@@ -2193,12 +1783,13 @@ mod tests {
     #[test]
     fn edit_replace_spine_itemref_rejects_missing_manifest_id() {
         let provider = memory_provider_with_two_spine_items();
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
 
         let err = epub
             .edit()
             .replace_spine_itemref(
-                SpineItemRefSelector::index(1),
+                SpineItemRefSelector::Ordinal(crate::resource::ReadingOrderOrdinal::from_index(1)),
                 ItemRef::new("missing").unwrap(),
             )
             .unwrap_err();
@@ -2236,11 +1827,12 @@ mod tests {
             ),
         ])
         .unwrap();
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
 
         epub.edit()
             .replace_spine_itemref(
-                SpineItemRefSelector::index(1),
+                SpineItemRefSelector::Ordinal(crate::resource::ReadingOrderOrdinal::from_index(1)),
                 ItemRef::new("chap").unwrap(),
             )
             .unwrap()
@@ -2249,9 +1841,7 @@ mod tests {
             .commit();
 
         let package_xml = epub
-            .resource(ResourceSelector::path("EPUB/package.opf").unwrap())
-            .unwrap()
-            .utf8_text()
+            .utf8_text(&EpubPath::new("EPUB/package.opf").unwrap())
             .unwrap();
         assert!(package_xml.contains("idref=\"chap\""));
         assert!(package_xml.contains("custom=\"keep\""));
@@ -2260,11 +1850,12 @@ mod tests {
     #[test]
     fn edit_move_spine_itemref_reorders_reading_order() {
         let provider = memory_provider_with_two_spine_items();
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
 
         epub.edit()
             .move_spine_itemref(
-                SpineItemRefSelector::idref(EpubString::try_new("chap").unwrap()),
+                SpineItemRefSelector::Idref(EpubString::try_new("chap").unwrap()),
                 1,
             )
             .unwrap()
@@ -2272,25 +1863,16 @@ mod tests {
             .unwrap()
             .commit();
 
-        assert_eq!(
-            epub.package().spine().itemrefs()[0]
-                .idref()
-                .map(EpubString::as_str),
-            Some("chap2")
-        );
-        assert_eq!(
-            epub.package().spine().itemrefs()[1]
-                .idref()
-                .map(EpubString::as_str),
-            Some("chap")
-        );
+        assert_eq!(epub.package().spine().itemrefs()[0].idref(), Some("chap2"));
+        assert_eq!(epub.package().spine().itemrefs()[1].idref(), Some("chap"));
         let order = epub
+            .resources()
             .reading_order()
             .map(|entry| {
-                let ReadingOrderTarget::Declaration { declaration, .. } = entry.target() else {
-                    panic!("reading-order entry should resolve to a declaration");
-                };
-                match epub.resources().declaration(*declaration).unwrap().id() {
+                let declaration = entry
+                    .declaration()
+                    .expect("reading-order entry should resolve to a declaration");
+                match declaration.id() {
                     crate::resource::ManifestIdValue::Valid(id) => id.to_string(),
                     _ => panic!("reading-order declaration should have a valid id"),
                 }
@@ -2302,11 +1884,15 @@ mod tests {
     #[test]
     fn edit_move_spine_itemref_rejects_out_of_range_target() {
         let provider = memory_provider_with_two_spine_items();
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
 
         let err = epub
             .edit()
-            .move_spine_itemref(SpineItemRefSelector::index(0), 2)
+            .move_spine_itemref(
+                SpineItemRefSelector::Ordinal(crate::resource::ReadingOrderOrdinal::from_index(0)),
+                2,
+            )
             .unwrap_err();
 
         assert!(matches!(
@@ -2342,7 +1928,8 @@ mod tests {
             ),
         ])
         .unwrap();
-        let error = Epub::from_provider(provider, "EPUB/package.opf").unwrap_err();
+        let error =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap_err();
 
         assert!(matches!(
             error.failure(),
@@ -2377,7 +1964,8 @@ mod tests {
             ),
         ])
         .unwrap();
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
 
         let err = epub
             .edit()
@@ -2400,14 +1988,16 @@ mod tests {
         let mut epub = memory_provider_epub();
         let preview = epub
             .edit()
-            .remove_resource(ResourceSelector::manifest_href("text/chapter.xhtml").unwrap())
+            .remove_resource(EpubPath::new("EPUB/text/chapter.xhtml").unwrap())
             .unwrap()
             .preview()
             .unwrap();
 
         let chapter = preview
             .resources()
-            .find_unique_resource_by_id("chap")
+            .declaration_by_id("chap")
+            .unwrap()
+            .resource()
             .unwrap();
         assert_eq!(
             chapter.presence(),
@@ -2417,13 +2007,14 @@ mod tests {
     }
 
     #[test]
-    fn edit_preview_rejects_raw_structural_resource_edits() {
+    fn raw_structural_resource_edits_are_rejected_when_staged() {
         let mut epub = memory_provider_epub();
         let err = epub
             .edit()
-            .upsert_resource("EPUB/package.opf", b"not opf".to_vec())
-            .unwrap()
-            .preview()
+            .upsert_resource(
+                EpubPath::new("EPUB/package.opf").unwrap(),
+                b"not opf".to_vec(),
+            )
             .unwrap_err();
 
         assert!(matches!(
@@ -2436,9 +2027,7 @@ mod tests {
 
         let err = epub
             .edit()
-            .remove_resource(ResourceSelector::path("EPUB/package.opf").unwrap())
-            .unwrap()
-            .preview()
+            .remove_resource(EpubPath::new("EPUB/package.opf").unwrap())
             .unwrap_err();
 
         assert!(matches!(

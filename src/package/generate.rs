@@ -1,7 +1,7 @@
 use super::collection::Collection;
 use super::legacy::{Guide, Opf2Meta};
 use super::manifest::{Manifest, ManifestItem, ManifestPropertyToken};
-use super::metadata::{Element, LinkPropertyToken, Meta, Metadata, MetadataLink};
+use super::metadata::{DcElement, Element, LinkPropertyToken, Meta, Metadata, MetadataLink};
 use super::spine::{ItemRef, Linear, Spine, SpinePropertyToken};
 use super::*;
 use quick_xml::Writer;
@@ -10,11 +10,8 @@ use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 impl Package {
     /// Generates a normalized OPF XML projection of the modeled package state.
     ///
-    /// Use this to create fresh OPF XML from a [`Package`]. It is not a source-preserving round
-    /// trip: unknown XML, comments, original ordering between modeled groups, lexical choices,
-    /// and malformed values not retained by the model are omitted or normalized. Use the
-    /// publication editing APIs when existing OPF source must be preserved. Collection nesting
-    /// is bounded by [`collection::MAX_COLLECTION_NESTING_DEPTH`].
+    /// Unknown XML, comments, interleaving between modeled groups, and source formatting are
+    /// not preserved. Use publication edits to modify existing OPF XML in place.
     ///
     /// # Errors
     ///
@@ -52,42 +49,28 @@ impl Package {
         write_metadata(&mut writer, self.metadata())?;
         write_manifest(&mut writer, self.manifest())?;
         write_spine(&mut writer, self.spine())?;
-        for collection in self.collections() {
-            write_collection(&mut writer, collection)?;
-        }
         if let Some(guide) = self.guide() {
             write_guide(&mut writer, guide)?;
         }
+        for collection in self.collections() {
+            write_collection(&mut writer, collection)?;
+        }
 
         writer.write_event(Event::End(BytesEnd::new(PACKAGE)))?;
-        String::from_utf8(writer.into_inner()).map_err(|source| PackageError::Utf8 { source })
+        Ok(String::from_utf8(writer.into_inner()).expect("XML writer emits UTF-8"))
     }
 }
 
 fn write_metadata(writer: &mut Writer<Vec<u8>>, metadata: &Metadata) -> Result<()> {
     writer.write_event(Event::Start(BytesStart::new(METADATA)))?;
 
-    let ordered = [
-        ("dc:title", metadata.title()),
-        ("dc:language", metadata.language()),
-        ("dc:identifier", metadata.identifier()),
-        ("dc:creator", metadata.creator()),
-        ("dc:contributor", metadata.contributor()),
-        ("dc:publisher", metadata.publisher()),
-        ("dc:description", metadata.description()),
-        ("dc:subject", metadata.subject()),
-        ("dc:rights", metadata.rights()),
-        ("dc:date", metadata.date()),
-        ("dc:format", metadata.format()),
-        ("dc:type", metadata.dc_type()),
-        ("dc:source", metadata.source()),
-        ("dc:relation", metadata.relation()),
-        ("dc:coverage", metadata.coverage()),
-    ];
-
-    ordered
-        .iter()
-        .try_for_each(|(tag, elements)| write_dc_elements(writer, tag, elements))?;
+    DcElement::ALL.into_iter().try_for_each(|kind| {
+        write_dc_elements(
+            writer,
+            &format!("dc:{}", kind.local_name()),
+            metadata.elements(kind),
+        )
+    })?;
 
     metadata
         .meta()
@@ -185,7 +168,7 @@ fn write_opf2_meta(writer: &mut Writer<Vec<u8>>, meta: &Opf2Meta) -> Result<()> 
         node.push_attribute((NAME, name.as_str()));
     }
     if let Some(content) = content {
-        node.push_attribute((CONTENT, content.as_str()));
+        node.push_attribute((CONTENT, content));
     }
     writer.write_event(Event::Empty(node))?;
     Ok(())
@@ -241,7 +224,7 @@ fn write_manifest(writer: &mut Writer<Vec<u8>>, manifest: &Manifest) -> Result<(
 fn write_manifest_item(writer: &mut Writer<Vec<u8>>, item: &ManifestItem) -> Result<()> {
     let mut node = BytesStart::new(ITEM);
     if let Some(id) = item.id() {
-        node.push_attribute((ID, id.as_str()));
+        node.push_attribute((ID, id));
     }
     if let Some(href) = item.authored_href() {
         node.push_attribute((HREF, href.as_str()));
@@ -250,10 +233,10 @@ fn write_manifest_item(writer: &mut Writer<Vec<u8>>, item: &ManifestItem) -> Res
         node.push_attribute((MEDIA_TYPE, media_type.as_str()));
     }
     if let Some(fallback) = item.fallback() {
-        node.push_attribute((FALLBACK, fallback.as_str()));
+        node.push_attribute((FALLBACK, fallback));
     }
     if let Some(overlay) = item.media_overlay() {
-        node.push_attribute((MEDIA_OVERLAY, overlay.as_str()));
+        node.push_attribute((MEDIA_OVERLAY, overlay));
     }
     if !item.properties().is_empty() {
         let properties = item
@@ -274,7 +257,7 @@ fn write_spine(writer: &mut Writer<Vec<u8>>, spine: &Spine) -> Result<()> {
         node.push_attribute((ID, id.as_str()));
     }
     if let Some(toc) = spine.toc() {
-        node.push_attribute((TOC, toc.as_str()));
+        node.push_attribute((TOC, toc));
     }
     let dir_value = spine
         .page_progression_direction()
@@ -297,7 +280,7 @@ fn write_itemref(writer: &mut Writer<Vec<u8>>, itemref: &ItemRef) -> Result<()> 
         node.push_attribute((ID, id.as_str()));
     }
     if let Some(idref) = itemref.idref() {
-        node.push_attribute((IDREF, idref.as_str()));
+        node.push_attribute((IDREF, idref));
     }
     if itemref.linear() == Linear::No {
         let linear = itemref.linear().to_string();
@@ -322,7 +305,6 @@ fn write_collection(writer: &mut Writer<Vec<u8>>, collection: &Collection) -> Re
         node.push_attribute((ID, id.as_str()));
     }
     if let Some(role) = collection.role() {
-        let role = role.to_string();
         node.push_attribute((ROLE, role.as_str()));
     }
     if let Some(lang) = collection.xml_lang() {
@@ -371,6 +353,17 @@ fn write_guide(writer: &mut Writer<Vec<u8>>, guide: &Guide) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    fn first_unrefined<'a, T>(
+        metadata: &'a Metadata,
+        project: impl Fn(&'a Meta) -> Option<T> + 'a,
+    ) -> Option<T> {
+        metadata
+            .meta()
+            .iter()
+            .filter(|meta| meta.refines().is_none())
+            .find_map(project)
+    }
     use super::*;
     use crate::package::manifest::{KnownManifestProperty, ManifestPropertyToken};
     use crate::package::metadata::{
@@ -496,7 +489,7 @@ mod tests {
         assert_eq!(properties[0].as_str(), "DCTERMS:MODIFIED");
         assert_eq!(
             properties[0].known_value(),
-            Some(KnownMetaProperty::Dctermsmodified)
+            Some(KnownMetaProperty::DctermsModified)
         );
         assert_eq!(properties[1].as_str(), "custom:layout-note");
         assert_eq!(properties[1].known_value(), None);
@@ -569,7 +562,7 @@ mod tests {
         let reparsed = Package::parse(&package.to_normalized_xml().unwrap()).unwrap();
 
         assert_eq!(
-            reparsed.metadata().rendition_layout(),
+            first_unrefined(reparsed.metadata(), Meta::rendition_layout),
             Some(RenditionLayout::Roll)
         );
         assert!(reparsed.metadata().meta().iter().any(|meta| {
@@ -603,5 +596,20 @@ mod tests {
             Some("missing-content")
         );
         assert!(reparsed.metadata().meta()[0].content().is_none());
+    }
+    #[test]
+    fn generated_opf_orders_guide_before_collections() {
+        let package = Package::parse(
+            r#"<package xmlns="http://www.idpf.org/2007/opf">
+                <collection role="index"/>
+                <guide><reference type="toc" href="toc.xhtml"/></guide>
+            </package>"#,
+        )
+        .unwrap();
+
+        let xml = package.to_normalized_xml().unwrap();
+        let guide = xml.find("<guide").expect("guide is written");
+        let collection = xml.find("<collection").expect("collection is written");
+        assert!(guide < collection, "{xml}");
     }
 }

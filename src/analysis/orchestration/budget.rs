@@ -195,18 +195,26 @@ pub(super) fn analysis_read_limit(
     analyzed_bytes: u64,
 ) -> (Option<u64>, AnalysisIssue) {
     match (
-        limits.max_resource_analysis_bytes(),
+        limits.max_resource_analysis_bytes,
         limits
-            .max_total_analysis_bytes()
+            .max_total_analysis_bytes
             .map(|total| total.saturating_sub(analyzed_bytes)),
     ) {
-        (Some(per_resource), Some(total)) if per_resource <= total => {
-            (Some(per_resource), AnalysisIssue::PerResourceAnalysisLimit)
-        }
-        (Some(_), Some(total)) | (None, Some(total)) => {
-            (Some(total), AnalysisIssue::TotalAnalysisLimit)
-        }
-        (Some(per_resource), None) => (Some(per_resource), AnalysisIssue::PerResourceAnalysisLimit),
-        (None, None) => (None, AnalysisIssue::TotalAnalysisLimit),
+        (Some(per_resource), Some(total)) if per_resource <= total => (
+            Some(per_resource),
+            AnalysisIssue::Limit(AnalysisLimit::ResourceAnalysisBytes),
+        ),
+        (Some(_), Some(total)) | (None, Some(total)) => (
+            Some(total),
+            AnalysisIssue::Limit(AnalysisLimit::TotalAnalysisBytes),
+        ),
+        (Some(per_resource), None) => (
+            Some(per_resource),
+            AnalysisIssue::Limit(AnalysisLimit::ResourceAnalysisBytes),
+        ),
+        (None, None) => (
+            None,
+            AnalysisIssue::Limit(AnalysisLimit::TotalAnalysisBytes),
+        ),
     }
 }

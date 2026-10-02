@@ -1,11 +1,10 @@
 //! BLAKE3 resource fingerprints and duplicate-byte queries.
 //!
-//! Applications can find a known digest or groups of byte-identical resources. A digest is
-//! available only when the complete resource was hashed, and whole-publication hashing is subject
-//! to the fingerprint budget in [`super::AnalysisLimits`].
+//! A digest is available only when the complete resource was hashed, subject to
+//! [`super::AnalysisLimits`].
 
 use super::PublicationAnalysis;
-use crate::resource::{ResourceIndex, ResourceKey, ResourceRecord};
+use crate::resource::{ResourceIndex, ResourceOrdinal, ResourceRef};
 use std::fmt;
 
 /// A BLAKE3 digest of one resource's complete analyzed bytes.
@@ -27,16 +26,12 @@ impl Blake3Hash {
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
-
-    /// Encodes the digest as lowercase hexadecimal.
-    pub fn to_hex(self) -> String {
-        blake3::Hash::from_bytes(self.0).to_hex().to_string()
-    }
 }
 
+/// Formats the digest as lowercase hexadecimal.
 impl fmt::Display for Blake3Hash {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.to_hex())
+        formatter.write_str(blake3::Hash::from_bytes(self.0).to_hex().as_str())
     }
 }
 
@@ -45,31 +40,34 @@ impl fmt::Display for Blake3Hash {
 pub struct DuplicateGroup<'a> {
     hash: Blake3Hash,
     resources: &'a ResourceIndex,
-    keys: &'a [ResourceKey],
+    keys: &'a [ResourceOrdinal],
 }
 
-impl DuplicateGroup<'_> {
+impl<'a> DuplicateGroup<'a> {
     /// Returns the fingerprint shared by every resource in the group.
-    pub fn hash(&self) -> Blake3Hash {
+    pub fn hash(self) -> Blake3Hash {
         self.hash
     }
 
     /// Iterates the matching resource records.
-    pub fn resources(&self) -> impl Iterator<Item = &ResourceRecord> {
+    pub fn resources(self) -> impl Iterator<Item = ResourceRef<'a>> + 'a {
         self.keys
             .iter()
-            .filter_map(|key| self.resources.resource(*key).ok())
+            .filter_map(move |key| self.resources.resource(*key))
     }
 }
 
 impl PublicationAnalysis {
     /// Iterates resources with the requested complete BLAKE3 fingerprint.
-    pub fn resources_by_blake3(&self, hash: Blake3Hash) -> impl Iterator<Item = &ResourceRecord> {
+    pub fn resources_with_fingerprint(
+        &self,
+        hash: Blake3Hash,
+    ) -> impl Iterator<Item = ResourceRef<'_>> {
         self.fingerprint_index
             .get(&hash)
             .into_iter()
             .flatten()
-            .filter_map(|key| self.resources.resource(*key).ok())
+            .filter_map(|key| self.resources.resource(*key))
     }
 
     /// Iterates groups of at least two byte-identical resources.

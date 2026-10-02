@@ -1,4 +1,4 @@
-use epub_stack::{EpubZip, ResourceSelector};
+use epub_stack::{EpubPath, EpubZip};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -16,14 +16,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let preview = book
         .edit()
-        .replace_resource(
-            ResourceSelector::path(resource_path).ok_or("invalid EPUB resource path")?,
+        .upsert_resource(
+            EpubPath::new(resource_path)?,
             b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><body>Updated</body></html>".to_vec(),
         )?
         .preview()?;
-    println!("staged resources: {}", preview.resources().len());
+    println!(
+        "staged resources: {}",
+        preview.resources().resources().len()
+    );
     println!("staged changes: {}", preview.changes().len());
-    preview.commit();
+    println!("committed changes: {}", preview.commit().len());
     book.export_to_path(output)?;
     Ok(())
 }

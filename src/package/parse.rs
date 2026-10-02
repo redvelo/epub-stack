@@ -1,8 +1,9 @@
-use super::collection::{Collection, CollectionRole, MAX_COLLECTION_NESTING_DEPTH};
+use super::collection::{Collection, CollectionRoleToken, MAX_COLLECTION_NESTING_DEPTH};
 use super::legacy::{Guide, Opf2Meta, Reference, ReferenceType};
 use super::manifest::{Manifest, ManifestItem, ManifestPropertyToken};
 use super::metadata::{
-    Element, LinkPropertyToken, LinkRelToken, Meta, MetaPropertyToken, Metadata, MetadataLink,
+    DcElement, Element, LinkPropertyToken, LinkRelToken, Meta, MetaPropertyToken, Metadata,
+    MetadataLink,
 };
 use super::spine::{ItemRef, Linear, PageProgressionDirection, Spine, SpinePropertyToken};
 use super::*;
@@ -17,11 +18,8 @@ use std::{io::BufRead, str::FromStr};
 impl Package {
     /// Parses UTF-8 OPF XML into an owned semantic package model.
     ///
-    /// Use the returned [`Package`] to inspect metadata, manifest resources, reading order, and
-    /// collections. Parsing is namespace-aware and preserves modeled group order, authored
-    /// hrefs, and vocabulary-token spellings after any surrounding whitespace represented by
-    /// [`EpubString`] is trimmed. Empty modeled scalars generally become absent. Unknown XML,
-    /// malformed typed values, the source tree, and lexical formatting are not retained.
+    /// Parsing is namespace-aware. Empty modeled scalars generally become absent; authored
+    /// hrefs and vocabulary tokens are retained. Unknown XML and source formatting are discarded.
     ///
     /// # Errors
     ///
@@ -32,21 +30,8 @@ impl Package {
     }
 }
 
-fn normalize_attr_byte(byte: u8) -> u8 {
-    if byte == b'-' { b'_' } else { byte }
-}
-
-fn attr_key_matches(attr: &[u8], key: &[u8]) -> bool {
-    if attr.len() != key.len() {
-        return false;
-    }
-    attr.iter()
-        .zip(key)
-        .all(|(attr, key)| normalize_attr_byte(*attr) == normalize_attr_byte(*key))
-}
-
 struct PackageEventAttrs {
-    values: Vec<(PackageAttrNamespace, Vec<u8>, String)>,
+    values: Vec<(PackageAttrNamespace, String, String)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -73,18 +58,16 @@ impl PackageEventAttrs {
                     let namespace = match resolved {
                         ResolveResult::Unbound => PackageAttrNamespace::Unbound,
                         ResolveResult::Bound(namespace)
-                            if namespace.as_ref() == b"http://www.w3.org/XML/1998/namespace" =>
+                            if namespace.as_ref() == "http://www.w3.org/XML/1998/namespace" =>
                         {
                             PackageAttrNamespace::Xml
                         }
-                        ResolveResult::Bound(namespace)
-                            if namespace.as_ref() == OPF_NS.as_bytes() =>
-                        {
+                        ResolveResult::Bound(namespace) if namespace.as_ref() == OPF_NS => {
                             PackageAttrNamespace::Opf
                         }
                         _ => PackageAttrNamespace::Other,
                     };
-                    values.push((namespace, local.as_ref().to_vec(), value.to_string()));
+                    values.push((namespace, local.as_ref().to_string(), value.to_string()));
                 }
                 Err(_) => continue,
             }
@@ -92,30 +75,30 @@ impl PackageEventAttrs {
         Self { values }
     }
 
-    fn value(&self, key: &[u8]) -> Option<String> {
+    fn value(&self, key: &str) -> Option<String> {
         self.values
             .iter()
             .find(|(namespace, attr_key, _)| {
-                let expected_namespace = if key == LANG.as_bytes() {
+                let expected_namespace = if key == LANG {
                     PackageAttrNamespace::Xml
                 } else {
                     PackageAttrNamespace::Unbound
                 };
-                *namespace == expected_namespace && attr_key_matches(attr_key, key)
+                *namespace == expected_namespace && attr_key == key
             })
             .map(|(_, _, value)| value.clone())
     }
 
-    fn opf_value(&self, key: &[u8]) -> Option<String> {
+    fn opf_value(&self, key: &str) -> Option<String> {
         self.values
             .iter()
             .find(|(namespace, attr_key, _)| {
-                *namespace == PackageAttrNamespace::Opf && attr_key_matches(attr_key, key)
+                *namespace == PackageAttrNamespace::Opf && attr_key == key
             })
             .map(|(_, _, value)| value.clone())
     }
 
-    fn epub_string(&self, key: &[u8]) -> Option<EpubString> {
+    fn epub_string(&self, key: &str) -> Option<EpubString> {
         optional_epub_string(self.value(key))
     }
 }
@@ -128,16 +111,16 @@ fn push_general_ref_preserving_unknown(
     Ok(())
 }
 
-fn read_text_content<R: BufRead>(reader: &mut NsReader<R>, end: &[u8]) -> Result<String> {
+fn read_text_content<R: BufRead>(reader: &mut NsReader<R>, end: &str) -> Result<String> {
     let mut buf = Vec::new();
     let mut content = String::new();
     loop {
         match reader.read_event_into(&mut buf)? {
             Event::Text(text) => {
-                content.push_str(&text_content(&text)?);
+                content.push_str(&text_content(&text));
             }
             Event::CData(text) => {
-                content.push_str(&cdata_content(&text)?);
+                content.push_str(&cdata_content(&text));
             }
             Event::GeneralRef(reference) => {
                 push_general_ref_preserving_unknown(&mut content, &reference)?;
@@ -156,23 +139,23 @@ fn read_text_content<R: BufRead>(reader: &mut NsReader<R>, end: &[u8]) -> Result
 fn is_namespaced_element<R>(
     reader: &NsReader<R>,
     event: &BytesStart<'_>,
-    namespace: &[u8],
-    name: &[u8],
+    namespace: &str,
+    name: &str,
 ) -> bool {
     let (resolved, local) = reader.resolver().resolve_element(event.name());
     matches!(resolved, ResolveResult::Bound(value) if value.as_ref() == namespace)
         && local.as_ref() == name
 }
 
-fn is_opf_element<R>(reader: &NsReader<R>, event: &BytesStart<'_>, name: &[u8]) -> bool {
-    is_namespaced_element(reader, event, OPF_NS.as_bytes(), name)
+fn is_opf_element<R>(reader: &NsReader<R>, event: &BytesStart<'_>, name: &str) -> bool {
+    is_namespaced_element(reader, event, OPF_NS, name)
 }
 
 fn is_namespaced_end<R>(
     reader: &NsReader<R>,
     event: &quick_xml::events::BytesEnd<'_>,
-    namespace: &[u8],
-    name: &[u8],
+    namespace: &str,
+    name: &str,
 ) -> bool {
     let (resolved, local) = reader.resolver().resolve_element(event.name());
     matches!(resolved, ResolveResult::Bound(value) if value.as_ref() == namespace)
@@ -182,13 +165,13 @@ fn is_namespaced_end<R>(
 fn is_opf_end<R>(
     reader: &NsReader<R>,
     event: &quick_xml::events::BytesEnd<'_>,
-    name: &[u8],
+    name: &str,
 ) -> bool {
-    is_namespaced_end(reader, event, OPF_NS.as_bytes(), name)
+    is_namespaced_end(reader, event, OPF_NS, name)
 }
 
 fn is_dc_element_event<R>(reader: &NsReader<R>, event: &BytesStart<'_>) -> bool {
-    is_namespaced_element(reader, event, DC_NS.as_bytes(), event.local_name().as_ref())
+    is_namespaced_element(reader, event, DC_NS, event.local_name().as_ref())
         && is_dc_element(event.local_name().as_ref())
 }
 
@@ -199,13 +182,13 @@ pub(crate) fn parse_package<R: BufRead>(input: R) -> Result<Package> {
     let (root_attrs, empty_root) = loop {
         match reader.read_event_into(&mut buf)? {
             Event::Start(event) => {
-                if !is_opf_element(&reader, &event, PACKAGE.as_bytes()) {
+                if !is_opf_element(&reader, &event, PACKAGE) {
                     return Err(PackageError::RootInvalid);
                 }
                 break (parse_package_attrs(&reader, &event)?, false);
             }
             Event::Empty(event) => {
-                if !is_opf_element(&reader, &event, PACKAGE.as_bytes()) {
+                if !is_opf_element(&reader, &event, PACKAGE) {
                     return Err(PackageError::RootInvalid);
                 }
                 break (parse_package_attrs(&reader, &event)?, true);
@@ -226,23 +209,23 @@ pub(crate) fn parse_package<R: BufRead>(input: R) -> Result<Package> {
             buf.clear();
             match reader.read_event_into(&mut buf)? {
                 Event::Start(event) => {
-                    if is_opf_element(&reader, &event, METADATA.as_bytes()) {
+                    if is_opf_element(&reader, &event, METADATA) {
                         let block = parse_metadata_block(&mut reader)?;
                         metadata.get_or_insert_with(Metadata::empty).append(block);
-                    } else if is_opf_element(&reader, &event, MANIFEST.as_bytes()) {
+                    } else if is_opf_element(&reader, &event, MANIFEST) {
                         let block = parse_manifest_block(&mut reader, &event)?;
                         manifest
                             .get_or_insert_with(Manifest::new_empty)
                             .append(block);
-                    } else if is_opf_element(&reader, &event, SPINE.as_bytes()) {
+                    } else if is_opf_element(&reader, &event, SPINE) {
                         if spine.is_some() {
                             return Err(PackageError::SpineDuplicate);
                         }
                         spine = Some(parse_spine_block(&mut reader, &event)?);
-                    } else if is_opf_element(&reader, &event, GUIDE.as_bytes()) {
+                    } else if is_opf_element(&reader, &event, GUIDE) {
                         let block = parse_guide_block(&mut reader)?;
                         guide.get_or_insert_with(Guide::empty).append(block);
-                    } else if is_opf_element(&reader, &event, COLLECTION.as_bytes()) {
+                    } else if is_opf_element(&reader, &event, COLLECTION) {
                         collections.push(parse_collection_block(&mut reader, &event)?);
                     } else {
                         let mut skipped = Vec::new();
@@ -250,30 +233,29 @@ pub(crate) fn parse_package<R: BufRead>(input: R) -> Result<Package> {
                     }
                 }
                 Event::Empty(event) => {
-                    if is_opf_element(&reader, &event, METADATA.as_bytes()) {
+                    if is_opf_element(&reader, &event, METADATA) {
                         metadata.get_or_insert_with(Metadata::empty);
-                    } else if is_opf_element(&reader, &event, MANIFEST.as_bytes()) {
+                    } else if is_opf_element(&reader, &event, MANIFEST) {
                         let attrs = PackageEventAttrs::new(&reader, &event);
-                        let block =
-                            Manifest::from_parsed(attrs.epub_string(ID.as_bytes()), Vec::new());
+                        let block = Manifest::from_parsed(attrs.epub_string(ID), Vec::new());
                         manifest
                             .get_or_insert_with(Manifest::new_empty)
                             .append(block);
-                    } else if is_opf_element(&reader, &event, SPINE.as_bytes()) {
+                    } else if is_opf_element(&reader, &event, SPINE) {
                         let block = parse_spine_attrs(&reader, &event);
                         if spine.replace(block).is_some() {
                             return Err(PackageError::SpineDuplicate);
                         }
-                    } else if is_opf_element(&reader, &event, GUIDE.as_bytes()) {
+                    } else if is_opf_element(&reader, &event, GUIDE) {
                         guide.get_or_insert_with(Guide::empty);
-                    } else if is_opf_element(&reader, &event, COLLECTION.as_bytes()) {
+                    } else if is_opf_element(&reader, &event, COLLECTION) {
                         collections.push(parse_collection_attrs(&reader, &event));
                     }
                 }
                 Event::End(event) => {
                     let (resolved, local) = reader.resolver().resolve_element(event.name());
-                    if matches!(resolved, ResolveResult::Bound(value) if value.as_ref() == OPF_NS.as_bytes())
-                        && local.as_ref() == PACKAGE.as_bytes()
+                    if matches!(resolved, ResolveResult::Bound(value) if value.as_ref() == OPF_NS)
+                        && local.as_ref() == PACKAGE
                     {
                         break;
                     }
@@ -289,8 +271,7 @@ pub(crate) fn parse_package<R: BufRead>(input: R) -> Result<Package> {
         match reader.read_event_into(&mut buf)? {
             Event::Eof => break,
             Event::Text(text) => {
-                let bytes: &[u8] = text.as_ref();
-                if !bytes.iter().all(u8::is_ascii_whitespace) {
+                if !text.trim_ascii().is_empty() {
                     return Err(PackageError::RootInvalid);
                 }
             }
@@ -334,14 +315,14 @@ struct PackageAttrs {
 
 fn parse_package_attrs<R>(reader: &NsReader<R>, event: &BytesStart<'_>) -> Result<PackageAttrs> {
     let attrs = PackageEventAttrs::new(reader, event);
-    let id = attrs.epub_string(ID.as_bytes());
-    let unique_identifier = attrs.epub_string(UNIQUE_IDENTIFIER.as_bytes());
-    let xml_lang = attrs.epub_string(LANG.as_bytes());
+    let id = attrs.epub_string(ID);
+    let unique_identifier = attrs.epub_string(UNIQUE_IDENTIFIER);
+    let xml_lang = attrs.epub_string(LANG);
     let dir = attrs
-        .value(DIR.as_bytes())
-        .and_then(|value| TextDirection::from_str(&value).ok());
-    let prefix = attrs.epub_string(PREFIX.as_bytes());
-    let version_attr = attrs.epub_string(VERSION.as_bytes());
+        .value(DIR)
+        .and_then(|value| TextDirection::from_token(&value));
+    let prefix = attrs.epub_string(PREFIX);
+    let version_attr = attrs.epub_string(VERSION);
     Ok(PackageAttrs {
         id,
         unique_identifier,
@@ -358,14 +339,14 @@ fn parse_metadata_block<R: BufRead>(reader: &mut NsReader<R>) -> Result<Metadata
     loop {
         match reader.read_event_into(&mut buf)? {
             Event::Start(event) => {
-                let name = event.local_name().as_ref().to_vec();
+                let name = event.local_name().as_ref().to_string();
                 if is_dc_element_event(reader, &event) {
                     let (element, metas) = parse_dc_element(reader, &event, &name)?;
                     push_dc_element(&mut metadata, &name, element);
                     metas.into_iter().for_each(|meta| metadata.add_meta(meta));
-                } else if is_opf_element(reader, &event, META.as_bytes()) {
+                } else if is_opf_element(reader, &event, META) {
                     parse_meta_element(reader, &event, &mut metadata)?;
-                } else if is_opf_element(reader, &event, LINK.as_bytes())
+                } else if is_opf_element(reader, &event, LINK)
                     && let Some(link) = parse_link_element(reader, &event)?
                 {
                     metadata.add_link(link);
@@ -377,20 +358,20 @@ fn parse_metadata_block<R: BufRead>(reader: &mut NsReader<R>) -> Result<Metadata
                 }
             }
             Event::Empty(event) => {
-                let name = event.local_name().as_ref().to_vec();
+                let name = event.local_name().as_ref().to_string();
                 if is_dc_element_event(reader, &event) {
                     let (element, metas) = parse_dc_element_empty(reader, &event, &name)?;
                     push_dc_element(&mut metadata, &name, element);
                     metas.into_iter().for_each(|meta| metadata.add_meta(meta));
-                } else if is_opf_element(reader, &event, META.as_bytes()) {
+                } else if is_opf_element(reader, &event, META) {
                     parse_meta_empty(reader, &event, &mut metadata)?;
-                } else if is_opf_element(reader, &event, LINK.as_bytes())
+                } else if is_opf_element(reader, &event, LINK)
                     && let Some(link) = parse_link_element(reader, &event)?
                 {
                     metadata.add_link(link);
                 }
             }
-            Event::End(end) if is_opf_end(reader, &end, METADATA.as_bytes()) => break,
+            Event::End(end) if is_opf_end(reader, &end, METADATA) => break,
             Event::Eof => break,
             _ => {}
         }
@@ -404,13 +385,13 @@ fn parse_manifest_block<R: BufRead>(
     event: &BytesStart<'_>,
 ) -> Result<Manifest> {
     let attrs = PackageEventAttrs::new(reader, event);
-    let id = attrs.epub_string(ID.as_bytes());
+    let id = attrs.epub_string(ID);
     let mut items = Vec::new();
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf)? {
             Event::Start(event) => {
-                if is_opf_element(reader, &event, ITEM.as_bytes()) {
+                if is_opf_element(reader, &event, ITEM) {
                     let index = items.len();
                     items.push(parse_manifest_item_event(reader, &event, index)?);
                     let mut skipped = Vec::new();
@@ -421,12 +402,12 @@ fn parse_manifest_block<R: BufRead>(
                 }
             }
             Event::Empty(event) => {
-                if is_opf_element(reader, &event, ITEM.as_bytes()) {
+                if is_opf_element(reader, &event, ITEM) {
                     let index = items.len();
                     items.push(parse_manifest_item_event(reader, &event, index)?);
                 }
             }
-            Event::End(end) if is_opf_end(reader, &end, MANIFEST.as_bytes()) => break,
+            Event::End(end) if is_opf_end(reader, &end, MANIFEST) => break,
             Event::Eof => break,
             _ => {}
         }
@@ -444,7 +425,7 @@ fn parse_spine_block<R: BufRead>(
     loop {
         match reader.read_event_into(&mut buf)? {
             Event::Start(event) => {
-                if is_opf_element(reader, &event, ITEMREF.as_bytes()) {
+                if is_opf_element(reader, &event, ITEMREF) {
                     let index = spine.itemrefs().len();
                     spine.add_itemref(parse_itemref_event(reader, &event, index)?);
                     let mut skipped = Vec::new();
@@ -455,12 +436,12 @@ fn parse_spine_block<R: BufRead>(
                 }
             }
             Event::Empty(event) => {
-                if is_opf_element(reader, &event, ITEMREF.as_bytes()) {
+                if is_opf_element(reader, &event, ITEMREF) {
                     let index = spine.itemrefs().len();
                     spine.add_itemref(parse_itemref_event(reader, &event, index)?);
                 }
             }
-            Event::End(end) if is_opf_end(reader, &end, SPINE.as_bytes()) => break,
+            Event::End(end) if is_opf_end(reader, &end, SPINE) => break,
             Event::Eof => break,
             _ => {}
         }
@@ -472,11 +453,11 @@ fn parse_spine_block<R: BufRead>(
 fn parse_spine_attrs<R>(reader: &NsReader<R>, event: &BytesStart<'_>) -> Spine {
     let attrs = PackageEventAttrs::new(reader, event);
     Spine::from_parsed(
-        attrs.epub_string(ID.as_bytes()),
+        attrs.epub_string(ID),
         attrs
-            .value(PAGE_PROGRESSION_DIRECTION.as_bytes())
+            .value(PAGE_PROGRESSION_DIRECTION)
             .and_then(|value| PageProgressionDirection::from_str(&value).ok()),
-        attrs.epub_string(TOC.as_bytes()),
+        attrs.value(TOC),
     )
 }
 
@@ -489,13 +470,13 @@ fn parse_collection_block<R: BufRead>(
     loop {
         match reader.read_event_into(&mut buf)? {
             Event::Start(event) => {
-                if is_opf_element(reader, &event, METADATA.as_bytes()) {
+                if is_opf_element(reader, &event, METADATA) {
                     let metadata = parse_metadata_block(reader)?;
                     stack
                         .last_mut()
                         .expect("collection stack has a root")
                         .append_metadata(metadata);
-                } else if is_opf_element(reader, &event, LINK.as_bytes()) {
+                } else if is_opf_element(reader, &event, LINK) {
                     if let Some(link) = parse_link_element(reader, &event)? {
                         stack
                             .last_mut()
@@ -504,7 +485,7 @@ fn parse_collection_block<R: BufRead>(
                     }
                     let mut skipped = Vec::new();
                     reader.read_to_end_into(event.name(), &mut skipped)?;
-                } else if is_opf_element(reader, &event, COLLECTION.as_bytes()) {
+                } else if is_opf_element(reader, &event, COLLECTION) {
                     if stack.len() == MAX_COLLECTION_NESTING_DEPTH {
                         return Err(PackageError::CollectionNestingLimitExceeded {
                             limit: MAX_COLLECTION_NESTING_DEPTH,
@@ -517,14 +498,14 @@ fn parse_collection_block<R: BufRead>(
                 }
             }
             Event::Empty(event) => {
-                if is_opf_element(reader, &event, LINK.as_bytes()) {
+                if is_opf_element(reader, &event, LINK) {
                     if let Some(link) = parse_link_element(reader, &event)? {
                         stack
                             .last_mut()
                             .expect("collection stack has a root")
                             .add_link(link);
                     }
-                } else if is_opf_element(reader, &event, COLLECTION.as_bytes()) {
+                } else if is_opf_element(reader, &event, COLLECTION) {
                     if stack.len() == MAX_COLLECTION_NESTING_DEPTH {
                         return Err(PackageError::CollectionNestingLimitExceeded {
                             limit: MAX_COLLECTION_NESTING_DEPTH,
@@ -537,7 +518,7 @@ fn parse_collection_block<R: BufRead>(
                         .add_collection(nested)?;
                 }
             }
-            Event::End(end) if is_opf_end(reader, &end, COLLECTION.as_bytes()) => {
+            Event::End(end) if is_opf_end(reader, &end, COLLECTION) => {
                 let collection = stack.pop().expect("collection stack has a root");
                 if let Some(parent) = stack.last_mut() {
                     parent.add_collection(collection)?;
@@ -565,13 +546,13 @@ fn parse_collection_attrs<R>(reader: &NsReader<R>, event: &BytesStart<'_>) -> Co
     let attrs = PackageEventAttrs::new(reader, event);
     Collection::from_parsed(
         attrs
-            .value(DIR.as_bytes())
-            .and_then(|value| TextDirection::from_str(&value).ok()),
-        attrs.epub_string(ID.as_bytes()),
-        attrs.epub_string(LANG.as_bytes()),
+            .value(DIR)
+            .and_then(|value| TextDirection::from_token(&value)),
+        attrs.epub_string(ID),
+        attrs.epub_string(LANG),
         attrs
-            .value(ROLE.as_bytes())
-            .and_then(|value| CollectionRole::from_str(&value).ok()),
+            .value(ROLE)
+            .and_then(|value| CollectionRoleToken::try_new(value).ok()),
     )
 }
 
@@ -581,7 +562,7 @@ fn parse_guide_block<R: BufRead>(reader: &mut NsReader<R>) -> Result<Guide> {
     loop {
         match reader.read_event_into(&mut buf)? {
             Event::Start(event) => {
-                if is_opf_element(reader, &event, REFERENCE.as_bytes())
+                if is_opf_element(reader, &event, REFERENCE)
                     && let Some(reference) = parse_reference_event(reader, &event)?
                 {
                     references.push(reference);
@@ -593,13 +574,13 @@ fn parse_guide_block<R: BufRead>(reader: &mut NsReader<R>) -> Result<Guide> {
                 }
             }
             Event::Empty(event) => {
-                if is_opf_element(reader, &event, REFERENCE.as_bytes())
+                if is_opf_element(reader, &event, REFERENCE)
                     && let Some(reference) = parse_reference_event(reader, &event)?
                 {
                     references.push(reference);
                 }
             }
-            Event::End(end) if is_opf_end(reader, &end, GUIDE.as_bytes()) => break,
+            Event::End(end) if is_opf_end(reader, &end, GUIDE) => break,
             Event::Eof => break,
             _ => {}
         }
@@ -613,10 +594,10 @@ fn parse_reference_event<R>(
     event: &BytesStart<'_>,
 ) -> Result<Option<Reference>> {
     let attrs = PackageEventAttrs::new(reader, event);
-    let title = attrs.epub_string(TITLE.as_bytes());
-    let href = attrs.value(HREF.as_bytes()).map(AuthoredHref::new);
+    let title = attrs.epub_string(TITLE);
+    let href = attrs.value(HREF).map(AuthoredHref::new);
     let reference_type = attrs
-        .value(TYPE.as_bytes())
+        .value(TYPE)
         .and_then(|value| ReferenceType::from_str(&value).ok());
     Ok(Some(Reference::from_parsed(reference_type, title, href)))
 }
@@ -627,15 +608,15 @@ fn parse_manifest_item_event<R>(
     _index: usize,
 ) -> Result<ManifestItem> {
     let attrs = PackageEventAttrs::new(reader, event);
-    let fallback = attrs.epub_string(FALLBACK.as_bytes());
-    let href = attrs.value(HREF.as_bytes()).map(AuthoredHref::new);
+    let fallback = attrs.value(FALLBACK);
+    let href = attrs.value(HREF).map(AuthoredHref::new);
     let media_type = attrs
-        .epub_string(MEDIA_TYPE.as_bytes())
+        .epub_string(MEDIA_TYPE)
         .map(MediaType::from_epub_string);
-    let media_overlay = attrs.epub_string(MEDIA_OVERLAY.as_bytes());
-    let id = attrs.epub_string(ID.as_bytes());
+    let media_overlay = attrs.value(MEDIA_OVERLAY);
+    let id = attrs.value(ID);
     let properties = attrs
-        .value(PROPERTIES.as_bytes())
+        .value(PROPERTIES)
         .map(|value| parse_manifest_properties(&value))
         .unwrap_or_default();
     Ok(ManifestItem::from_parsed(
@@ -651,14 +632,14 @@ fn parse_manifest_item_event<R>(
 fn parse_manifest_properties(value: &str) -> Vec<ManifestPropertyToken> {
     value
         .split_whitespace()
-        .filter_map(ManifestPropertyToken::new)
+        .filter_map(|token| ManifestPropertyToken::try_new(token).ok())
         .collect()
 }
 
 fn parse_spine_properties(value: &str) -> Vec<SpinePropertyToken> {
     value
         .split_whitespace()
-        .filter_map(SpinePropertyToken::new)
+        .filter_map(|token| SpinePropertyToken::try_new(token).ok())
         .collect()
 }
 
@@ -668,13 +649,13 @@ fn parse_itemref_event<R>(
     _index: usize,
 ) -> Result<ItemRef> {
     let attrs = PackageEventAttrs::new(reader, event);
-    let idref = attrs.epub_string(IDREF.as_bytes());
-    let id = attrs.epub_string(ID.as_bytes());
+    let idref = attrs.value(IDREF);
+    let id = attrs.epub_string(ID);
     let linear = attrs
-        .value(LINEAR.as_bytes())
+        .value(LINEAR)
         .and_then(|value| Linear::from_str(&value).ok());
     let properties = attrs
-        .value(PROPERTIES.as_bytes())
+        .value(PROPERTIES)
         .map(|value| parse_spine_properties(&value))
         .unwrap_or_default();
     let linear = linear.unwrap_or(Linear::Yes);
@@ -686,27 +667,29 @@ fn parse_link_element<R>(
     event: &BytesStart<'_>,
 ) -> Result<Option<MetadataLink>> {
     let attrs = PackageEventAttrs::new(reader, event);
-    let href = attrs.value(HREF.as_bytes()).map(AuthoredHref::new);
-    let rel = attrs.value(REL.as_bytes()).and_then(LinkRelToken::new);
+    let href = attrs.value(HREF).map(AuthoredHref::new);
+    let rel = attrs
+        .value(REL)
+        .and_then(|value| LinkRelToken::try_new(value).ok());
     if href.is_none() || rel.is_none() {
         return Ok(None);
     }
     let properties = attrs
-        .value(PROPERTIES.as_bytes())
+        .value(PROPERTIES)
         .map(|properties| {
             properties
                 .split_whitespace()
-                .filter_map(LinkPropertyToken::new)
+                .filter_map(|token| LinkPropertyToken::try_new(token).ok())
                 .collect()
         })
         .unwrap_or_default();
     Ok(Some(MetadataLink::from_parsed(
         href,
         rel,
-        attrs.epub_string(REFINES.as_bytes()),
-        attrs.epub_string(MEDIA_TYPE.as_bytes()),
-        attrs.epub_string(ID.as_bytes()),
-        attrs.epub_string(HREFLANG.as_bytes()),
+        attrs.epub_string(REFINES),
+        attrs.epub_string(MEDIA_TYPE),
+        attrs.epub_string(ID),
+        attrs.epub_string(HREFLANG),
         properties,
     )))
 }
@@ -714,7 +697,7 @@ fn parse_link_element<R>(
 fn parse_dc_element<R: BufRead>(
     reader: &mut NsReader<R>,
     event: &BytesStart<'_>,
-    name: &[u8],
+    name: &str,
 ) -> Result<(Element, Vec<Meta>)> {
     let content = read_text_content(reader, event.name().as_ref())?;
     let content = EpubString::new(content);
@@ -724,7 +707,7 @@ fn parse_dc_element<R: BufRead>(
 fn parse_dc_element_empty<R>(
     reader: &NsReader<R>,
     event: &BytesStart<'_>,
-    name: &[u8],
+    name: &str,
 ) -> Result<(Element, Vec<Meta>)> {
     parse_dc_element_from_parts(reader, event, name, None)
 }
@@ -732,18 +715,18 @@ fn parse_dc_element_empty<R>(
 fn parse_dc_element_from_parts<R>(
     reader: &NsReader<R>,
     event: &BytesStart<'_>,
-    name: &[u8],
+    name: &str,
     content: Option<EpubString>,
 ) -> Result<(Element, Vec<Meta>)> {
     let attrs = PackageEventAttrs::new(reader, event);
-    let id = attrs.epub_string(ID.as_bytes());
+    let id = attrs.epub_string(ID);
     let dir = attrs
-        .value(DIR.as_bytes())
-        .and_then(|value| TextDirection::from_str(&value).ok());
-    let xml_lang = attrs.epub_string(LANG.as_bytes());
-    let opf2_scheme = optional_epub_string(attrs.opf_value(SCHEME.as_bytes()));
-    let opf2_role = optional_epub_string(attrs.opf_value(ROLE.as_bytes()));
-    let opf2_file_as = optional_epub_string(attrs.opf_value(b"file_as"));
+        .value(DIR)
+        .and_then(|value| TextDirection::from_token(&value));
+    let xml_lang = attrs.epub_string(LANG);
+    let opf2_scheme = optional_epub_string(attrs.opf_value(SCHEME));
+    let opf2_role = optional_epub_string(attrs.opf_value(ROLE));
+    let opf2_file_as = optional_epub_string(attrs.opf_value("file-as"));
     let element = Element::from_parsed(
         id,
         dir,
@@ -763,10 +746,8 @@ fn parse_meta_element<R: BufRead>(
     metadata: &mut Metadata,
 ) -> Result<()> {
     let attrs = PackageEventAttrs::new(reader, event);
-    let property = attrs
-        .epub_string(PROPERTY.as_bytes())
-        .map(MetaPropertyToken::from_raw);
-    let name = attrs.epub_string(NAME.as_bytes());
+    let property = attrs.epub_string(PROPERTY).map(MetaPropertyToken::from);
+    let name = attrs.epub_string(NAME);
     if property.is_some() {
         let content = read_text_content(reader, event.name().as_ref())?;
         let content = EpubString::new(content);
@@ -787,10 +768,8 @@ fn parse_meta_empty<R>(
     metadata: &mut Metadata,
 ) -> Result<()> {
     let attrs = PackageEventAttrs::new(reader, event);
-    let property = attrs
-        .epub_string(PROPERTY.as_bytes())
-        .map(MetaPropertyToken::from_raw);
-    let name = attrs.epub_string(NAME.as_bytes());
+    let property = attrs.epub_string(PROPERTY).map(MetaPropertyToken::from);
+    let name = attrs.epub_string(NAME);
     if property.is_some() {
         if let Some(meta) = build_meta_from_attrs(&attrs, property, None)? {
             metadata.add_meta(meta);
@@ -809,20 +788,20 @@ fn build_meta_from_attrs(
     if property.is_none() {
         return Ok(None);
     }
-    let id = attrs.epub_string(ID.as_bytes());
-    let refines = attrs.epub_string(REFINES.as_bytes());
-    let scheme = attrs.epub_string(SCHEME.as_bytes());
-    let xml_lang = attrs.epub_string(LANG.as_bytes());
+    let id = attrs.epub_string(ID);
+    let refines = attrs.epub_string(REFINES);
+    let scheme = attrs.epub_string(SCHEME);
+    let xml_lang = attrs.epub_string(LANG);
     let dir = attrs
-        .value(DIR.as_bytes())
-        .and_then(|value| TextDirection::from_str(&value).ok());
+        .value(DIR)
+        .and_then(|value| TextDirection::from_token(&value));
     Ok(Some(Meta::from_parsed(
         dir, id, property, scheme, xml_lang, refines, content,
     )))
 }
 
 fn build_opf2_meta(attrs: &PackageEventAttrs, name: Option<EpubString>) -> Option<Opf2Meta> {
-    let content = attrs.epub_string(CONTENT.as_bytes());
+    let content = attrs.value(CONTENT);
     if name.is_some() || content.is_some() {
         Some(Opf2Meta::from_parsed(name, content))
     } else {
@@ -830,28 +809,13 @@ fn build_opf2_meta(attrs: &PackageEventAttrs, name: Option<EpubString>) -> Optio
     }
 }
 
-fn push_dc_element(metadata: &mut Metadata, name: &[u8], element: Element) {
-    match name {
-        name if name == IDENTIFIER.as_bytes() => metadata.add_identifier(element),
-        name if name == TITLE.as_bytes() => metadata.add_title(element),
-        name if name == LANGUAGE.as_bytes() => metadata.add_language(element),
-        name if name == CONTRIBUTOR.as_bytes() => metadata.add_contributor(element),
-        name if name == COVERAGE.as_bytes() => metadata.add_coverage(element),
-        name if name == CREATOR.as_bytes() => metadata.add_creator(element),
-        name if name == DATE.as_bytes() => metadata.add_date(element),
-        name if name == DESCRIPTION.as_bytes() => metadata.add_description(element),
-        name if name == FORMAT.as_bytes() => metadata.add_format(element),
-        name if name == PUBLISHER.as_bytes() => metadata.add_publisher(element),
-        name if name == RELATION.as_bytes() => metadata.add_relation(element),
-        name if name == RIGHTS.as_bytes() => metadata.add_rights(element),
-        name if name == SOURCE.as_bytes() => metadata.add_source(element),
-        name if name == SUBJECT.as_bytes() => metadata.add_subject(element),
-        name if name == TYPE.as_bytes() => metadata.add_dc_type(element),
-        _ => {}
+fn push_dc_element(metadata: &mut Metadata, name: &str, element: Element) {
+    if let Some(kind) = DcElement::from_local_name(name) {
+        metadata.add_element(kind, element);
     }
 }
 
-fn is_dc_element(name: &[u8]) -> bool {
+fn is_dc_element(name: &str) -> bool {
     [
         IDENTIFIER,
         TITLE,
@@ -869,12 +833,22 @@ fn is_dc_element(name: &[u8]) -> bool {
         SUBJECT,
         TYPE,
     ]
-    .iter()
-    .any(|value| name == value.as_bytes())
+    .contains(&name)
 }
 
 #[cfg(test)]
 mod tests {
+
+    fn first_unrefined<'a, T>(
+        metadata: &'a Metadata,
+        project: impl Fn(&'a Meta) -> Option<T> + 'a,
+    ) -> Option<T> {
+        metadata
+            .meta()
+            .iter()
+            .filter(|meta| meta.refines().is_none())
+            .find_map(project)
+    }
     use super::*;
 
     #[test]
@@ -925,8 +899,13 @@ mod tests {
             Package::parse(r#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0"/>"#)
                 .unwrap();
 
-        assert!(package.metadata().title().is_empty());
-        assert!(package.metadata().identifier().is_empty());
+        assert!(package.metadata().elements(DcElement::Title).is_empty());
+        assert!(
+            package
+                .metadata()
+                .elements(DcElement::Identifier)
+                .is_empty()
+        );
         assert!(package.metadata().meta().is_empty());
         assert!(package.metadata().link().is_empty());
         assert!(package.manifest().items().is_empty());
@@ -951,7 +930,7 @@ mod tests {
         assert_eq!(
             package
                 .metadata()
-                .title()
+                .elements(DcElement::Title)
                 .iter()
                 .filter_map(Element::content)
                 .map(EpubString::as_str)
@@ -964,7 +943,6 @@ mod tests {
                 .items()
                 .iter()
                 .filter_map(ManifestItem::id)
-                .map(EpubString::as_str)
                 .collect::<Vec<_>>(),
             vec!["one", "two"]
         );
@@ -988,7 +966,7 @@ mod tests {
             );
             let package = Package::parse(&xml).unwrap();
             assert_eq!(
-                package.metadata().title()[0]
+                package.metadata().elements(DcElement::Title)[0]
                     .content()
                     .map(EpubString::as_str),
                 Some(expected)
@@ -1021,7 +999,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_required_whitespace_attrs_are_missing() {
+    fn invalid_manifest_id_source_remains_present() {
         let package = Package::parse(
             r#"<package xmlns="http://www.idpf.org/2007/opf"><manifest>
                 <item id="   " href="   " media-type="   "/>
@@ -1030,7 +1008,7 @@ mod tests {
         .unwrap();
         let item = package.manifest().items().first().unwrap();
 
-        assert_eq!(item.id(), None);
+        assert_eq!(item.id(), Some("   "));
         assert_eq!(item.href(), None);
         assert_eq!(item.authored_href().map(AuthoredHref::as_str), Some("   "));
         assert_eq!(item.media_type(), None);
@@ -1086,7 +1064,7 @@ mod tests {
             </package>"#,
         )
         .unwrap();
-        assert!(package.metadata().title().is_empty());
+        assert!(package.metadata().elements(DcElement::Title).is_empty());
         assert!(package.manifest().items().is_empty());
     }
 
@@ -1139,7 +1117,7 @@ mod tests {
             </package>"#,
         )
         .unwrap();
-        let creator = &package.metadata().creator()[0];
+        let creator = &package.metadata().elements(DcElement::Creator)[0];
 
         assert_eq!(creator.id().map(EpubString::as_str), Some("creator"));
         assert_eq!(creator.xml_lang().map(EpubString::as_str), Some("fr"));
@@ -1165,9 +1143,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(package.metadata().identifier().len(), 2);
+        assert_eq!(package.metadata().elements(DcElement::Identifier).len(), 2);
         assert_eq!(
-            package.metadata().identifier()[1]
+            package.metadata().elements(DcElement::Identifier)[1]
                 .opf2_scheme()
                 .map(EpubString::as_str),
             Some("isbn")
@@ -1237,7 +1215,10 @@ mod tests {
                 r#"<package xmlns="http://www.idpf.org/2007/opf"><metadata><meta property="rendition:layout">{value}</meta></metadata></package>"#
             );
             let package = Package::parse(&xml).unwrap();
-            assert_eq!(package.metadata().rendition_layout(), expected);
+            assert_eq!(
+                first_unrefined(package.metadata(), Meta::rendition_layout),
+                expected
+            );
             assert_eq!(
                 package.metadata().meta()[0]
                     .content()
@@ -1258,5 +1239,19 @@ mod tests {
             package.spine().itemrefs()[0].properties()[0].known_value(),
             Some(super::super::spine::KnownSpineProperty::PageSpreadLeft)
         );
+    }
+    #[test]
+    fn underscore_attribute_spellings_are_not_accepted_as_spec_attributes() {
+        let package = Package::parse(
+            r#"<package xmlns="http://www.idpf.org/2007/opf" unique_identifier="bookid">
+                <manifest><item id="chapter" href="chapter.xhtml" media_type="application/xhtml+xml"/></manifest>
+                <spine page_progression_direction="rtl"/>
+            </package>"#,
+        )
+        .unwrap();
+
+        assert_eq!(package.unique_identifier_id(), None);
+        assert_eq!(package.manifest().items()[0].media_type(), None);
+        assert_eq!(package.spine().page_progression_direction(), None);
     }
 }

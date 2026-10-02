@@ -17,19 +17,19 @@ pub(crate) fn probe_root_format(bytes: &[u8]) -> (Option<SemanticFormat>, Option
         match event {
             quick_xml::events::Event::Start(element) | quick_xml::events::Event::Empty(element) => {
                 let name = element.name();
-                let Some(local) = name.as_ref().rsplit(|byte| *byte == b':').next() else {
+                let Some(local) = name.as_ref().rsplit(':').next() else {
                     return (None, inspection);
                 };
-                let format = if local.eq_ignore_ascii_case(b"html") {
+                let format = if local.eq_ignore_ascii_case("html") {
                     Some(SemanticFormat::Xhtml)
-                } else if local.eq_ignore_ascii_case(b"smil") {
+                } else if local.eq_ignore_ascii_case("smil") {
                     Some(SemanticFormat::Smil)
                 } else {
                     None
                 };
                 return (format, inspection);
             }
-            quick_xml::events::Event::Text(text) if !text.iter().all(u8::is_ascii_whitespace) => {
+            quick_xml::events::Event::Text(text) if !text.trim_ascii().is_empty() => {
                 return (None, inspection);
             }
             quick_xml::events::Event::Eof => return (None, inspection),
@@ -42,91 +42,27 @@ pub(crate) fn probe_root_format(bytes: &[u8]) -> (Option<SemanticFormat>, Option
 #[allow(clippy::too_many_arguments)]
 pub(super) fn push_xhtml_href_reference(
     resources: &ResourceIndex,
-    facts: &[ResourceFacts],
+    facts: &[ResourceAnalysis],
     references: &mut Vec<AuthoredReference>,
-    source: ResourceKey,
+    source: ResourceOrdinal,
     declared: &AuthoredHref,
     kind: HrefRole,
     source_path: &EpubPath,
     authored_base: Option<&AuthoredHref>,
     context: ReferenceContext,
 ) -> ReferenceSlot {
-    let (resolved, query) = authored_base
-        .and_then(|base| resolve_href_with_bases(resources, source_path, &[base], declared))
-        .unwrap_or_else(|| {
-            (
-                resources.resolve_href_from(declared.as_str(), source_path),
-                authored_query(declared),
-            )
-        });
-    let target = href_target(resources, facts, declared, resolved, query);
+    let bases = authored_base.into_iter().collect::<Vec<_>>();
+    let resolved = resolve_with_bases(source_path, &bases, declared);
+    let target = href_target(resources, facts, declared, resolved);
     href_reference(references, source, declared.clone(), kind, target, context)
-}
-
-fn resolve_href_with_bases(
-    resources: &ResourceIndex,
-    source_path: &EpubPath,
-    authored_bases: &[&AuthoredHref],
-    declared: &AuthoredHref,
-) -> Option<(ResolvedHref, Option<String>)> {
-    const LOCAL_ORIGIN: &str = "analysis.invalid";
-    const LOCAL_ROOT: &str = "/__epub_root__/";
-    if authored_bases
-        .iter()
-        .copied()
-        .chain(std::iter::once(declared))
-        .any(|href| matches!(parse_href(href.clone()), ParsedHref::Invalid { .. }))
-    {
-        return Some((
-            ResolvedHref::Invalid(declared.as_str().to_string()),
-            authored_query(declared),
-        ));
-    }
-    let mut document = url::Url::parse(&format!("https://{LOCAL_ORIGIN}/")).ok()?;
-    document.set_path(&format!("{LOCAL_ROOT}{}", source_path.as_str()));
-    let bases_are_relative = authored_bases
-        .iter()
-        .all(|base| is_relative_url_reference(base));
-    let target_is_relative = is_relative_url_reference(declared);
-    let mut base = document;
-    for authored_base in authored_bases {
-        base = base.join(authored_base.as_str()).ok()?;
-    }
-    let target = base.join(declared.as_str()).ok()?;
-    let query = target.query().map(str::to_string);
-    if bases_are_relative
-        && target_is_relative
-        && target.scheme() == "https"
-        && target.host_str() == Some(LOCAL_ORIGIN)
-    {
-        let Some(path) = target.path().strip_prefix(LOCAL_ROOT) else {
-            return Some((ResolvedHref::Invalid(declared.as_str().to_string()), query));
-        };
-        let mut href = path.to_string();
-        if let Some(query) = target.query() {
-            href.push('?');
-            href.push_str(query);
-        }
-        if let Some(fragment) = target.fragment() {
-            href.push('#');
-            href.push_str(fragment);
-        }
-        let root = EpubPath::new("__analysis_root__.xhtml").expect("constant path is valid");
-        Some((resources.resolve_href_from(href, &root), query))
-    } else {
-        Some((
-            resources.resolve_href_from(target.as_str(), source_path),
-            query,
-        ))
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn push_svg_href_reference(
     resources: &ResourceIndex,
-    facts: &[ResourceFacts],
+    facts: &[ResourceAnalysis],
     references: &mut Vec<AuthoredReference>,
-    source: ResourceKey,
+    source: ResourceOrdinal,
     declared: &AuthoredHref,
     authored_bases: &[AuthoredHref],
     kind: HrefRole,
@@ -134,142 +70,112 @@ pub(super) fn push_svg_href_reference(
     context: ReferenceContext,
 ) -> ReferenceSlot {
     let bases = authored_bases.iter().collect::<Vec<_>>();
-    let (resolved, query) = resolve_href_with_bases(resources, source_path, &bases, declared)
-        .unwrap_or_else(|| {
-            (
-                resources.resolve_href_from(declared.as_str(), source_path),
-                authored_query(declared),
-            )
-        });
-    let target = href_target(resources, facts, declared, resolved, query);
+    let resolved = resolve_with_bases(source_path, &bases, declared);
+    let target = href_target(resources, facts, declared, resolved);
     href_reference(references, source, declared.clone(), kind, target, context)
-}
-
-fn is_relative_url_reference(href: &AuthoredHref) -> bool {
-    !href.as_str().starts_with("//") && url::Url::parse(href.as_str()).is_err()
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn push_href_reference(
     resources: &ResourceIndex,
-    facts: &[ResourceFacts],
+    facts: &[ResourceAnalysis],
     references: &mut Vec<AuthoredReference>,
-    source: ResourceKey,
+    source: ResourceOrdinal,
     declared: &AuthoredHref,
     kind: HrefRole,
     source_path: &EpubPath,
     context: ReferenceContext,
 ) -> ReferenceSlot {
-    let resolved = resources.resolve_href_from(declared.as_str(), source_path);
-    let target = href_target(
-        resources,
-        facts,
-        declared,
-        resolved,
-        authored_query(declared),
-    );
+    let resolved = resolve_href(declared, source_path);
+    let target = href_target(resources, facts, declared, resolved);
     href_reference(references, source, declared.clone(), kind, target, context)
+}
+
+fn resolve_with_bases(
+    source_path: &EpubPath,
+    bases: &[&AuthoredHref],
+    declared: &AuthoredHref,
+) -> Result<ResolvedHref, InvalidHref> {
+    if bases.is_empty() {
+        return resolve_href(declared, source_path);
+    }
+    resolve_href_with_bases(source_path, bases, declared)
 }
 
 fn href_target(
     resources: &ResourceIndex,
-    facts: &[ResourceFacts],
+    facts: &[ResourceAnalysis],
     declared: &AuthoredHref,
-    resolved: ResolvedHref,
-    query: Option<String>,
+    resolved: Result<ResolvedHref, InvalidHref>,
 ) -> HrefTarget {
-    match resolved {
-        ResolvedHref::Resource(address) => match &address {
-            ResourceAddress::Local(path) => resources
-                .resources_at(&address)
-                .next()
-                .map(|resource| HrefTarget::Resource {
-                    resource: resource.key(),
+    let Ok(ResolvedHref {
+        address,
+        query,
+        fragment,
+    }) = resolved
+    else {
+        return HrefTarget::Invalid(declared.clone());
+    };
+    match &address {
+        ResourceAddress::Local(path) => {
+            let Some(resource) = resources.resource_at(&address) else {
+                return HrefTarget::MissingLocal(path.clone());
+            };
+            match fragment {
+                Some(fragment) => HrefTarget::Fragment {
+                    resource: resource.ordinal(),
                     query,
-                })
-                .unwrap_or_else(|| HrefTarget::MissingLocal(path.clone())),
-            ResourceAddress::Remote(href) => HrefTarget::Remote {
-                href: href.clone(),
-                declared_resource: resources
-                    .resources_at(&address)
-                    .next()
-                    .map(ResourceRecord::key),
-            },
-            ResourceAddress::Data(value) => HrefTarget::Data(value.clone()),
-            ResourceAddress::External(value) => HrefTarget::External(value.clone()),
-            ResourceAddress::Invalid(_) => HrefTarget::Invalid(declared.clone()),
-        },
-        ResolvedHref::Fragment {
-            resource: address,
-            fragment,
-            ..
-        } if fragment.is_empty() => href_target(
-            resources,
-            facts,
-            declared,
-            ResolvedHref::Resource(address),
-            query,
-        ),
-        ResolvedHref::Fragment {
-            resource: address,
-            fragment,
-            ..
-        } => match &address {
-            ResourceAddress::Local(path) => resources
-                .resources_at(&address)
-                .next()
-                .map(|resource| HrefTarget::Fragment {
-                    resource: resource.key(),
-                    query,
-                    exists: fragment_exists(facts, resource.key(), &fragment),
+                    exists: fragment_exists(facts, resource.ordinal(), &fragment),
                     fragment,
-                })
-                .unwrap_or_else(|| HrefTarget::MissingLocal(path.clone())),
-            ResourceAddress::Remote(href) => HrefTarget::Remote {
-                href: format!("{href}#{fragment}"),
-                declared_resource: resources
-                    .resources_at(&address)
-                    .next()
-                    .map(ResourceRecord::key),
+                },
+                None => HrefTarget::Resource {
+                    resource: resource.ordinal(),
+                    query,
+                },
+            }
+        }
+        ResourceAddress::Remote(href) => HrefTarget::Remote {
+            href: match &fragment {
+                Some(fragment) => format!(
+                    "{href}#{}",
+                    percent_encoding::utf8_percent_encode(fragment, FRAGMENT)
+                ),
+                None => href.clone(),
             },
-            ResourceAddress::Data(value) => HrefTarget::Data(value.clone()),
-            ResourceAddress::External(value) => HrefTarget::External(value.clone()),
-            ResourceAddress::Invalid(_) => HrefTarget::Invalid(declared.clone()),
+            declared_resource: resources.resource_at(&address).map(ResourceRef::ordinal),
         },
-        ResolvedHref::RemoteUrl(href) => HrefTarget::Remote {
-            declared_resource: resources
-                .resources_at(&ResourceAddress::Remote(href.clone()))
-                .next()
-                .map(ResourceRecord::key),
-            href,
-        },
-        ResolvedHref::Data(value) => HrefTarget::Data(value),
-        ResolvedHref::External(value) => HrefTarget::External(value),
-        ResolvedHref::MissingPath(path) => HrefTarget::MissingLocal(path),
-        ResolvedHref::MissingManifestId(_)
-        | ResolvedHref::AmbiguousAddress { .. }
-        | ResolvedHref::Invalid(_) => HrefTarget::Invalid(declared.clone()),
+        ResourceAddress::Data(value) => HrefTarget::Data(value.clone()),
+        ResourceAddress::External(value) => HrefTarget::External(value.clone()),
     }
 }
 
-fn authored_query(href: &AuthoredHref) -> Option<String> {
-    href.as_str()
-        .split_once('#')
-        .map_or(href.as_str(), |(target, _)| target)
-        .split_once('?')
-        .map(|(_, query)| query.to_string())
+const FRAGMENT: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'<')
+    .add(b'>')
+    .add(b'`');
+
+pub(super) fn facts_for_row(
+    facts: &[ResourceAnalysis],
+    resource: ResourceOrdinal,
+) -> Option<&ResourceAnalysis> {
+    facts
+        .get(resource.index())
+        .filter(|facts| facts.resource() == resource)
 }
 
-fn fragment_exists(facts: &[ResourceFacts], resource: ResourceKey, fragment: &str) -> Option<bool> {
-    let outcome = facts
-        .iter()
-        .find(|facts| facts.resource() == resource)?
-        .content();
-    let fragments = match outcome.value()? {
-        ContentFacts::Xhtml(content) => content.fragments(),
-        ContentFacts::Svg(content) => content.fragments(),
-        ContentFacts::Smil(_) => return None,
-    };
+fn fragment_exists(
+    facts: &[ResourceAnalysis],
+    resource: ResourceOrdinal,
+    fragment: &str,
+) -> Option<bool> {
+    let outcome = facts_for_row(facts, resource)?.content();
+    let content = outcome.value()?;
+    let fragments = content
+        .as_xhtml()
+        .map(|facts| facts.fragments())
+        .or_else(|| content.as_svg().map(|facts| facts.fragments()))?;
     let found = fragments.iter().any(|fact| fact.id() == fragment);
     match outcome {
         AnalysisOutcome::Complete(_) => Some(found),
@@ -280,48 +186,31 @@ fn fragment_exists(facts: &[ResourceFacts], resource: ResourceKey, fragment: &st
 
 pub(super) fn fragment_coverage(
     references: &[AuthoredReference],
-    facts: &[ResourceFacts],
-) -> ResourceCoverage {
-    let mut expected = Vec::new();
-    for reference in references {
-        let AuthoredReference::Href(reference) = reference else {
-            continue;
-        };
-        let HrefTarget::Fragment { resource, .. } = reference.target() else {
-            continue;
-        };
-        if facts
-            .iter()
-            .find(|facts| facts.resource() == *resource)
-            .is_none_or(|facts| matches!(facts.content(), AnalysisOutcome::NotApplicable))
-        {
-            continue;
-        }
-        if !expected.contains(resource) {
-            expected.push(*resource);
-        }
-    }
-    let mut completed = Vec::new();
-    let mut partial = Vec::new();
-    let mut unavailable = Vec::new();
-    for resource in &expected {
-        let outcome = facts
-            .iter()
-            .find(|facts| facts.resource() == *resource)
-            .map(ResourceFacts::content);
-        match outcome {
-            Some(AnalysisOutcome::Complete(_)) => completed.push(*resource),
-            Some(AnalysisOutcome::Partial { issue, .. }) => {
-                partial.push(IncompleteResource::new(*resource, *issue))
-            }
-            Some(AnalysisOutcome::Unavailable(issue)) => {
-                unavailable.push(IncompleteResource::new(*resource, *issue))
-            }
-            Some(AnalysisOutcome::NotApplicable) | None => unavailable.push(
-                IncompleteResource::new(*resource, AnalysisIssue::Unsupported),
-            ),
-        }
-    }
-    ResourceCoverage::new(expected, completed, partial, unavailable)
+    facts: &[ResourceAnalysis],
+) -> Vec<ResourceCompleteness> {
+    let mut seen = HashSet::new();
+    references
+        .iter()
+        .filter_map(|reference| match reference {
+            AuthoredReference::Href(reference) => match reference.target() {
+                HrefTarget::Fragment { resource, .. } => Some(*resource),
+                _ => None,
+            },
+            AuthoredReference::Manifest(_) => None,
+        })
+        .filter(|resource| {
+            facts_for_row(facts, *resource)
+                .is_some_and(|facts| !facts.content().is_not_applicable())
+        })
+        .filter(|resource| seen.insert(*resource))
+        .map(|resource| ResourceCompleteness {
+            resource,
+            completeness: facts_for_row(facts, resource)
+                .and_then(|facts| facts.content().completeness())
+                .expect("fragment targets with applicable content have an outcome"),
+        })
+        .collect()
 }
 use super::*;
+use crate::resource::base::resolve_href_with_bases;
+use crate::resource::{InvalidHref, resolve_href};

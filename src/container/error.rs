@@ -2,32 +2,53 @@ use std::path::PathBuf;
 
 use crate::{
     resource::EpubPath,
-    resource::provider::{ProviderReadError, ResourceProviderIndexError},
+    resource::provider::{ProviderIndexError, ProviderReadError},
+    xml::XmlDecodeError,
 };
 
-/// An error decoding XML bytes used by an OCF container document.
-///
-/// This re-export keeps container decoding failures available without exposing the
-/// crate's internal XML module through the container API.
-pub use crate::xml::XmlDecodeError as ContainerXmlDecodeError;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+/// The way a container document violates required OCF structure.
+pub enum ContainerStructure {
+    /// The document has no element content.
+    #[error("missing document element")]
+    MissingDocumentElement,
+    /// The document element is not `{{urn:oasis:names:tc:opendocument:xmlns:container}}container`.
+    #[error("expected an OCF container document element")]
+    UnexpectedDocumentElement,
+    /// More than one document element was present.
+    #[error("multiple document elements")]
+    MultipleDocumentElements,
+    /// Markup or non-whitespace text appeared outside the document element.
+    #[error("content outside the document element")]
+    ContentOutsideDocumentElement,
+    /// The document element was never closed.
+    #[error("truncated container document")]
+    Truncated,
+}
 
 #[derive(Debug, Clone, thiserror::Error)]
 /// Failure while discovering or parsing `META-INF/container.xml`.
-///
-/// The error owns any message or source needed to retain the discovery failure after
-/// the archive lock has been released.
 pub enum ContainerDocumentError {
+    /// The archive has no logical `META-INF/container.xml` entry.
+    #[error("META-INF/container.xml is missing")]
+    Missing,
+    /// The container document exceeded the automatic parsing byte limit.
+    #[error("Container document exceeds the automatic parsing limit of {limit} bytes")]
+    TooLarge {
+        /// The applied maximum number of bytes.
+        limit: u64,
+    },
     /// The decoded document did not have the required OCF structure.
-    #[error("Malformed container document: {message}")]
-    Malformed {
-        /// A description of the structural problem.
-        message: String,
+    #[error("Malformed container document: {structure}")]
+    Structure {
+        /// The structural problem.
+        structure: ContainerStructure,
     },
     /// The container bytes could not be decoded according to their XML encoding.
     #[error("Could not decode container XML: {source}")]
-    XmlDecode {
+    Decode {
         /// The XML encoding failure.
-        source: ContainerXmlDecodeError,
+        source: XmlDecodeError,
     },
     /// The decoded XML was not well formed.
     #[error("Could not parse container XML: {source}")]
@@ -35,46 +56,66 @@ pub enum ContainerDocumentError {
         /// The XML parser failure.
         source: quick_xml::Error,
     },
-    /// Reading the container entry failed.
-    #[error("Could not read container document ({kind:?}): {message}")]
+    /// Reading the container entry from the archive failed.
+    #[error("Could not read the container document: {source}")]
     Read {
+        /// The archive access failure.
+        source: EpubZipError,
+    },
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+/// Failure accessing the source ZIP archive.
+pub enum EpubZipError {
+    /// An I/O operation failed.
+    #[error("IO error{}: {message}", .path.as_ref().map(|path| format!(" for {}", path.display())).unwrap_or_default())]
+    Io {
         /// The portable category of the I/O failure.
         kind: std::io::ErrorKind,
         /// The owned original error message.
         message: String,
+        /// The filesystem path associated with the failure, when there is one.
+        path: Option<PathBuf>,
     },
-    /// Accessing the container entry through the ZIP archive failed.
-    #[error("Could not access container document in the ZIP archive: {message}")]
-    Archive {
+    /// Opening or accessing the ZIP archive failed.
+    #[error("ZIP error: {message}")]
+    Zip {
         /// The owned archive error message.
         message: String,
     },
+    /// Another thread panicked while holding the archive mutex.
+    #[error("ZIP archive lock poisoned")]
+    LockPoisoned,
 }
 
-impl ContainerDocumentError {
-    pub(super) fn from_container_error(error: ContainerError) -> Self {
-        match error {
-            ContainerError::MalformedContainer { message } => Self::Malformed { message },
-            ContainerError::XmlDecode { source } => Self::XmlDecode { source },
-            ContainerError::Xml { source } => Self::Xml { source },
-            ContainerError::Io { source } => Self::Read {
-                kind: source.kind(),
-                message: source.to_string(),
-            },
-            ContainerError::IoPath { path, source } => Self::Read {
-                kind: source.kind(),
-                message: format!("{}: {source}", path.display()),
-            },
-            ContainerError::Zip { source } => Self::Archive {
-                message: source.to_string(),
-            },
-            ContainerError::ZipLockPoisoned => Self::Archive {
-                message: "ZIP archive lock poisoned".to_string(),
-            },
-            ContainerError::ContainerDocument { source } => source,
-            error => Self::Malformed {
-                message: error.to_string(),
-            },
+impl EpubZipError {
+    pub(super) fn io(source: std::io::Error) -> Self {
+        Self::Io {
+            kind: source.kind(),
+            message: source.to_string(),
+            path: None,
+        }
+    }
+
+    pub(super) fn io_path(source: std::io::Error, path: PathBuf) -> Self {
+        Self::Io {
+            kind: source.kind(),
+            message: source.to_string(),
+            path: Some(path),
+        }
+    }
+}
+
+impl From<std::io::Error> for EpubZipError {
+    fn from(source: std::io::Error) -> Self {
+        Self::io(source)
+    }
+}
+
+impl From<zip::result::ZipError> for EpubZipError {
+    fn from(source: zip::result::ZipError) -> Self {
+        Self::Zip {
+            message: source.to_string(),
         }
     }
 }
@@ -85,58 +126,22 @@ pub enum ContainerError {
     /// The requested logical ZIP entry does not exist.
     #[error("ZIP entry not found: {path}")]
     MissingEntry {
-        /// The requested archive-relative path.
-        path: PathBuf,
+        /// The requested canonical path.
+        path: EpubPath,
     },
-    /// The container has no rootfile from which to select a rendition.
-    #[error("Missing rootfiles in container")]
-    MissingRootfiles,
-    /// The archive has no logical `META-INF/container.xml` entry.
-    #[error("META-INF/container.xml is missing")]
-    MissingContainer,
-    /// The container document violates required OCF document structure.
-    #[error("Malformed META-INF/container.xml: {message}")]
-    MalformedContainer {
-        /// A description of the structural problem.
-        message: String,
-    },
-    /// Automatic container discovery retained a malformed-document failure.
-    #[error("Could not discover META-INF/container.xml: {source}")]
+    /// Discovering or parsing the container document failed.
+    #[error("Could not use META-INF/container.xml: {source}")]
     ContainerDocument {
+        #[from]
         /// The retained discovery or parsing failure.
         source: ContainerDocumentError,
     },
-    /// A programmatically supplied required field was empty or whitespace-only.
-    #[error("OCF container field is empty: {field}")]
-    EmptyField {
-        /// The name of the rejected field.
-        field: &'static str,
-    },
-    /// A parsed rootfile has no usable `full-path` attribute.
-    #[error("Rootfile missing full-path")]
-    MissingRootfilePath,
-    /// The requested rendition index is outside the rootfile list.
-    #[error("Rootfile index {index} is out of bounds for {len} renditions")]
-    RootfileIndexOutOfBounds {
-        /// The requested zero-based index.
-        index: usize,
-        /// The number of available rootfiles.
-        len: usize,
-    },
-    /// An unassociated I/O operation failed.
-    #[error("IO error: {source}")]
-    Io {
+    /// Accessing the source archive failed.
+    #[error("Could not access the ZIP archive: {source}")]
+    Archive {
         #[from]
-        /// The underlying I/O failure.
-        source: std::io::Error,
-    },
-    /// Opening or reading a named filesystem path failed.
-    #[error("IO error for {path}: {source}")]
-    IoPath {
-        /// The underlying I/O failure.
-        source: std::io::Error,
-        /// The owned filesystem path associated with the failure.
-        path: PathBuf,
+        /// The archive failure.
+        source: EpubZipError,
     },
     /// Reading a logical resource through the provider view failed.
     #[error("Could not read the logical container resource: {source}")]
@@ -144,16 +149,6 @@ pub enum ContainerError {
         /// The provider failure.
         source: ProviderReadError,
     },
-    /// Opening or accessing the ZIP archive failed.
-    #[error("ZIP error: {source}")]
-    Zip {
-        #[from]
-        /// The underlying ZIP failure.
-        source: zip::result::ZipError,
-    },
-    /// Another thread panicked while holding the archive mutex.
-    #[error("ZIP archive lock poisoned")]
-    ZipLockPoisoned,
     /// Parsing or generating container XML failed.
     #[error("XML error: {source}")]
     Xml {
@@ -166,8 +161,24 @@ pub enum ContainerError {
     XmlDecode {
         #[from]
         /// The underlying XML encoding failure.
-        source: ContainerXmlDecodeError,
+        source: XmlDecodeError,
     },
+}
+
+impl From<std::io::Error> for ContainerError {
+    fn from(source: std::io::Error) -> Self {
+        Self::Archive {
+            source: EpubZipError::io(source),
+        }
+    }
+}
+
+impl From<zip::result::ZipError> for ContainerError {
+    fn from(source: zip::result::ZipError) -> Self {
+        Self::Archive {
+            source: EpubZipError::from(source),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -178,7 +189,7 @@ pub enum ExportError {
     #[error("Could not index resources for export: {source}")]
     ProviderIndex {
         /// The provider indexing failure.
-        source: ResourceProviderIndexError,
+        source: ProviderIndexError,
     },
     /// Opening a resource stream through the provider failed.
     #[error("Could not read resource {path} for export: {source}")]

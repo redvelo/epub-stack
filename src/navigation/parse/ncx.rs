@@ -1,14 +1,14 @@
 use super::common::{
-    NavParseState, NavigationParseError, ParseResult, attr_value, checked_attr_value,
-    finish_navigation_document, is_element, is_end, skip_element, validate_root,
+    NavigationParseError, ParseResult, attr_value, checked_attr_value, finish_navigation_document,
+    is_element, is_end, push_general_ref_text, skip_element, validate_root,
 };
 use crate::{
     navigation::{
         Heading, MAX_NAV_DEPTH, NavigationDocument, NavigationList, NavigationPoint,
-        NavigationSemanticSource, NavigationSemanticToken, NavigationSource,
+        NavigationSource,
     },
     resource::{AuthoredHref, EpubPath},
-    semantics::{DpubAriaRole, EpubStructuralSemantic},
+    semantics::{EpubStructuralSemantic, SemanticToken},
     string::EpubString,
     xml::{XmlUtf8Reader, cdata_content, normalize_optional, text_content},
 };
@@ -53,7 +53,6 @@ pub(crate) fn ncx_reader<R: BufRead>(
 }
 
 fn parse_ncx_impl<R: BufRead>(path: EpubPath, input: R) -> ParseResult<NavigationDocument> {
-    let mut state = NavParseState::new();
     let mut reader = NsReader::from_reader(BufReader::new(XmlUtf8Reader::new(input)));
     reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
@@ -68,32 +67,29 @@ fn parse_ncx_impl<R: BufRead>(path: EpubPath, input: R) -> ParseResult<Navigatio
                     buf.clear();
                     continue;
                 }
-                if is_element(&reader, &event, NCX_NS.as_bytes(), NAV_MAP.as_bytes()) {
+                if is_element(&reader, &event, NCX_NS, NAV_MAP) {
                     lists.push(parse_ncx_section(
                         &mut reader,
                         &event,
                         NAV_MAP,
                         NAV_POINT,
                         Some(EpubStructuralSemantic::Toc),
-                        &mut state,
                     )?);
-                } else if is_element(&reader, &event, NCX_NS.as_bytes(), PAGE_LIST.as_bytes()) {
+                } else if is_element(&reader, &event, NCX_NS, PAGE_LIST) {
                     lists.push(parse_ncx_section(
                         &mut reader,
                         &event,
                         PAGE_LIST,
                         PAGE_TARGET,
                         Some(EpubStructuralSemantic::PageList),
-                        &mut state,
                     )?);
-                } else if is_element(&reader, &event, NCX_NS.as_bytes(), NAV_LIST.as_bytes()) {
+                } else if is_element(&reader, &event, NCX_NS, NAV_LIST) {
                     lists.push(parse_ncx_section(
                         &mut reader,
                         &event,
                         NAV_LIST,
                         NAV_TARGET,
                         None,
-                        &mut state,
                     )?);
                 }
             }
@@ -104,25 +100,23 @@ fn parse_ncx_impl<R: BufRead>(path: EpubPath, input: R) -> ParseResult<Navigatio
                     finish_navigation_document(&mut reader, &mut buf)?;
                     break;
                 }
-                if is_element(&reader, &event, NCX_NS.as_bytes(), NAV_MAP.as_bytes()) {
+                if is_element(&reader, &event, NCX_NS, NAV_MAP) {
                     lists.push(empty_ncx_section(
                         &reader,
                         &event,
                         Some(EpubStructuralSemantic::Toc),
-                        &mut state,
                     ));
-                } else if is_element(&reader, &event, NCX_NS.as_bytes(), PAGE_LIST.as_bytes()) {
+                } else if is_element(&reader, &event, NCX_NS, PAGE_LIST) {
                     lists.push(empty_ncx_section(
                         &reader,
                         &event,
                         Some(EpubStructuralSemantic::PageList),
-                        &mut state,
                     ));
-                } else if is_element(&reader, &event, NCX_NS.as_bytes(), NAV_LIST.as_bytes()) {
-                    lists.push(empty_ncx_section(&reader, &event, None, &mut state));
+                } else if is_element(&reader, &event, NCX_NS, NAV_LIST) {
+                    lists.push(empty_ncx_section(&reader, &event, None));
                 }
             }
-            Event::End(event) if is_end(&reader, &event, NCX_NS.as_bytes(), NCX.as_bytes()) => {
+            Event::End(event) if is_end(&reader, &event, NCX_NS, NCX) => {
                 finish_navigation_document(&mut reader, &mut buf)?;
                 break;
             }
@@ -147,37 +141,30 @@ fn parse_ncx_impl<R: BufRead>(path: EpubPath, input: R) -> ParseResult<Navigatio
 fn parse_ncx_semantics<R>(
     reader: &NsReader<R>,
     event: &quick_xml::events::BytesStart<'_>,
-    state: &mut NavParseState,
-) -> (Vec<NavigationSemanticToken>, bool) {
-    state.attrs(event);
-    let class = attr_value(reader, event, None, CLASS.as_bytes());
-    let role = attr_value(reader, event, None, ROLE.as_bytes());
+) -> (Vec<SemanticToken>, bool) {
+    let class = attr_value(reader, event, None, CLASS);
+    let role = attr_value(reader, event, None, ROLE);
     let mut hidden = false;
     let tokens = class
         .as_deref()
         .into_iter()
-        .flat_map(|value| {
-            value
-                .split_whitespace()
-                .map(|token| (NavigationSemanticSource::Class, token))
-        })
-        .chain(role.as_deref().into_iter().flat_map(|value| {
-            value
-                .split_whitespace()
-                .map(|token| (NavigationSemanticSource::Role, token))
-        }))
-        .map(|(source, token)| {
+        .flat_map(|value| value.split_whitespace().map(|token| (true, token)))
+        .chain(
+            role.as_deref()
+                .into_iter()
+                .flat_map(|value| value.split_whitespace().map(|token| (false, token))),
+        )
+        .map(|(class, token)| {
             if token.eq_ignore_ascii_case(HIDDEN) {
                 hidden = true;
             }
-            match source {
-                NavigationSemanticSource::Class => NavigationSemanticToken::ncx_class(token),
-                NavigationSemanticSource::Role => {
-                    NavigationSemanticToken::role(token, DpubAriaRole::from_html_token(token))
-                }
-                NavigationSemanticSource::EpubType => unreachable!(),
+            if class {
+                SemanticToken::ncx_class(token)
+            } else {
+                SemanticToken::aria_role(token)
             }
         })
+        .filter_map(Result::ok)
         .collect();
     (tokens, hidden)
 }
@@ -188,29 +175,26 @@ fn parse_ncx_section<R: BufRead>(
     section_end: &'static str,
     entry_name: &'static str,
     semantic: Option<EpubStructuralSemantic>,
-    state: &mut NavParseState,
 ) -> ParseResult<NavigationList> {
-    let (tokens, hidden) = parse_ncx_semantics(reader, event, state);
+    let (tokens, hidden) = parse_ncx_semantics(reader, event);
     let mut points = Vec::new();
     let mut heading = None;
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf)? {
             Event::Start(event) => {
-                if is_element(reader, &event, NCX_NS.as_bytes(), entry_name.as_bytes()) {
-                    points.push(parse_ncx_point(reader, &event, entry_name, 1, state)?);
-                } else if is_element(reader, &event, NCX_NS.as_bytes(), NAV_LABEL.as_bytes()) {
-                    heading = parse_ncx_label(reader, state)?
+                if is_element(reader, &event, NCX_NS, entry_name) {
+                    points.push(parse_ncx_point(reader, &event, entry_name, 1)?);
+                } else if is_element(reader, &event, NCX_NS, NAV_LABEL) {
+                    heading = parse_ncx_label(reader)?
                         .and_then(EpubString::new)
                         .map(Heading::h2);
                 }
             }
-            Event::Empty(event)
-                if is_element(reader, &event, NCX_NS.as_bytes(), entry_name.as_bytes()) =>
-            {
-                points.push(empty_ncx_point(reader, &event, 1, state)?);
+            Event::Empty(event) if is_element(reader, &event, NCX_NS, entry_name) => {
+                points.push(empty_ncx_point(reader, &event, 1)?);
             }
-            Event::End(end) if is_end(reader, &end, NCX_NS.as_bytes(), section_end.as_bytes()) => {
+            Event::End(end) if is_end(reader, &end, NCX_NS, section_end) => {
                 break;
             }
             Event::Eof => {
@@ -231,9 +215,8 @@ fn empty_ncx_section<R>(
     reader: &NsReader<R>,
     event: &quick_xml::events::BytesStart<'_>,
     semantic: Option<EpubStructuralSemantic>,
-    state: &mut NavParseState,
 ) -> NavigationList {
-    let (tokens, hidden) = parse_ncx_semantics(reader, event, state);
+    let (tokens, hidden) = parse_ncx_semantics(reader, event);
     NavigationList::from_authored(semantic, None, hidden, Vec::new(), tokens)
 }
 
@@ -242,9 +225,8 @@ fn parse_ncx_point<R: BufRead>(
     event: &quick_xml::events::BytesStart<'_>,
     entry_name: &'static str,
     depth: usize,
-    state: &mut NavParseState,
 ) -> ParseResult<NavigationPoint> {
-    let (tokens, hidden) = parse_ncx_semantics(reader, event, state);
+    let (tokens, hidden) = parse_ncx_semantics(reader, event);
     if depth > MAX_NAV_DEPTH {
         return Err(NavigationParseError::DepthLimitExceeded {
             limit: MAX_NAV_DEPTH,
@@ -257,29 +239,23 @@ fn parse_ncx_point<R: BufRead>(
     loop {
         match reader.read_event_into(&mut buf)? {
             Event::Start(event) => {
-                if is_element(reader, &event, NCX_NS.as_bytes(), NAV_LABEL.as_bytes()) {
-                    label = parse_ncx_label(reader, state)?;
-                } else if is_element(reader, &event, NCX_NS.as_bytes(), CONTENT.as_bytes()) {
-                    href = checked_attr_value(reader, &event, state, None, SRC.as_bytes());
+                if is_element(reader, &event, NCX_NS, NAV_LABEL) {
+                    label = parse_ncx_label(reader)?;
+                } else if is_element(reader, &event, NCX_NS, CONTENT) {
+                    href = checked_attr_value(reader, &event, None, SRC);
                     skip_element(reader, event.name().as_ref(), CONTENT)?;
-                } else if is_element(reader, &event, NCX_NS.as_bytes(), entry_name.as_bytes()) {
-                    children.push(parse_ncx_point(
-                        reader,
-                        &event,
-                        entry_name,
-                        depth + 1,
-                        state,
-                    )?);
+                } else if is_element(reader, &event, NCX_NS, entry_name) {
+                    children.push(parse_ncx_point(reader, &event, entry_name, depth + 1)?);
                 }
             }
             Event::Empty(event) => {
-                if is_element(reader, &event, NCX_NS.as_bytes(), CONTENT.as_bytes()) {
-                    href = checked_attr_value(reader, &event, state, None, SRC.as_bytes());
-                } else if is_element(reader, &event, NCX_NS.as_bytes(), entry_name.as_bytes()) {
-                    children.push(empty_ncx_point(reader, &event, depth + 1, state)?);
+                if is_element(reader, &event, NCX_NS, CONTENT) {
+                    href = checked_attr_value(reader, &event, None, SRC);
+                } else if is_element(reader, &event, NCX_NS, entry_name) {
+                    children.push(empty_ncx_point(reader, &event, depth + 1)?);
                 }
             }
-            Event::End(end) if is_end(reader, &end, NCX_NS.as_bytes(), entry_name.as_bytes()) => {
+            Event::End(end) if is_end(reader, &end, NCX_NS, entry_name) => {
                 break;
             }
             Event::Eof => {
@@ -294,18 +270,15 @@ fn parse_ncx_point<R: BufRead>(
     Ok(navigation_point(label, href, children, hidden, tokens))
 }
 
-fn parse_ncx_label<R: BufRead>(
-    reader: &mut NsReader<R>,
-    state: &mut NavParseState,
-) -> ParseResult<Option<String>> {
+fn parse_ncx_label<R: BufRead>(reader: &mut NsReader<R>) -> ParseResult<Option<String>> {
     let mut text_buffer = String::new();
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf)? {
-            Event::Text(text) => text_buffer.push_str(&text_content(&text)?),
-            Event::CData(text) => text_buffer.push_str(&cdata_content(&text)?),
-            Event::GeneralRef(reference) => state.push_general_ref(&mut text_buffer, &reference)?,
-            Event::End(end) if is_end(reader, &end, NCX_NS.as_bytes(), NAV_LABEL.as_bytes()) => {
+            Event::Text(text) => text_buffer.push_str(&text_content(&text)),
+            Event::CData(text) => text_buffer.push_str(&cdata_content(&text)),
+            Event::GeneralRef(reference) => push_general_ref_text(&mut text_buffer, &reference)?,
+            Event::End(end) if is_end(reader, &end, NCX_NS, NAV_LABEL) => {
                 break;
             }
             Event::Eof => {
@@ -324,14 +297,13 @@ fn empty_ncx_point<R: BufRead>(
     reader: &NsReader<R>,
     event: &quick_xml::events::BytesStart<'_>,
     depth: usize,
-    state: &mut NavParseState,
 ) -> ParseResult<NavigationPoint> {
     if depth > MAX_NAV_DEPTH {
         return Err(NavigationParseError::DepthLimitExceeded {
             limit: MAX_NAV_DEPTH,
         });
     }
-    let (tokens, hidden) = parse_ncx_semantics(reader, event, state);
+    let (tokens, hidden) = parse_ncx_semantics(reader, event);
     Ok(navigation_point(None, None, Vec::new(), hidden, tokens))
 }
 
@@ -340,7 +312,7 @@ fn navigation_point(
     href: Option<String>,
     children: Vec<NavigationPoint>,
     hidden: bool,
-    tokens: Vec<NavigationSemanticToken>,
+    tokens: Vec<SemanticToken>,
 ) -> NavigationPoint {
     NavigationPoint::from_authored(
         label.and_then(EpubString::new),
@@ -355,6 +327,7 @@ fn navigation_point(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::semantics::DpubAriaRole;
 
     const FIXTURE: &str = include_str!("../../tests/fixtures/ncx_with_page_list_and_landmarks.ncx");
 
@@ -384,7 +357,7 @@ mod tests {
         assert_eq!(
             list.authored_semantic_tokens()
                 .iter()
-                .map(|token| token.raw())
+                .map(|token| token.as_str())
                 .collect::<Vec<_>>(),
             vec!["vendor", "toc", "doc-pagelist", "mystery"]
         );

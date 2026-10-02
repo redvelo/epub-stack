@@ -1,4 +1,4 @@
-use crate::xml::{XmlAttrs, local_name, push_general_ref};
+use crate::xml::{local_name, push_general_ref};
 use quick_xml::{
     events::{BytesEnd, BytesStart, Event},
     name::ResolveResult,
@@ -32,10 +32,10 @@ pub enum NavigationParseError {
         /// The encountered namespace URI, if bound.
         found: Option<String>,
     },
-    /// The point tree exceeds the supported bounded depth.
+    /// The point tree or EPUB NAV label markup exceeds the supported bounded depth.
     #[error("Navigation nesting exceeds the supported depth of {limit}")]
     DepthLimitExceeded {
-        /// The maximum supported point depth.
+        /// The maximum supported point or label markup depth.
         limit: usize,
     },
     /// The document ended before a required closing element.
@@ -56,34 +56,19 @@ pub enum NavigationParseError {
     },
 }
 
-pub(crate) struct NavParseState;
-
-impl NavParseState {
-    pub(crate) fn new() -> Self {
-        Self
-    }
-
-    pub(crate) fn attrs(&mut self, event: &BytesStart<'_>) -> XmlAttrs {
-        let attrs = XmlAttrs::from_event(event);
-        let _ = attrs.invalid;
-        attrs
-    }
-
-    pub(crate) fn push_general_ref(
-        &mut self,
-        output: &mut String,
-        reference: &quick_xml::events::BytesRef<'_>,
-    ) -> ParseResult<()> {
-        let _ = push_general_ref(output, reference)?;
-        Ok(())
-    }
+pub(crate) fn push_general_ref_text(
+    output: &mut String,
+    reference: &quick_xml::events::BytesRef<'_>,
+) -> ParseResult<()> {
+    let _ = push_general_ref(output, reference)?;
+    Ok(())
 }
 
 pub(crate) fn is_element<R>(
     reader: &NsReader<R>,
     event: &BytesStart<'_>,
-    namespace: &[u8],
-    name: &[u8],
+    namespace: &str,
+    name: &str,
 ) -> bool {
     let (resolved, local) = reader.resolver().resolve_element(event.name());
     matches!(resolved, ResolveResult::Bound(value) if value.as_ref() == namespace)
@@ -93,8 +78,8 @@ pub(crate) fn is_element<R>(
 pub(crate) fn is_end<R>(
     reader: &NsReader<R>,
     event: &BytesEnd<'_>,
-    namespace: &[u8],
-    name: &[u8],
+    namespace: &str,
+    name: &str,
 ) -> bool {
     let (resolved, local) = reader.resolver().resolve_element(event.name());
     matches!(resolved, ResolveResult::Bound(value) if value.as_ref() == namespace)
@@ -104,8 +89,8 @@ pub(crate) fn is_end<R>(
 pub(crate) fn attr_value<R>(
     reader: &NsReader<R>,
     event: &BytesStart<'_>,
-    namespace: Option<&[u8]>,
-    name: &[u8],
+    namespace: Option<&str>,
+    name: &str,
 ) -> Option<String> {
     event
         .attributes()
@@ -129,20 +114,18 @@ pub(crate) fn attr_value<R>(
 pub(crate) fn checked_attr_value<R>(
     reader: &NsReader<R>,
     event: &BytesStart<'_>,
-    state: &mut NavParseState,
-    namespace: Option<&[u8]>,
-    name: &[u8],
+    namespace: Option<&str>,
+    name: &str,
 ) -> Option<String> {
-    state.attrs(event);
     attr_value(reader, event, namespace, name)
 }
 
 pub(crate) fn skip_element<R: BufRead>(
     reader: &mut NsReader<R>,
-    end: &[u8],
+    end: &str,
     expected: &'static str,
 ) -> ParseResult<()> {
-    let end = end.to_vec();
+    let end = end.to_string();
     let mut depth = 1usize;
     let mut buf = Vec::new();
     loop {
@@ -168,7 +151,7 @@ pub(crate) fn validate_root<R>(
     expected_root: &'static str,
     expected_namespace: &'static str,
 ) -> ParseResult<()> {
-    let found = String::from_utf8_lossy(local_name(event.name().as_ref())).into_owned();
+    let found = local_name(event.name().as_ref()).to_string();
     if found != expected_root {
         return Err(NavigationParseError::WrongRoot {
             expected: expected_root,
@@ -177,7 +160,7 @@ pub(crate) fn validate_root<R>(
     }
     let (resolved, _) = reader.resolver().resolve_element(event.name());
     let namespace = match resolved {
-        ResolveResult::Bound(value) => Some(String::from_utf8_lossy(value.as_ref()).into_owned()),
+        ResolveResult::Bound(value) => Some(value.as_ref().to_string()),
         ResolveResult::Unbound | ResolveResult::Unknown(_) => None,
     };
     if namespace.as_deref() != Some(expected_namespace) {
@@ -198,7 +181,7 @@ pub(crate) fn finish_navigation_document<R: BufRead>(
         buf.clear();
         match reader.read_event_into(buf)? {
             Event::Eof => return Ok(()),
-            Event::Text(text) if text.iter().all(u8::is_ascii_whitespace) => {}
+            Event::Text(text) if text.trim_ascii().is_empty() => {}
             Event::Comment(_) | Event::PI(_) => {}
             _ => return Err(NavigationParseError::TrailingContent),
         }

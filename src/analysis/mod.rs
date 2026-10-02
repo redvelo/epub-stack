@@ -1,15 +1,36 @@
-//! Searchable text, resolved links, media details, accessibility facts, and editing insights.
+//! Extracted content, resolved links, byte inspection, and edit impact.
 //!
-//! [`PublicationAnalysis`] gives applications one coherent view of extracted content,
-//! resource metadata, authored relationships, media overlays, and accessibility observations.
+//! Start with [`PublicationAnalysis::analyzed_resources`]; each [`ResourceAnalysisRef`] connects
+//! a resource's content and inspection results to its inventory record and outgoing references.
+//!
+//! ```no_run
+//! use epub_stack::EpubZip;
+//!
+//! # fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! let book = EpubZip::open("book.epub")?.default_rendition()?;
+//! let analysis = book.analyze();
+//! for resource in analysis.analyzed_resources() {
+//!     println!("{}", resource.resource().address().display_value());
+//!     if let Some(content) = resource.content().value() {
+//!         println!("{:?}", content);
+//!     }
+//!     if let Some(inspection) = resource.inspection().value() {
+//!         println!("{:?}", inspection.data());
+//!     }
+//!     for reference in resource.references() {
+//!         println!("{:?}: {:?}", reference.role(), reference.target());
+//!     }
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! [`AnalysisOutcome::value`] borrows available results, including partial results.
 //! [`PublicationAnalysis::coverage`] reports which expected results are complete, partial, or
 //! unavailable because of limits, missing bytes, or unsupported formats.
 //!
-//! Building a full analysis may read every selected publication resource, subject to
-//! [`AnalysisLimits`]. The result is an owned snapshot: its resource and occurrence keys work
-//! only with that snapshot, and after the publication is edited it still describes the version
-//! that was analyzed. Results contain the modeled facts exposed by these APIs, not complete
-//! source bytes or unknown document structure.
+//! Analysis reads resources subject to [`AnalysisLimits`]. Results and ordinals belong to
+//! that snapshot; rerun analysis after edits for current results.
 
 pub mod coverage;
 pub mod dependency;
@@ -19,95 +40,40 @@ pub mod inspection;
 pub(crate) mod orchestration;
 pub mod reference;
 mod relationships;
-pub mod search;
 
 use crate::accessibility::{
     AccessibilityCertifierReport, AccessibilityFacts, AccessibilityObservationRef,
 };
-use crate::content::text::TextStream;
 use crate::content::{ContentFacts, XhtmlFacts};
 use crate::media_overlay::{MediaOverlayFacts, SmilNodeRef};
-use crate::resource::{IndexKeyError, ManifestKey, ResourceIndex, ResourceKey};
-use coverage::Coverage;
+use crate::resource::{
+    ManifestDeclarationRef, ManifestOrdinal, ResourceIndex, ResourceOrdinal, ResourceRef,
+};
+use coverage::{Coverage, RelationshipCoverage, ResourceCompleteness};
 use fingerprint::Blake3Hash;
-use reference::{AuthoredReference, HrefReference, XhtmlReferenceIndex};
-use std::collections::HashMap;
+use reference::{AuthoredReference, HrefReference, ManifestReference, XhtmlReferenceIndex};
+use std::collections::{HashMap, HashSet};
 
-/// Resource-count and byte budgets for one full publication analysis.
+/// How much work analysis may do before it stops: how many resources, how many bytes, how deep
+/// a SMIL tree.
 ///
-/// Each `None` disables that individual limit. Reaching a limit produces partial or unavailable
-/// results recorded by [`AnalysisOutcome`] and [`Coverage`]; it does not imply that the EPUB is
-/// invalid. The applied limits are retained by [`PublicationAnalysis`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `None` means no limit. Whatever a budget cuts short is reported as incomplete, never
+/// silently dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AnalysisLimits {
-    max_analyzed_resources: Option<usize>,
-    max_resource_analysis_bytes: Option<u64>,
-    max_total_analysis_bytes: Option<u64>,
-    max_total_fingerprint_bytes: Option<u64>,
-}
-
-impl AnalysisLimits {
-    /// Creates a set of independent resource-count and byte budgets.
-    ///
-    /// The byte limits apply, in order, per analyzed resource, across content analysis,
-    /// and across fingerprinting. `None` disables the corresponding budget.
-    pub fn new(
-        max_analyzed_resources: Option<usize>,
-        max_resource_analysis_bytes: Option<u64>,
-        max_total_analysis_bytes: Option<u64>,
-        max_total_fingerprint_bytes: Option<u64>,
-    ) -> Self {
-        Self {
-            max_analyzed_resources,
-            max_resource_analysis_bytes,
-            max_total_analysis_bytes,
-            max_total_fingerprint_bytes,
-        }
-    }
-
-    /// Returns the maximum number of resources selected for byte analysis.
-    pub fn max_analyzed_resources(&self) -> Option<usize> {
-        self.max_analyzed_resources
-    }
-
-    /// Returns the maximum analyzed bytes for any one resource.
-    pub fn max_resource_analysis_bytes(&self) -> Option<u64> {
-        self.max_resource_analysis_bytes
-    }
-
-    /// Returns the aggregate byte budget for content analysis and inspection.
-    pub fn max_total_analysis_bytes(&self) -> Option<u64> {
-        self.max_total_analysis_bytes
-    }
-
-    /// Returns the aggregate byte budget for fingerprinting.
-    pub fn max_total_fingerprint_bytes(&self) -> Option<u64> {
-        self.max_total_fingerprint_bytes
-    }
-
-    /// Replaces the resource-count budget.
-    pub fn with_max_analyzed_resources(mut self, value: Option<usize>) -> Self {
-        self.max_analyzed_resources = value;
-        self
-    }
-
-    /// Replaces the per-resource analysis byte budget.
-    pub fn with_max_resource_analysis_bytes(mut self, value: Option<u64>) -> Self {
-        self.max_resource_analysis_bytes = value;
-        self
-    }
-
-    /// Replaces the aggregate content-analysis byte budget.
-    pub fn with_max_total_analysis_bytes(mut self, value: Option<u64>) -> Self {
-        self.max_total_analysis_bytes = value;
-        self
-    }
-
-    /// Replaces the aggregate fingerprint byte budget.
-    pub fn with_max_total_fingerprint_bytes(mut self, value: Option<u64>) -> Self {
-        self.max_total_fingerprint_bytes = value;
-        self
-    }
+    /// Maximum number of resources selected for byte analysis.
+    pub max_analyzed_resources: Option<usize>,
+    /// Maximum analyzed bytes for any one resource.
+    pub max_resource_analysis_bytes: Option<u64>,
+    /// Aggregate byte budget for content analysis and inspection.
+    pub max_total_analysis_bytes: Option<u64>,
+    /// Aggregate byte budget for fingerprinting.
+    pub max_total_fingerprint_bytes: Option<u64>,
+    /// Maximum number of XML nodes accepted in one SMIL document.
+    pub max_smil_nodes: Option<usize>,
+    /// Maximum element nesting depth accepted in one SMIL document.
+    pub max_smil_nesting: Option<usize>,
 }
 
 impl Default for AnalysisLimits {
@@ -117,15 +83,16 @@ impl Default for AnalysisLimits {
             max_resource_analysis_bytes: Some(32 * 1024 * 1024),
             max_total_analysis_bytes: Some(512 * 1024 * 1024),
             max_total_fingerprint_bytes: Some(8 * 1024 * 1024 * 1024),
+            max_smil_nodes: Some(100_000),
+            max_smil_nesting: Some(256),
         }
     }
 }
 
-/// Availability of one analysis result.
+/// Whether an answer is whole, partial, or missing.
 ///
-/// This reports whether the result could be produced, not whether the EPUB is valid. Missing or
-/// ambiguous authored targets can therefore be part of `T`, while budget and read failures are
-/// represented by this enum.
+/// Complete means analysis finished, not that the book is sound: a complete result can report
+/// plenty of broken links.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnalysisOutcome<T> {
     /// This result does not apply to the resource or source.
@@ -181,49 +148,48 @@ impl<T> AnalysisOutcome<T> {
 /// The reason an analysis result is incomplete or unavailable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AnalysisIssue {
-    /// The run reached its resource-count budget.
-    ResourceLimit,
-    /// A resource exceeded the per-resource analysis byte budget.
-    PerResourceAnalysisLimit,
-    /// The run reached its aggregate analysis byte budget.
-    TotalAnalysisLimit,
-    /// The run reached its aggregate fingerprint byte budget.
-    TotalFingerprintLimit,
+    /// The run reached one of its [`AnalysisLimits`].
+    Limit(AnalysisLimit),
     /// Expected local bytes were absent.
     Missing,
     /// The provider could not read the resource bytes.
     Unreadable,
     /// The resource format or operation is not supported.
     Unsupported,
-    /// The bytes could not produce the supported semantic result.
+    /// The bytes do not conform to their format; any partial result was recovered before or
+    /// around the malformation.
     Malformed,
-    /// Inspection required byte access the provider could not supply.
-    RandomAccessUnavailable,
-    /// A supported parser failed before producing a result.
-    ParserFailure,
 }
 
-/// A content format recognized for semantic extraction.
+/// One [`AnalysisLimits`] budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SemanticFormat {
-    /// XHTML content.
+pub enum AnalysisLimit {
+    /// [`AnalysisLimits::max_analyzed_resources`].
+    AnalyzedResources,
+    /// [`AnalysisLimits::max_resource_analysis_bytes`].
+    ResourceAnalysisBytes,
+    /// [`AnalysisLimits::max_total_analysis_bytes`].
+    TotalAnalysisBytes,
+    /// [`AnalysisLimits::max_total_fingerprint_bytes`].
+    TotalFingerprintBytes,
+    /// [`AnalysisLimits::max_smil_nodes`].
+    SmilNodes,
+    /// [`AnalysisLimits::max_smil_nesting`].
+    SmilNesting,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SemanticFormat {
     Xhtml,
-    /// Cascading Style Sheets.
     Css,
-    /// Standalone SVG content.
     Svg,
-    /// SMIL media-overlay content.
     Smil,
 }
 
-/// Classification of a resource as a supported semantic document format.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ResourceClassification {
-    /// No supported semantic format was identified.
+pub(crate) enum ResourceClassification {
     Unknown,
-    /// Exactly one supported semantic format was identified.
     Identified(SemanticFormat),
-    /// Package declarations identify the resource as multiple incompatible formats.
     Conflict(Vec<SemanticFormat>),
 }
 
@@ -245,39 +211,28 @@ impl ResourceClassification {
     }
 }
 
-/// Extracted content, inspection metadata, classification, and fingerprint for one resource.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResourceFacts {
-    resource: ResourceKey,
-    classification: AnalysisOutcome<ResourceClassification>,
+pub(crate) struct ResourceAnalysis {
+    resource: ResourceOrdinal,
     fingerprint: AnalysisOutcome<Blake3Hash>,
     inspection: AnalysisOutcome<inspection::ResourceInspection>,
     content: AnalysisOutcome<ContentFacts>,
 }
 
-impl ResourceFacts {
-    /// Returns the key of the resource in this analysis snapshot.
-    pub fn resource(&self) -> ResourceKey {
+impl ResourceAnalysis {
+    pub(crate) fn resource(&self) -> ResourceOrdinal {
         self.resource
     }
 
-    /// Returns semantic-format classification and its execution state.
-    pub fn classification(&self) -> &AnalysisOutcome<ResourceClassification> {
-        &self.classification
-    }
-
-    /// Returns the whole-resource BLAKE3 fingerprint outcome.
-    pub fn fingerprint(&self) -> &AnalysisOutcome<Blake3Hash> {
+    pub(crate) fn fingerprint(&self) -> &AnalysisOutcome<Blake3Hash> {
         &self.fingerprint
     }
 
-    /// Returns decoded image, media, font, or text metadata and its availability.
-    pub fn inspection(&self) -> &AnalysisOutcome<inspection::ResourceInspection> {
+    pub(crate) fn inspection(&self) -> &AnalysisOutcome<inspection::ResourceInspection> {
         &self.inspection
     }
 
-    /// Returns extracted semantic content and its execution state.
-    pub fn content(&self) -> &AnalysisOutcome<ContentFacts> {
+    pub(crate) fn content(&self) -> &AnalysisOutcome<ContentFacts> {
         &self.content
     }
 
@@ -285,18 +240,14 @@ impl ResourceFacts {
         &mut self.content
     }
 
-    #[allow(clippy::too_many_arguments, dead_code)]
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        resource: ResourceKey,
-        classification: AnalysisOutcome<ResourceClassification>,
+        resource: ResourceOrdinal,
         fingerprint: AnalysisOutcome<Blake3Hash>,
         inspection: AnalysisOutcome<inspection::ResourceInspection>,
         content: AnalysisOutcome<ContentFacts>,
     ) -> Self {
         Self {
             resource,
-            classification,
             fingerprint,
             inspection,
             content,
@@ -304,91 +255,101 @@ impl ResourceFacts {
     }
 }
 
-/// An owned snapshot of searchable content, resource details, links, and publication facts.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ReferenceIndex {
+    from: Vec<usize>,
+    to: Vec<usize>,
+}
+
+/// What a publication's resources turned out to contain: their text, their formats, and the
+/// links between them.
 ///
-/// Use its query methods to connect extracted text and media to resource records, inspect broken
-/// links and dependencies, and enumerate accessibility and media-overlay observations. The value
-/// remains usable after an edit, but it continues to describe the publication version from which
-/// it was built. Keys obtained from it must be used only with the same snapshot.
+/// These are the answers from one moment. Edit the book and they describe the version that was
+/// analyzed, not the current one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicationAnalysis {
     limits: AnalysisLimits,
     resources: ResourceIndex,
-    resource_facts: Vec<ResourceFacts>,
-    resource_fact_slots: HashMap<ResourceKey, usize>,
+    resource_facts: Vec<ResourceAnalysis>,
     references: Vec<AuthoredReference>,
-    media_overlay_references: HashMap<ManifestKey, usize>,
-    xhtml_references: HashMap<ResourceKey, XhtmlReferenceIndex>,
+    resource_references: Vec<ReferenceIndex>,
+    declaration_references: Vec<ReferenceIndex>,
+    xhtml_references: HashMap<ResourceOrdinal, XhtmlReferenceIndex>,
     media_overlays: MediaOverlayFacts,
     accessibility: AccessibilityFacts,
-    coverage: Coverage,
-    fingerprint_index: HashMap<Blake3Hash, Vec<ResourceKey>>,
+    relationship_coverage: Vec<RelationshipCoverage>,
+    fragment_coverage: Vec<ResourceCompleteness>,
+    fingerprint_index: HashMap<Blake3Hash, Vec<ResourceOrdinal>>,
     duplicate_fingerprints: Vec<Blake3Hash>,
 }
 
 impl PublicationAnalysis {
+    /// Every resource that was analyzed.
+    pub fn analyzed_resources(&self) -> impl ExactSizeIterator<Item = ResourceAnalysisRef<'_>> {
+        self.resource_facts.iter().map(|facts| ResourceAnalysisRef {
+            analysis: self,
+            facts,
+        })
+    }
+
+    /// The analysis of one resource, or `None` if the position is past the end.
+    ///
+    /// Positions belong to the analysis that produced them. Once you hold a handle, everything
+    /// you ask it answers without failing.
+    pub fn resource(&self, ordinal: ResourceOrdinal) -> Option<ResourceAnalysisRef<'_>> {
+        self.resource_facts
+            .get(ordinal.index())
+            .map(|facts| ResourceAnalysisRef {
+                analysis: self,
+                facts,
+            })
+    }
+
+    /// The analysis of one declaration, or `None` if the position is past the end.
+    ///
+    /// Positions belong to the analysis that produced them.
+    pub fn declaration(&self, ordinal: ManifestOrdinal) -> Option<DeclarationAnalysisRef<'_>> {
+        self.resources
+            .declaration(ordinal)
+            .map(|declaration| DeclarationAnalysisRef {
+                analysis: self,
+                declaration,
+            })
+    }
+
     /// Returns the operational limits applied to this analysis run.
     pub fn limits(&self) -> &AnalysisLimits {
         &self.limits
     }
 
-    /// Returns the resources and package declarations represented by this snapshot.
-    ///
-    /// Keys from this index must be used only with queries on the same snapshot.
+    /// What the analyzed publication is made of.
     pub fn resources(&self) -> &ResourceIndex {
         &self.resources
     }
 
-    /// Iterates analysis results for every resource in resource-index order.
-    pub fn resource_facts(&self) -> impl Iterator<Item = &ResourceFacts> {
-        self.resource_facts.iter()
+    pub(crate) fn resource_analysis(&self, ordinal: ResourceOrdinal) -> ResourceAnalysisRef<'_> {
+        self.resource(ordinal)
+            .expect("analysis resources are aligned with the resource index")
     }
 
-    /// Returns facts for a key from this snapshot's resource index.
-    pub fn facts_for(&self, key: ResourceKey) -> Result<&ResourceFacts, IndexKeyError> {
-        self.resources.resource(key)?;
-        self.resource_fact_slots
-            .get(&key)
-            .and_then(|slot| self.resource_facts.get(*slot))
-            .ok_or(IndexKeyError::UnknownKey)
+    pub(crate) fn references_at<'a>(
+        &'a self,
+        slots: &'a [usize],
+    ) -> impl Iterator<Item = &'a AuthoredReference> + 'a {
+        slots.iter().map(|slot| &self.references[*slot])
     }
 
-    /// Returns the semantic content outcome for a snapshot resource.
-    pub fn content_for(
-        &self,
-        key: ResourceKey,
-    ) -> Result<&AnalysisOutcome<ContentFacts>, IndexKeyError> {
-        self.facts_for(key).map(ResourceFacts::content)
-    }
-
-    /// Returns the byte-inspection outcome for a snapshot resource.
-    pub fn inspection_for(
-        &self,
-        key: ResourceKey,
-    ) -> Result<&AnalysisOutcome<inspection::ResourceInspection>, IndexKeyError> {
-        self.facts_for(key).map(ResourceFacts::inspection)
-    }
-
-    /// Returns the XHTML text stream when complete or partial XHTML facts are available.
-    pub fn text_stream_for(&self, key: ResourceKey) -> Result<Option<&TextStream>, IndexKeyError> {
-        Ok(self
-            .content_for(key)?
-            .value()
-            .and_then(ContentFacts::as_xhtml)
-            .map(XhtmlFacts::text_stream))
-    }
-
-    /// Returns analyzed media-overlay associations for this snapshot.
+    /// Which documents have narration, and what drives it.
     pub fn media_overlays(&self) -> &MediaOverlayFacts {
         &self.media_overlays
     }
 
-    /// Returns the policy-free accessibility projection for this snapshot.
+    /// What the book states and shows about its own accessibility.
     pub fn accessibility(&self) -> &AccessibilityFacts {
         &self.accessibility
     }
 
-    /// Returns the resolved authored link for a certifier report from this snapshot.
+    /// Where the accessibility certifier's report points, if the book names one.
     ///
     /// Returns `None` when `report` comes from another analysis or has no retained link
     /// reference.
@@ -411,9 +372,6 @@ impl PublicationAnalysis {
     }
 
     /// Iterates accessibility-relevant navigation, content, structure, overlays, and media.
-    ///
-    /// The observations are factual inputs for application policy, not conformance verdicts.
-    /// Consult [`Self::coverage`] before treating the set as complete.
     pub fn accessibility_observations(
         &self,
     ) -> impl Iterator<Item = AccessibilityObservationRef<'_>> {
@@ -424,7 +382,7 @@ impl PublicationAnalysis {
                 observation,
                 resource: observation
                     .resource_key()
-                    .and_then(|key| self.resources.resource(key).ok()),
+                    .and_then(|key| self.resources.resource(key)),
             });
         let content = self.accessibility.content_occurrences().map(|occurrence| {
             AccessibilityObservationRef::Content {
@@ -435,12 +393,13 @@ impl PublicationAnalysis {
                 fact: occurrence.fact(),
             }
         });
-        let resource_facts = || self.resources.resources().iter().zip(&self.resource_facts);
+        let resource_facts = || self.resources.resources().zip(&self.resource_facts);
         let structure = resource_facts().flat_map(|(resource, facts)| {
-            let structure = match facts.content().value() {
-                Some(ContentFacts::Xhtml(facts)) => facts.structure(),
-                Some(ContentFacts::Svg(_) | ContentFacts::Smil(_)) | None => &[],
-            };
+            let structure = facts
+                .content()
+                .value()
+                .and_then(ContentFacts::as_xhtml)
+                .map_or(&[][..], XhtmlFacts::structure);
             structure
                 .iter()
                 .map(move |fact| AccessibilityObservationRef::Structure { resource, fact })
@@ -456,8 +415,8 @@ impl PublicationAnalysis {
             .media_overlay_associations()
             .map(AccessibilityObservationRef::MediaOverlay);
         let media_tracks = resource_facts().flat_map(|(resource, facts)| {
-            let tracks = match facts.inspection().value().map(|facts| facts.kind()) {
-                Some(inspection::InspectionKind::Media(media)) => media.tracks(),
+            let tracks = match facts.inspection().value().map(|facts| facts.data()) {
+                Some(inspection::InspectionData::Media(media)) => media.tracks(),
                 _ => &[],
             };
             tracks
@@ -465,7 +424,7 @@ impl PublicationAnalysis {
                 .map(move |track| AccessibilityObservationRef::MediaTrack { resource, track })
         });
         let webvtt = resource_facts().filter_map(|(resource, facts)| {
-            let inspection::InspectionKind::WebVtt(webvtt) = facts.inspection().value()?.kind()
+            let inspection::InspectionData::WebVtt(webvtt) = facts.inspection().value()?.data()
             else {
                 return None;
             };
@@ -480,67 +439,83 @@ impl PublicationAnalysis {
             .chain(webvtt)
     }
 
-    /// Returns root playback nodes and their text and audio references for a SMIL resource.
+    /// How much of the book analysis actually got through, and what it could not finish.
     ///
-    /// Returns `Ok(None)` when no complete or partial SMIL facts are available.
-    pub fn smil_roots_for(
-        &self,
-        resource: ResourceKey,
-    ) -> Result<Option<impl Iterator<Item = SmilNodeRef<'_>>>, IndexKeyError> {
-        let facts = self
-            .content_for(resource)?
-            .value()
-            .and_then(ContentFacts::as_smil);
-        Ok(facts.map(move |facts| {
-            facts
-                .roots()
-                .iter()
-                .filter_map(move |node| SmilNodeRef::new(resource, *node, facts, &self.references))
-        }))
+    /// Check this before reading a negative answer as fact: "no broken links" means less when
+    /// half the resources could not be read.
+    pub fn coverage(&self) -> Coverage<'_> {
+        Coverage::new(self)
     }
 
-    /// Returns execution coverage for all analysis producer families.
-    pub fn coverage(&self) -> &Coverage {
-        &self.coverage
-    }
-
-    #[allow(clippy::too_many_arguments, dead_code)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         limits: AnalysisLimits,
         resources: ResourceIndex,
-        resource_facts: Vec<ResourceFacts>,
+        resource_facts: Vec<ResourceAnalysis>,
         references: Vec<AuthoredReference>,
-        xhtml_references: HashMap<ResourceKey, XhtmlReferenceIndex>,
+        xhtml_references: HashMap<ResourceOrdinal, XhtmlReferenceIndex>,
         media_overlays: MediaOverlayFacts,
         accessibility: AccessibilityFacts,
-        coverage: Coverage,
+        relationship_coverage: Vec<RelationshipCoverage>,
+        fragment_coverage: Vec<ResourceCompleteness>,
     ) -> Self {
-        assert_eq!(resources.len(), resource_facts.len());
-        assert!(
+        debug_assert_eq!(
+            relationship_coverage
+                .iter()
+                .map(|coverage| coverage.source)
+                .collect::<HashSet<_>>()
+                .len(),
+            relationship_coverage.len()
+        );
+        debug_assert_eq!(resources.resources().len(), resource_facts.len());
+        debug_assert!(
             resources
                 .resources()
-                .iter()
                 .zip(&resource_facts)
-                .all(|(resource, facts)| resource.key() == facts.resource())
+                .all(|(resource, facts)| resource.ordinal() == facts.resource())
         );
-        let resource_fact_slots = resource_facts
-            .iter()
-            .enumerate()
-            .map(|(slot, facts)| (facts.resource(), slot))
-            .collect();
-        let media_overlay_references = references
-            .iter()
-            .enumerate()
-            .filter_map(|(index, reference)| match reference {
-                AuthoredReference::Manifest(reference)
-                    if reference.role() == reference::ManifestRole::MediaOverlay =>
-                {
-                    Some((reference.source(), index))
+        let mut resource_references = vec![ReferenceIndex::default(); resources.resources().len()];
+        let mut declaration_references =
+            vec![ReferenceIndex::default(); resources.declarations().len()];
+        for (slot, reference) in references.iter().enumerate() {
+            match reference {
+                AuthoredReference::Href(reference) => {
+                    resource_references[reference.source().index()]
+                        .from
+                        .push(slot);
+                    let target = match reference.target() {
+                        reference::HrefTarget::Resource { resource, .. }
+                        | reference::HrefTarget::Fragment { resource, .. } => Some(*resource),
+                        reference::HrefTarget::Remote {
+                            declared_resource, ..
+                        } => *declared_resource,
+                        reference::HrefTarget::Data(_)
+                        | reference::HrefTarget::External(_)
+                        | reference::HrefTarget::MissingLocal(_)
+                        | reference::HrefTarget::Invalid(_) => None,
+                    };
+                    if let Some(target) = target {
+                        resource_references[target.index()].to.push(slot);
+                    }
                 }
-                AuthoredReference::Href(_) | AuthoredReference::Manifest(_) => None,
-            })
-            .collect();
-        let mut fingerprint_index = HashMap::<Blake3Hash, Vec<ResourceKey>>::new();
+                AuthoredReference::Manifest(reference) => {
+                    declaration_references[reference.source().index()]
+                        .from
+                        .push(slot);
+                    if let reference::ManifestTarget::Declaration {
+                        declaration,
+                        resource,
+                    } = reference.target()
+                    {
+                        declaration_references[declaration.index()].to.push(slot);
+                        if let Some(resource) = resource {
+                            resource_references[resource.index()].to.push(slot);
+                        }
+                    }
+                }
+            }
+        }
+        let mut fingerprint_index = HashMap::<Blake3Hash, Vec<ResourceOrdinal>>::new();
         for facts in &resource_facts {
             if let AnalysisOutcome::Complete(hash) = facts.fingerprint() {
                 fingerprint_index
@@ -549,6 +524,7 @@ impl PublicationAnalysis {
                     .push(facts.resource());
             }
         }
+        let mut seen_duplicate_fingerprints = HashSet::new();
         let duplicate_fingerprints = resource_facts
             .iter()
             .filter_map(|facts| match facts.fingerprint() {
@@ -562,25 +538,217 @@ impl PublicationAnalysis {
                     .get(hash)
                     .is_some_and(|keys| keys.len() > 1)
             })
-            .fold(Vec::new(), |mut hashes, hash| {
-                if !hashes.contains(&hash) {
-                    hashes.push(hash);
-                }
-                hashes
-            });
+            .filter(|hash| seen_duplicate_fingerprints.insert(*hash))
+            .collect();
         Self {
             limits,
             resources,
             resource_facts,
-            resource_fact_slots,
             references,
-            media_overlay_references,
+            resource_references,
+            declaration_references,
             xhtml_references,
             media_overlays,
             accessibility,
-            coverage,
+            relationship_coverage,
+            fragment_coverage,
             fingerprint_index,
             duplicate_fingerprints,
         }
+    }
+}
+
+/// What one resource contains, and the links into and out of it.
+#[derive(Debug, Clone, Copy)]
+pub struct ResourceAnalysisRef<'a> {
+    analysis: &'a PublicationAnalysis,
+    facts: &'a ResourceAnalysis,
+}
+
+impl<'a> ResourceAnalysisRef<'a> {
+    /// The resource this describes: its address, presence and declarations.
+    pub fn resource(self) -> ResourceRef<'a> {
+        self.analysis
+            .resources
+            .resource(self.facts.resource())
+            .expect("analysis resources are aligned")
+    }
+
+    /// The text, structure and links extracted from this resource.
+    ///
+    /// Only XHTML, SVG, SMIL and CSS carry content; for an image or a font it does not apply.
+    /// It is unavailable, rather than absent, when the resource could not be read or its format
+    /// could not be determined.
+    pub fn content(self) -> &'a AnalysisOutcome<ContentFacts> {
+        self.facts.content()
+    }
+
+    /// What the bytes themselves say: image dimensions, media duration, font names.
+    pub fn inspection(self) -> &'a AnalysisOutcome<inspection::ResourceInspection> {
+        self.facts.inspection()
+    }
+
+    /// The BLAKE3 hash of the whole resource, for spotting duplicates.
+    pub fn fingerprint(self) -> &'a AnalysisOutcome<Blake3Hash> {
+        self.facts.fingerprint()
+    }
+
+    /// Every link written in this resource, and where each one resolves.
+    pub fn references(self) -> impl Iterator<Item = &'a HrefReference> + 'a {
+        self.analysis
+            .references_at(&self.reference_index().from)
+            .filter_map(|reference| match reference {
+                AuthoredReference::Href(reference) => Some(reference),
+                AuthoredReference::Manifest(_) => None,
+            })
+    }
+
+    /// Every link elsewhere in the book that points at this resource.
+    ///
+    /// Use it to ask who depends on a file before removing or moving it.
+    pub fn incoming_references(self) -> impl Iterator<Item = &'a AuthoredReference> + 'a {
+        self.analysis.references_at(&self.reference_index().to)
+    }
+
+    /// The images, audio and video this document embeds, with the links they were written as.
+    ///
+    /// Empty for anything that is not readable XHTML; [`Self::content`] says which.
+    pub fn xhtml_media(self) -> impl Iterator<Item = reference::XhtmlMediaOccurrence<'a>> + 'a {
+        let resource = self.facts.resource();
+        let index = self.analysis.xhtml_references.get(&resource);
+        self.xhtml()
+            .into_iter()
+            .flat_map(|facts| facts.media().iter().enumerate())
+            .map(move |(position, fact)| {
+                let slots = index
+                    .and_then(|index| index.media.get(position))
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                reference::XhtmlMediaOccurrence::new(
+                    fact,
+                    resource,
+                    slots,
+                    &self.analysis.references,
+                )
+            })
+    }
+
+    /// The forms and controls this document declares.
+    ///
+    /// Empty for anything that is not readable XHTML; [`Self::content`] says which.
+    pub fn xhtml_forms(self) -> impl Iterator<Item = reference::XhtmlFormOccurrence<'a>> + 'a {
+        let index = self.analysis.xhtml_references.get(&self.facts.resource());
+        self.xhtml()
+            .into_iter()
+            .flat_map(|facts| facts.forms().iter().enumerate())
+            .map(move |(position, fact)| {
+                let slot = index
+                    .and_then(|index| index.forms.get(position))
+                    .copied()
+                    .flatten();
+                reference::XhtmlFormOccurrence::new(fact, slot.and_then(|slot| self.href(slot)))
+            })
+    }
+
+    /// The scripts this document carries, inline or linked.
+    ///
+    /// Empty for anything that is not readable XHTML; [`Self::content`] says which.
+    pub fn xhtml_scripts(self) -> impl Iterator<Item = reference::XhtmlScriptOccurrence<'a>> + 'a {
+        let index = self.analysis.xhtml_references.get(&self.facts.resource());
+        self.xhtml()
+            .into_iter()
+            .flat_map(|facts| facts.scripts().iter().enumerate())
+            .map(move |(position, fact)| {
+                let slot = index
+                    .and_then(|index| index.scripts.get(position))
+                    .copied()
+                    .flatten();
+                reference::XhtmlScriptOccurrence::new(fact, slot.and_then(|slot| self.href(slot)))
+            })
+    }
+
+    /// The narration this overlay drives, pairing each passage of text with its audio.
+    ///
+    /// Empty for anything that is not readable SMIL; [`Self::content`] says which.
+    pub fn smil_roots(self) -> impl Iterator<Item = SmilNodeRef<'a>> + 'a {
+        let resource = self.facts.resource();
+        let references = &self.analysis.references;
+        self.content()
+            .value()
+            .and_then(ContentFacts::as_smil)
+            .into_iter()
+            .flat_map(move |facts| {
+                facts
+                    .roots()
+                    .iter()
+                    .filter_map(move |node| SmilNodeRef::new(resource, *node, facts, references))
+            })
+    }
+
+    fn xhtml(self) -> Option<&'a XhtmlFacts> {
+        self.content().value().and_then(ContentFacts::as_xhtml)
+    }
+
+    fn href(self, slot: reference::ReferenceSlot) -> Option<&'a HrefReference> {
+        match self.analysis.references.get(slot.index()) {
+            Some(AuthoredReference::Href(reference))
+                if reference.source() == self.facts.resource() =>
+            {
+                Some(reference)
+            }
+            _ => None,
+        }
+    }
+
+    fn reference_index(self) -> &'a ReferenceIndex {
+        &self.analysis.resource_references[self.facts.resource().index()]
+    }
+}
+
+/// One manifest declaration, and the `fallback` and `media-overlay` links around it.
+#[derive(Debug, Clone, Copy)]
+pub struct DeclarationAnalysisRef<'a> {
+    analysis: &'a PublicationAnalysis,
+    declaration: ManifestDeclarationRef<'a>,
+}
+
+impl<'a> DeclarationAnalysisRef<'a> {
+    /// The declaration this describes.
+    pub fn declaration(self) -> ManifestDeclarationRef<'a> {
+        self.declaration
+    }
+
+    /// The analysis of the file this declaration points at, when its href resolves.
+    pub fn resource(self) -> Option<ResourceAnalysisRef<'a>> {
+        let resource = self.declaration.resource()?;
+        Some(self.analysis.resource_analysis(resource.ordinal()))
+    }
+
+    /// The `fallback` and `media-overlay` links this declaration writes.
+    pub fn references(self) -> impl Iterator<Item = &'a ManifestReference> + 'a {
+        self.manifest_references(&self.reference_index().from)
+    }
+
+    /// Iterates manifest relationships that resolve to this declaration.
+    ///
+    /// Missing and ambiguous ID references do not match a declaration.
+    pub fn incoming_references(self) -> impl Iterator<Item = &'a ManifestReference> + 'a {
+        self.manifest_references(&self.reference_index().to)
+    }
+
+    fn manifest_references(
+        self,
+        slots: &'a [usize],
+    ) -> impl Iterator<Item = &'a ManifestReference> + 'a {
+        self.analysis
+            .references_at(slots)
+            .filter_map(|reference| match reference {
+                AuthoredReference::Manifest(reference) => Some(reference),
+                AuthoredReference::Href(_) => None,
+            })
+    }
+
+    fn reference_index(self) -> &'a ReferenceIndex {
+        &self.analysis.declaration_references[self.declaration.ordinal().index()]
     }
 }

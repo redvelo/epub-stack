@@ -10,10 +10,10 @@ pub struct EpubStringEmpty;
 
 /// Non-empty EPUB text with surrounding whitespace removed.
 ///
-/// Every constructor trims leading and trailing Unicode whitespace using [`str::trim`] and stores
-/// the trimmed value. Interior whitespace is unchanged. This is whitespace handling, not
-/// language-tag, identifier, URI, case, or Unicode normalization.
+/// Constructors use [`str::trim`]; interior whitespace, case, and Unicode representation are unchanged.
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize), serde(transparent))]
+#[cfg_attr(feature = "specta", derive(specta::Type), specta(transparent))]
 pub struct EpubString(String);
 
 impl EpubString {
@@ -122,4 +122,15 @@ impl FromStr for EpubString {
 
 pub(crate) fn optional_epub_string(value: Option<String>) -> Option<EpubString> {
     value.and_then(EpubString::new)
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for EpubString {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).ok_or_else(|| serde::de::Error::custom("EPUB string is empty"))
+    }
 }

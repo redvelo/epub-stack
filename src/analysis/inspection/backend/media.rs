@@ -1,5 +1,5 @@
-use super::{AnalysisIssue, InspectionKind, MediaContainer};
-use crate::analysis::inspection::{Media, MediaDuration, MediaTrack, MediaTrackKind};
+use super::{AnalysisIssue, InspectionData, MediaContainer};
+use crate::analysis::inspection::{Media, MediaDuration, MediaTrack, MediaTrackRole};
 use std::io::Cursor;
 use symphonia::core::codecs::CodecParameters;
 use symphonia::core::codecs::audio::{AudioCodecId, well_known as audio_codecs};
@@ -18,8 +18,7 @@ pub(super) fn inspect(
     bytes: &[u8],
     container: MediaContainer,
     complete: bool,
-) -> (InspectionKind, Option<AnalysisIssue>) {
-    let name = media_container_name(container);
+) -> (InspectionData, Option<AnalysisIssue>) {
     // A non-seekable MP3 source prevents Symphonia from estimating duration from file size.
     let source: Box<dyn MediaSource + '_> = if complete && container != MediaContainer::Mp3 {
         Box::new(Cursor::new(bytes))
@@ -41,14 +40,14 @@ pub(super) fn inspect(
         Ok(format) => format,
         Err(error) => {
             return (
-                InspectionKind::Media(Media::new(name.to_string(), None, Vec::new())),
+                InspectionData::Media(Media::new(container, None, Vec::new())),
                 Some(symphonia_issue(error)),
             );
         }
     };
     if format.format_info().format != expected_format_id(container) {
         return (
-            InspectionKind::Media(Media::new(name.to_string(), None, Vec::new())),
+            InspectionData::Media(Media::new(container, None, Vec::new())),
             Some(AnalysisIssue::Malformed),
         );
     }
@@ -63,7 +62,7 @@ pub(super) fn inspect(
         .map(|track| inspect_symphonia_track(track, duration_is_reliable))
         .collect();
     (
-        InspectionKind::Media(Media::new(name.to_string(), duration, tracks)),
+        InspectionData::Media(Media::new(container, duration, tracks)),
         None,
     )
 }
@@ -94,10 +93,10 @@ fn inspect_symphonia_track(track: &Track, duration_is_reliable: bool) -> MediaTr
         _ => (None, None, None, None, None),
     };
     let kind = match track.track_type() {
-        Some(TrackType::Audio) => MediaTrackKind::Audio,
-        Some(TrackType::Video) => MediaTrackKind::Video,
-        Some(TrackType::Subtitle) => MediaTrackKind::Subtitle,
-        Some(_) | None => MediaTrackKind::Unknown,
+        Some(TrackType::Audio) => MediaTrackRole::Audio,
+        Some(TrackType::Video) => MediaTrackRole::Video,
+        Some(TrackType::Subtitle) => MediaTrackRole::Subtitle,
+        Some(_) | None => MediaTrackRole::Unknown,
     };
     MediaTrack::new(
         kind,
@@ -146,12 +145,9 @@ fn symphonia_issue(error: SymphoniaError) -> AnalysisIssue {
             AnalysisIssue::Malformed
         }
         SymphoniaError::Unsupported(_) => AnalysisIssue::Unsupported,
-        SymphoniaError::SeekError(_) => AnalysisIssue::RandomAccessUnavailable,
+        SymphoniaError::SeekError(_) => AnalysisIssue::Unsupported,
         SymphoniaError::IoError(_) | SymphoniaError::DecodeError(_) => AnalysisIssue::Malformed,
-        SymphoniaError::LimitError(_) | SymphoniaError::ResetRequired => {
-            AnalysisIssue::ParserFailure
-        }
-        _ => AnalysisIssue::ParserFailure,
+        _ => AnalysisIssue::Malformed,
     }
 }
 
@@ -174,16 +170,6 @@ fn expected_format_id(container: MediaContainer) -> FormatId {
         MediaContainer::Ogg => FORMAT_ID_OGG,
         MediaContainer::Mp4 => FORMAT_ID_ISOMP4,
         MediaContainer::WebM => FORMAT_ID_MKV,
-    }
-}
-
-fn media_container_name(container: MediaContainer) -> &'static str {
-    match container {
-        MediaContainer::Mp3 => "mp3",
-        MediaContainer::AacAdts => "adts",
-        MediaContainer::Ogg => "ogg",
-        MediaContainer::Mp4 => "mp4",
-        MediaContainer::WebM => "webm",
     }
 }
 
@@ -273,20 +259,20 @@ mod tests {
                 MediaContainer::Mp4,
                 "opus",
                 48_000,
-                None,
+                Some(1),
                 DurationExpectation::Exact(300),
             ),
         ];
 
         for (bytes, container, codec, sample_rate, channels, duration) in cases {
-            let (kind, issue) = inspect(bytes, *container, true);
+            let (data, issue) = inspect(bytes, *container, true);
             assert_eq!(issue, None, "{container:?}");
-            let InspectionKind::Media(media) = kind else {
+            let InspectionData::Media(media) = data else {
                 panic!("expected media inspection")
             };
             assert_eq!(media.tracks().len(), 1, "{container:?}");
             let track = &media.tracks()[0];
-            assert_eq!(track.kind(), MediaTrackKind::Audio);
+            assert_eq!(track.role(), MediaTrackRole::Audio);
             assert_eq!(track.codec(), Some(*codec));
             assert_eq!(track.sample_rate(), Some(*sample_rate));
             assert_eq!(track.channels(), *channels);
@@ -325,21 +311,21 @@ mod tests {
         ];
 
         for (bytes, container, video_codec, audio_codec) in cases {
-            let (kind, issue) = inspect(bytes, *container, true);
+            let (data, issue) = inspect(bytes, *container, true);
             assert_eq!(issue, None, "{container:?}");
-            let InspectionKind::Media(media) = kind else {
+            let InspectionData::Media(media) = data else {
                 panic!("expected media inspection")
             };
             assert_eq!(media.tracks().len(), 2, "{container:?}");
             let video = media
                 .tracks()
                 .iter()
-                .find(|track| track.kind() == MediaTrackKind::Video)
+                .find(|track| track.role() == MediaTrackRole::Video)
                 .expect("video track");
             let audio = media
                 .tracks()
                 .iter()
-                .find(|track| track.kind() == MediaTrackKind::Audio)
+                .find(|track| track.role() == MediaTrackRole::Audio)
                 .expect("audio track");
             assert_eq!(video.codec(), Some(*video_codec));
             assert_eq!((video.width(), video.height()), (Some(32), Some(24)));
@@ -362,9 +348,9 @@ mod tests {
             ),
         ];
         for (bytes, codec) in cases {
-            let (kind, issue) = inspect(bytes, MediaContainer::WebM, true);
+            let (data, issue) = inspect(bytes, MediaContainer::WebM, true);
             assert_eq!(issue, None, "{codec}");
-            let InspectionKind::Media(media) = kind else {
+            let InspectionData::Media(media) = data else {
                 panic!("expected media inspection")
             };
             assert_eq!(media.tracks().len(), 1);
@@ -378,12 +364,12 @@ mod tests {
     fn symphonia_rejects_a_different_probed_container() {
         let mut bytes = vec![b'x'; 32];
         bytes.extend_from_slice(include_bytes!("../../../tests/fixtures/media-opus.ogg"));
-        let (kind, issue) = inspect(&bytes, MediaContainer::Mp4, true);
+        let (data, issue) = inspect(&bytes, MediaContainer::Mp4, true);
         assert_eq!(issue, Some(AnalysisIssue::Malformed));
-        let InspectionKind::Media(media) = kind else {
+        let InspectionData::Media(media) = data else {
             panic!("expected media inspection")
         };
-        assert_eq!(media.container(), "mp4");
+        assert_eq!(media.container(), MediaContainer::Mp4);
         assert!(media.tracks().is_empty());
     }
 

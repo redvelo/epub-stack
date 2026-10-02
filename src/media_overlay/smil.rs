@@ -1,19 +1,18 @@
 use crate::analysis::reference::HrefRole;
 use crate::media_overlay::{SmilFacts, SmilNodeFact, SmilNodeId, SmilTime};
-use crate::resource::{AuthoredHref, EpubHref, ParsedHref, parse_href};
+use crate::resource::{AuthoredHref, EpubHref};
+#[cfg(test)]
+use crate::resource::{ParsedHref, parse_href};
 use crate::semantics::TextDirection;
 use crate::string::{EpubString, optional_epub_string};
 use crate::xml::{
-    XmlAttrs, XmlUtf8Reader, cdata_content, local_name, normalize_optional, push_general_ref,
-    text_content,
+    XmlUtf8Reader, cdata_content, local_name, normalize_optional, push_general_ref, text_content,
 };
 use quick_xml::Writer;
-use quick_xml::escape::escape;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, Event};
 use quick_xml::name::ResolveResult;
 use quick_xml::reader::NsReader;
 use std::io::{BufRead, BufReader};
-use std::str::FromStr;
 
 const SMIL: &str = "smil";
 const HEAD: &str = "head";
@@ -147,10 +146,6 @@ impl SmilParseLimits {
             max_nesting,
         }
     }
-
-    const fn unbounded() -> Self {
-        Self::new(usize::MAX, usize::MAX)
-    }
 }
 
 impl Default for SmilParseLimits {
@@ -199,8 +194,6 @@ impl SmilDocument {
     }
 
     /// Parses a standalone document while preserving modeled authored states.
-    ///
-    /// Parsing accepts at most 100,000 XML nodes and 256 nested elements.
     pub fn parse(xml: &str) -> Result<Self> {
         parse_smil(xml.as_bytes())
     }
@@ -211,21 +204,21 @@ impl SmilDocument {
     }
 
     /// Serializes the modeled document as normalized, indented UTF-8 XML.
-    pub fn to_string(&self) -> Result<String> {
+    pub fn to_xml(&self) -> Result<String> {
         let mut writer = Writer::new_with_indent(Vec::new(), b' ', 4);
         writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
 
         let mut smil = BytesStart::new(SMIL);
-        push_escaped_attribute(&mut smil, "xmlns", SMIL_NS);
-        push_escaped_attribute(&mut smil, "xmlns:epub", EPUB_NS);
+        smil.push_attribute(("xmlns", SMIL_NS));
+        smil.push_attribute(("xmlns:epub", EPUB_NS));
         if let Some(version) = self.version.as_deref() {
-            push_escaped_attribute(&mut smil, VERSION, version);
+            smil.push_attribute((VERSION, version));
         }
         if let Some(lang) = self.xml_lang.as_deref() {
-            push_escaped_attribute(&mut smil, "xml:lang", lang);
+            smil.push_attribute(("xml:lang", lang));
         }
         if let Some(id) = self.id.as_deref() {
-            push_escaped_attribute(&mut smil, ID, id);
+            smil.push_attribute((ID, id));
         }
         writer.write_event(Event::Start(smil))?;
 
@@ -450,17 +443,24 @@ impl SmilSeq {
     pub fn authored_textref(&self) -> Option<&AuthoredHref> {
         self.authored_textref.as_ref()
     }
+}
 
-    /// Parses the authored `epub:textref` value on demand.
-    pub fn parsed_textref(&self) -> Option<ParsedHref> {
-        self.authored_textref.clone().map(parse_href)
-    }
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
+/// The authored order of a parallel's text and audio children.
+pub enum SmilParOrder {
+    /// `text` precedes `audio`, or only one child was authored.
+    #[default]
+    TextFirst,
+    /// `audio` precedes `text`.
+    AudioFirst,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 /// A parallel SMIL timing container with at most one text and one audio child.
 pub struct SmilPar {
-    children: Vec<SmilParallelChild>,
+    text: Option<SmilText>,
+    audio: Option<SmilAudio>,
+    order: SmilParOrder,
     epub_type: Option<EpubString>,
     id: Option<EpubString>,
     class: Option<EpubString>,
@@ -475,16 +475,17 @@ impl SmilPar {
     pub fn new(
         text: SmilText,
         audio: Option<SmilAudio>,
+        #[builder(default)] order: SmilParOrder,
         epub_type: Option<EpubString>,
         id: Option<EpubString>,
         class: Option<EpubString>,
         custom_test: Option<EpubString>,
         textref: Option<EpubHref>,
     ) -> Self {
-        let mut children = vec![SmilParallelChild::Text(text)];
-        children.extend(audio.map(SmilParallelChild::Audio));
         Self {
-            children,
+            text: Some(text),
+            audio,
+            order,
             epub_type,
             id,
             class,
@@ -493,25 +494,19 @@ impl SmilPar {
         }
     }
 
-    /// Returns text and audio children in document order.
-    pub fn children(&self) -> &[SmilParallelChild] {
-        &self.children
-    }
-
-    /// Returns the first text child.
+    /// Returns the text child, when one was authored.
     pub fn text(&self) -> Option<&SmilText> {
-        self.children.iter().find_map(|child| match child {
-            SmilParallelChild::Text(text) => Some(text),
-            SmilParallelChild::Audio(_) => None,
-        })
+        self.text.as_ref()
     }
 
-    /// Returns the first audio child.
+    /// Returns the audio child, when one was authored.
     pub fn audio(&self) -> Option<&SmilAudio> {
-        self.children.iter().find_map(|child| match child {
-            SmilParallelChild::Audio(audio) => Some(audio),
-            SmilParallelChild::Text(_) => None,
-        })
+        self.audio.as_ref()
+    }
+
+    /// Returns the authored order of the text and audio children.
+    pub fn order(&self) -> SmilParOrder {
+        self.order
     }
 
     /// Returns the optional `epub:type` value.
@@ -538,20 +533,6 @@ impl SmilPar {
     pub fn authored_textref(&self) -> Option<&AuthoredHref> {
         self.authored_textref.as_ref()
     }
-
-    /// Parses the authored `epub:textref` value on demand.
-    pub fn parsed_textref(&self) -> Option<ParsedHref> {
-        self.authored_textref.clone().map(parse_href)
-    }
-}
-
-#[derive(Debug, PartialEq, Eq, Clone)]
-/// A text or audio child retained in authored order within a parsed parallel.
-pub enum SmilParallelChild {
-    /// The parallel's text target.
-    Text(SmilText),
-    /// The parallel's audio target.
-    Audio(SmilAudio),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -586,11 +567,6 @@ impl SmilText {
         self.authored_src.as_ref()
     }
 
-    /// Parses the authored text source on demand.
-    pub fn parsed_src(&self) -> Option<ParsedHref> {
-        self.authored_src.clone().map(parse_href)
-    }
-
     /// Returns the optional element ID.
     pub fn id(&self) -> Option<&EpubString> {
         self.id.as_ref()
@@ -611,8 +587,8 @@ impl SmilText {
 /// A SMIL audio target and its lexical clip clocks.
 pub struct SmilAudio {
     authored_src: Option<AuthoredHref>,
-    clip_begin: Option<String>,
-    clip_end: Option<String>,
+    clip_begin: Option<SmilTime>,
+    clip_end: Option<SmilTime>,
     id: Option<EpubString>,
     epub_type: Option<EpubString>,
 }
@@ -631,14 +607,16 @@ impl SmilAudio {
         let clip_begin = normalized_clock(CLIP_BEGIN, clip_begin)?;
         let clip_end = normalized_clock(CLIP_END, clip_end)?;
         if let (Some(begin), Some(end)) = (&clip_begin, &clip_end) {
-            let begin_time = crate::media_overlay::parse_media_time(begin)
+            let begin_time = begin
+                .parsed()
                 .expect("normalized clipBegin is a recognized clock");
-            let end_time = crate::media_overlay::parse_media_time(end)
+            let end_time = end
+                .parsed()
                 .expect("normalized clipEnd is a recognized clock");
             if begin_time.milliseconds() >= end_time.milliseconds() {
                 return Err(SmilError::InvalidClipRange {
-                    begin: begin.clone(),
-                    end: end.clone(),
+                    begin: begin.authored().to_string(),
+                    end: end.authored().to_string(),
                 });
             }
         }
@@ -656,19 +634,14 @@ impl SmilAudio {
         self.authored_src.as_ref()
     }
 
-    /// Parses the authored audio source on demand.
-    pub fn parsed_src(&self) -> Option<ParsedHref> {
-        self.authored_src.clone().map(parse_href)
+    /// Returns the normalized clip start.
+    pub fn clip_begin(&self) -> Option<&SmilTime> {
+        self.clip_begin.as_ref()
     }
 
-    /// Returns the normalized lexical clip start.
-    pub fn clip_begin(&self) -> Option<&str> {
-        self.clip_begin.as_deref()
-    }
-
-    /// Returns the normalized lexical clip end.
-    pub fn clip_end(&self) -> Option<&str> {
-        self.clip_end.as_deref()
+    /// Returns the normalized clip end.
+    pub fn clip_end(&self) -> Option<&SmilTime> {
+        self.clip_end.as_ref()
     }
 
     /// Returns the optional element ID.
@@ -682,23 +655,21 @@ impl SmilAudio {
     }
 }
 
-fn normalized_clock(attribute: &'static str, value: Option<String>) -> Result<Option<String>> {
+fn normalized_clock(attribute: &'static str, value: Option<String>) -> Result<Option<SmilTime>> {
     value
         .map(|value| {
-            let normalized = value.trim();
-            crate::media_overlay::parse_media_time(normalized).ok_or_else(|| {
-                SmilError::InvalidClock {
-                    attribute,
-                    value: value.clone(),
-                }
-            })?;
-            Ok(normalized.to_string())
+            let time = SmilTime::new(value.trim());
+            if time.parsed().is_none() {
+                return Err(SmilError::InvalidClock { attribute, value });
+            }
+            Ok(time)
         })
         .transpose()
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 /// A sequence or parallel timing child.
+#[allow(clippy::large_enum_variant)]
 pub enum SmilSequenceChild {
     /// A nested sequential timing container.
     Seq(SmilSeq),
@@ -779,13 +750,13 @@ impl<R: BufRead> SmilParser<R> {
         loop {
             match self.read_event_into(&mut buf)? {
                 Event::Start(event) => {
-                    if self.is_smil_element(&event, HEAD.as_bytes()) {
+                    if self.is_smil_element(&event, HEAD) {
                         if head_seen {
                             return Err(SmilError::DuplicateHead);
                         }
                         head_seen = true;
                         smil.head = self.parse_head_block()?;
-                    } else if self.is_smil_element(&event, BODY.as_bytes()) {
+                    } else if self.is_smil_element(&event, BODY) {
                         if body_seen {
                             return Err(SmilError::DuplicateBody);
                         }
@@ -796,20 +767,20 @@ impl<R: BufRead> SmilParser<R> {
                     }
                 }
                 Event::Empty(event) => {
-                    if self.is_smil_element(&event, HEAD.as_bytes()) {
+                    if self.is_smil_element(&event, HEAD) {
                         if head_seen {
                             return Err(SmilError::DuplicateHead);
                         }
                         head_seen = true;
-                    } else if self.is_smil_element(&event, BODY.as_bytes()) {
+                    } else if self.is_smil_element(&event, BODY) {
                         if body_seen {
                             return Err(SmilError::DuplicateBody);
                         }
                         body_seen = true;
                     }
                 }
-                Event::End(event) if self.is_smil_end(&event, SMIL.as_bytes()) => break,
-                Event::Eof => return Err(unexpected_eof(SMIL.as_bytes())),
+                Event::End(event) if self.is_smil_end(&event, SMIL) => break,
+                Event::Eof => return Err(unexpected_eof(SMIL)),
                 _ => {}
             }
             buf.clear();
@@ -822,7 +793,7 @@ impl<R: BufRead> SmilParser<R> {
         loop {
             match self.reader.read_event_into(&mut buf)? {
                 Event::Eof => return Ok(()),
-                Event::Text(text) if text.iter().all(u8::is_ascii_whitespace) => {}
+                Event::Text(text) if text.trim_ascii().is_empty() => {}
                 Event::Comment(_) | Event::PI(_) => {}
                 _ => return Err(SmilError::TrailingContent),
             }
@@ -881,8 +852,8 @@ impl<R: BufRead> SmilParser<R> {
         Ok(event)
     }
 
-    fn skip_element(&mut self, end: &[u8]) -> Result<()> {
-        let end = end.to_vec();
+    fn skip_element(&mut self, end: &str) -> Result<()> {
+        let end = end.to_string();
         let mut depth = 1usize;
         let mut buf = Vec::new();
         loop {
@@ -903,15 +874,13 @@ impl<R: BufRead> SmilParser<R> {
     }
 
     fn validate_root(&mut self, event: &BytesStart<'_>) -> Result<()> {
-        let found = String::from_utf8_lossy(local_name(event.name().as_ref())).into_owned();
+        let found = local_name(event.name().as_ref()).to_string();
         if found != SMIL {
             return Err(SmilError::WrongRoot { found });
         }
         let (resolved, _) = self.reader.resolver().resolve_element(event.name());
         let namespace = match resolved {
-            ResolveResult::Bound(value) => {
-                Some(String::from_utf8_lossy(value.as_ref()).into_owned())
-            }
+            ResolveResult::Bound(value) => Some(value.as_ref().to_string()),
             ResolveResult::Unbound | ResolveResult::Unknown(_) => None,
         };
         if namespace.as_deref() != Some(SMIL_NS) {
@@ -923,29 +892,23 @@ impl<R: BufRead> SmilParser<R> {
         Ok(())
     }
 
-    fn attrs(&mut self, event: &BytesStart<'_>) -> XmlAttrs {
-        let attrs = XmlAttrs::from_event(event);
-        let _ = attrs.invalid;
-        attrs
-    }
-
-    fn is_smil_element(&self, event: &BytesStart<'_>, name: &[u8]) -> bool {
+    fn is_smil_element(&self, event: &BytesStart<'_>, name: &str) -> bool {
         let (resolved, local) = self.reader.resolver().resolve_element(event.name());
-        matches!(resolved, ResolveResult::Bound(value) if value.as_ref() == SMIL_NS.as_bytes())
+        matches!(resolved, ResolveResult::Bound(value) if value.as_ref() == SMIL_NS)
             && local.as_ref() == name
     }
 
-    fn is_smil_end(&self, event: &BytesEnd<'_>, name: &[u8]) -> bool {
+    fn is_smil_end(&self, event: &BytesEnd<'_>, name: &str) -> bool {
         let (resolved, local) = self.reader.resolver().resolve_element(event.name());
-        matches!(resolved, ResolveResult::Bound(value) if value.as_ref() == SMIL_NS.as_bytes())
+        matches!(resolved, ResolveResult::Bound(value) if value.as_ref() == SMIL_NS)
             && local.as_ref() == name
     }
 
     fn attr_value(
         &self,
         event: &BytesStart<'_>,
-        namespace: Option<&[u8]>,
-        name: &[u8],
+        namespace: Option<&str>,
+        name: &str,
     ) -> Option<String> {
         event
             .attributes()
@@ -960,8 +923,7 @@ impl<R: BufRead> SmilParser<R> {
                 (namespace_matches && local.as_ref() == name)
                     .then(|| match attr.normalized_value(quick_xml::XmlVersion::default()) {
                         Ok(value) => Some(value.to_string()),
-                        Err(_) => String::from_utf8(attr.value.into_owned())
-                            .ok()
+                        Err(_) => Some(attr.value.into_owned())
                             .filter(|value| {
                                 value.contains("&#0;")
                                     || value.contains("&#x0;")
@@ -975,8 +937,8 @@ impl<R: BufRead> SmilParser<R> {
     fn attr_value_trimmed(
         &self,
         event: &BytesStart<'_>,
-        namespace: Option<&[u8]>,
-        name: &[u8],
+        namespace: Option<&str>,
+        name: &str,
     ) -> Option<String> {
         normalize_optional(self.attr_value(event, namespace, name))
     }
@@ -991,15 +953,9 @@ impl<R: BufRead> SmilParser<R> {
     }
 
     fn parse_smil_attrs(&mut self, event: &BytesStart<'_>, smil: &mut SmilDocument) {
-        self.attrs(event);
-        smil.version =
-            optional_epub_string(self.attr_value_trimmed(event, None, VERSION.as_bytes()));
-        smil.xml_lang = optional_epub_string(self.attr_value_trimmed(
-            event,
-            Some(XML_NS.as_bytes()),
-            LANG.as_bytes(),
-        ));
-        smil.id = optional_epub_string(self.attr_value_trimmed(event, None, ID.as_bytes()));
+        smil.version = optional_epub_string(self.attr_value_trimmed(event, None, VERSION));
+        smil.xml_lang = optional_epub_string(self.attr_value_trimmed(event, Some(XML_NS), LANG));
+        smil.id = optional_epub_string(self.attr_value_trimmed(event, None, ID));
     }
 
     fn parse_head_block(&mut self) -> Result<SmilHead> {
@@ -1008,21 +964,21 @@ impl<R: BufRead> SmilParser<R> {
         loop {
             match self.read_event_into(&mut buf)? {
                 Event::Start(event) => {
-                    if self.is_smil_element(&event, METADATA.as_bytes()) {
+                    if self.is_smil_element(&event, METADATA) {
                         head.metadata.extend(self.parse_metadata_block()?);
-                    } else if self.is_smil_element(&event, META.as_bytes()) {
+                    } else if self.is_smil_element(&event, META) {
                         head.metadata.push(self.parse_meta_element(&event)?);
                     } else {
                         self.skip_element(event.name().as_ref())?;
                     }
                 }
                 Event::Empty(event) => {
-                    if self.is_smil_element(&event, META.as_bytes()) {
+                    if self.is_smil_element(&event, META) {
                         head.metadata.push(self.parse_meta_empty(&event))
                     }
                 }
-                Event::End(event) if self.is_smil_end(&event, HEAD.as_bytes()) => break,
-                Event::Eof => return Err(unexpected_eof(HEAD.as_bytes())),
+                Event::End(event) if self.is_smil_end(&event, HEAD) => break,
+                Event::Eof => return Err(unexpected_eof(HEAD)),
                 _ => {}
             }
             buf.clear();
@@ -1036,19 +992,19 @@ impl<R: BufRead> SmilParser<R> {
         loop {
             match self.read_event_into(&mut buf)? {
                 Event::Start(event) => {
-                    if self.is_smil_element(&event, META.as_bytes()) {
+                    if self.is_smil_element(&event, META) {
                         metadata.push(self.parse_meta_element(&event)?);
                     } else {
                         self.skip_element(event.name().as_ref())?;
                     }
                 }
-                Event::Empty(event) if self.is_smil_element(&event, META.as_bytes()) => {
+                Event::Empty(event) if self.is_smil_element(&event, META) => {
                     metadata.push(self.parse_meta_empty(&event))
                 }
-                Event::End(event) if self.is_smil_end(&event, METADATA.as_bytes()) => {
+                Event::End(event) if self.is_smil_end(&event, METADATA) => {
                     break;
                 }
-                Event::Eof => return Err(unexpected_eof(METADATA.as_bytes())),
+                Event::Eof => return Err(unexpected_eof(METADATA)),
                 _ => {}
             }
             buf.clear();
@@ -1058,7 +1014,7 @@ impl<R: BufRead> SmilParser<R> {
 
     fn parse_meta_element(&mut self, event: &BytesStart<'_>) -> Result<SmilMeta> {
         let mut meta = self.parse_meta_empty(event);
-        let content = self.read_text_content(META.as_bytes())?;
+        let content = self.read_text_content(META)?;
         if meta.content.is_none() {
             meta.content = optional_epub_string(normalize_optional(Some(content)));
         }
@@ -1066,20 +1022,15 @@ impl<R: BufRead> SmilParser<R> {
     }
 
     fn parse_meta_empty(&mut self, event: &BytesStart<'_>) -> SmilMeta {
-        self.attrs(event);
         SmilMeta {
-            name: optional_epub_string(self.attr_value_trimmed(event, None, NAME.as_bytes())),
-            content: optional_epub_string(self.attr_value_trimmed(event, None, CONTENT.as_bytes())),
-            scheme: optional_epub_string(self.attr_value_trimmed(event, None, SCHEME.as_bytes())),
-            xml_lang: optional_epub_string(self.attr_value_trimmed(
-                event,
-                Some(XML_NS.as_bytes()),
-                LANG.as_bytes(),
-            )),
+            name: optional_epub_string(self.attr_value_trimmed(event, None, NAME)),
+            content: optional_epub_string(self.attr_value_trimmed(event, None, CONTENT)),
+            scheme: optional_epub_string(self.attr_value_trimmed(event, None, SCHEME)),
+            xml_lang: optional_epub_string(self.attr_value_trimmed(event, Some(XML_NS), LANG)),
             dir: self
-                .attr_value_trimmed(event, None, DIR.as_bytes())
-                .and_then(|value| TextDirection::from_str(&value).ok()),
-            id: optional_epub_string(self.attr_value_trimmed(event, None, ID.as_bytes())),
+                .attr_value_trimmed(event, None, DIR)
+                .and_then(|value| TextDirection::from_token(&value)),
+            id: optional_epub_string(self.attr_value_trimmed(event, None, ID)),
         }
     }
 
@@ -1090,9 +1041,9 @@ impl<R: BufRead> SmilParser<R> {
         loop {
             match self.read_event_into(&mut buf)? {
                 Event::Start(event) => {
-                    if self.is_smil_element(&event, SEQ.as_bytes()) {
+                    if self.is_smil_element(&event, SEQ) {
                         sequences.push(self.parse_seq_empty(&event));
-                    } else if self.is_smil_element(&event, PAR.as_bytes()) {
+                    } else if self.is_smil_element(&event, PAR) {
                         let child = SmilSequenceChild::Par(self.parse_par(&event)?);
                         append_sequence_child(&mut body.children, &mut sequences, child);
                     } else {
@@ -1100,31 +1051,29 @@ impl<R: BufRead> SmilParser<R> {
                     }
                 }
                 Event::Empty(event) => {
-                    if self.is_smil_element(&event, SEQ.as_bytes()) {
+                    if self.is_smil_element(&event, SEQ) {
                         let child = SmilSequenceChild::Seq(self.parse_seq_empty(&event));
                         append_sequence_child(&mut body.children, &mut sequences, child);
-                    } else if self.is_smil_element(&event, PAR.as_bytes()) {
+                    } else if self.is_smil_element(&event, PAR) {
                         let child = SmilSequenceChild::Par(self.parse_par_empty(&event));
                         append_sequence_child(&mut body.children, &mut sequences, child);
                     }
                 }
-                Event::End(event) if self.is_smil_end(&event, SEQ.as_bytes()) => {
-                    let sequence = sequences
-                        .pop()
-                        .ok_or_else(|| unexpected_eof(SEQ.as_bytes()))?;
+                Event::End(event) if self.is_smil_end(&event, SEQ) => {
+                    let sequence = sequences.pop().ok_or_else(|| unexpected_eof(SEQ))?;
                     append_sequence_child(
                         &mut body.children,
                         &mut sequences,
                         SmilSequenceChild::Seq(sequence),
                     );
                 }
-                Event::End(event) if self.is_smil_end(&event, BODY.as_bytes()) => {
+                Event::End(event) if self.is_smil_end(&event, BODY) => {
                     if !sequences.is_empty() {
-                        return Err(unexpected_eof(SEQ.as_bytes()));
+                        return Err(unexpected_eof(SEQ));
                     }
                     break;
                 }
-                Event::Eof => return Err(unexpected_eof(BODY.as_bytes())),
+                Event::Eof => return Err(unexpected_eof(BODY)),
                 _ => {}
             }
             buf.clear();
@@ -1133,24 +1082,15 @@ impl<R: BufRead> SmilParser<R> {
     }
 
     fn parse_seq_empty(&mut self, event: &BytesStart<'_>) -> SmilSeq {
-        self.attrs(event);
         let authored_textref = self
-            .attr_value(event, Some(EPUB_NS.as_bytes()), TEXTREF.as_bytes())
+            .attr_value(event, Some(EPUB_NS), TEXTREF)
             .map(AuthoredHref::new);
         SmilSeq {
             children: Vec::new(),
-            epub_type: optional_epub_string(self.attr_value_trimmed(
-                event,
-                Some(EPUB_NS.as_bytes()),
-                TYPE.as_bytes(),
-            )),
-            id: optional_epub_string(self.attr_value_trimmed(event, None, ID.as_bytes())),
-            class: optional_epub_string(self.attr_value_trimmed(event, None, CLASS.as_bytes())),
-            custom_test: optional_epub_string(self.attr_value_trimmed(
-                event,
-                None,
-                CUSTOM_TEST.as_bytes(),
-            )),
+            epub_type: optional_epub_string(self.attr_value_trimmed(event, Some(EPUB_NS), TYPE)),
+            id: optional_epub_string(self.attr_value_trimmed(event, None, ID)),
+            class: optional_epub_string(self.attr_value_trimmed(event, None, CLASS)),
+            custom_test: optional_epub_string(self.attr_value_trimmed(event, None, CUSTOM_TEST)),
             authored_textref,
         }
     }
@@ -1161,41 +1101,43 @@ impl<R: BufRead> SmilParser<R> {
         loop {
             match self.read_event_into(&mut buf)? {
                 Event::Start(event) => {
-                    if self.is_smil_element(&event, TEXT.as_bytes()) {
+                    if self.is_smil_element(&event, TEXT) {
                         if par.text().is_some() {
                             return Err(SmilError::RepeatedText);
                         }
-                        par.children
-                            .push(SmilParallelChild::Text(self.parse_text(&event)));
+                        par.text = Some(self.parse_text(&event));
                         self.skip_element(event.name().as_ref())?;
-                    } else if self.is_smil_element(&event, AUDIO.as_bytes()) {
+                    } else if self.is_smil_element(&event, AUDIO) {
                         if par.audio().is_some() {
                             return Err(SmilError::RepeatedAudio);
                         }
-                        par.children
-                            .push(SmilParallelChild::Audio(self.parse_audio(&event)));
+                        if par.text().is_none() {
+                            par.order = SmilParOrder::AudioFirst;
+                        }
+                        par.audio = Some(self.parse_audio(&event));
                         self.skip_element(event.name().as_ref())?;
                     } else {
                         self.skip_element(event.name().as_ref())?;
                     }
                 }
                 Event::Empty(event) => {
-                    if self.is_smil_element(&event, TEXT.as_bytes()) {
+                    if self.is_smil_element(&event, TEXT) {
                         if par.text().is_some() {
                             return Err(SmilError::RepeatedText);
                         }
-                        par.children
-                            .push(SmilParallelChild::Text(self.parse_text(&event)));
-                    } else if self.is_smil_element(&event, AUDIO.as_bytes()) {
+                        par.text = Some(self.parse_text(&event));
+                    } else if self.is_smil_element(&event, AUDIO) {
                         if par.audio().is_some() {
                             return Err(SmilError::RepeatedAudio);
                         }
-                        par.children
-                            .push(SmilParallelChild::Audio(self.parse_audio(&event)));
+                        if par.text().is_none() {
+                            par.order = SmilParOrder::AudioFirst;
+                        }
+                        par.audio = Some(self.parse_audio(&event));
                     }
                 }
-                Event::End(event) if self.is_smil_end(&event, PAR.as_bytes()) => break,
-                Event::Eof => return Err(unexpected_eof(PAR.as_bytes())),
+                Event::End(event) if self.is_smil_end(&event, PAR) => break,
+                Event::Eof => return Err(unexpected_eof(PAR)),
                 _ => {}
             }
             buf.clear();
@@ -1204,73 +1146,52 @@ impl<R: BufRead> SmilParser<R> {
     }
 
     fn parse_par_empty(&mut self, event: &BytesStart<'_>) -> SmilPar {
-        self.attrs(event);
         let authored_textref = self
-            .attr_value(event, Some(EPUB_NS.as_bytes()), TEXTREF.as_bytes())
+            .attr_value(event, Some(EPUB_NS), TEXTREF)
             .map(AuthoredHref::new);
         SmilPar {
-            children: Vec::new(),
-            epub_type: optional_epub_string(self.attr_value_trimmed(
-                event,
-                Some(EPUB_NS.as_bytes()),
-                TYPE.as_bytes(),
-            )),
-            id: optional_epub_string(self.attr_value_trimmed(event, None, ID.as_bytes())),
-            class: optional_epub_string(self.attr_value_trimmed(event, None, CLASS.as_bytes())),
-            custom_test: optional_epub_string(self.attr_value_trimmed(
-                event,
-                None,
-                CUSTOM_TEST.as_bytes(),
-            )),
+            text: None,
+            audio: None,
+            order: SmilParOrder::TextFirst,
+            epub_type: optional_epub_string(self.attr_value_trimmed(event, Some(EPUB_NS), TYPE)),
+            id: optional_epub_string(self.attr_value_trimmed(event, None, ID)),
+            class: optional_epub_string(self.attr_value_trimmed(event, None, CLASS)),
+            custom_test: optional_epub_string(self.attr_value_trimmed(event, None, CUSTOM_TEST)),
             authored_textref,
         }
     }
 
     fn parse_text(&mut self, event: &BytesStart<'_>) -> SmilText {
-        self.attrs(event);
-        let authored_src = self
-            .attr_value(event, None, SRC.as_bytes())
-            .map(AuthoredHref::new);
+        let authored_src = self.attr_value(event, None, SRC).map(AuthoredHref::new);
         SmilText {
             authored_src,
-            id: optional_epub_string(self.attr_value_trimmed(event, None, ID.as_bytes())),
-            region: optional_epub_string(self.attr_value_trimmed(event, None, REGION.as_bytes())),
-            epub_type: optional_epub_string(self.attr_value_trimmed(
-                event,
-                Some(EPUB_NS.as_bytes()),
-                TYPE.as_bytes(),
-            )),
+            id: optional_epub_string(self.attr_value_trimmed(event, None, ID)),
+            region: optional_epub_string(self.attr_value_trimmed(event, None, REGION)),
+            epub_type: optional_epub_string(self.attr_value_trimmed(event, Some(EPUB_NS), TYPE)),
         }
     }
 
     fn parse_audio(&mut self, event: &BytesStart<'_>) -> SmilAudio {
-        self.attrs(event);
-        let authored_src = self
-            .attr_value(event, None, SRC.as_bytes())
-            .map(AuthoredHref::new);
+        let authored_src = self.attr_value(event, None, SRC).map(AuthoredHref::new);
         SmilAudio {
             authored_src,
-            clip_begin: self.attr_value(event, None, CLIP_BEGIN.as_bytes()),
-            clip_end: self.attr_value(event, None, CLIP_END.as_bytes()),
-            id: optional_epub_string(self.attr_value_trimmed(event, None, ID.as_bytes())),
-            epub_type: optional_epub_string(self.attr_value_trimmed(
-                event,
-                Some(EPUB_NS.as_bytes()),
-                TYPE.as_bytes(),
-            )),
+            clip_begin: self.attr_value(event, None, CLIP_BEGIN).map(SmilTime::new),
+            clip_end: self.attr_value(event, None, CLIP_END).map(SmilTime::new),
+            id: optional_epub_string(self.attr_value_trimmed(event, None, ID)),
+            epub_type: optional_epub_string(self.attr_value_trimmed(event, Some(EPUB_NS), TYPE)),
         }
     }
 
-    fn read_text_content(&mut self, end: &[u8]) -> Result<String> {
+    fn read_text_content(&mut self, end: &str) -> Result<String> {
         let mut buf = Vec::new();
         let mut output = String::new();
         loop {
             match self.read_event_into(&mut buf)? {
                 Event::Text(event) => {
-                    output.push_str(&text_content(&event)?);
+                    output.push_str(&text_content(&event));
                 }
                 Event::CData(event) => {
-                    output.push_str(&cdata_content(&event)?);
+                    output.push_str(&cdata_content(&event));
                 }
                 Event::GeneralRef(reference) => {
                     self.push_general_ref(&mut output, &reference)?;
@@ -1297,14 +1218,10 @@ fn append_sequence_child(
     }
 }
 
-fn unexpected_eof(expected: &[u8]) -> SmilError {
+fn unexpected_eof(expected: &str) -> SmilError {
     SmilError::UnexpectedEof {
-        expected: String::from_utf8_lossy(expected).into_owned(),
+        expected: expected.to_string(),
     }
-}
-
-fn push_escaped_attribute(node: &mut BytesStart<'_>, name: &str, value: &str) {
-    node.push_attribute((name.as_bytes(), escape(value).as_bytes()));
 }
 
 fn write_head(writer: &mut Writer<Vec<u8>>, head: &SmilHead) -> Result<()> {
@@ -1323,22 +1240,22 @@ fn write_head(writer: &mut Writer<Vec<u8>>, head: &SmilHead) -> Result<()> {
 fn write_meta(writer: &mut Writer<Vec<u8>>, meta: &SmilMeta) -> Result<()> {
     let mut node = BytesStart::new(META);
     if let Some(name) = meta.name.as_deref() {
-        push_escaped_attribute(&mut node, NAME, name);
+        node.push_attribute((NAME, name));
     }
     if let Some(content) = meta.content.as_deref() {
-        push_escaped_attribute(&mut node, CONTENT, content);
+        node.push_attribute((CONTENT, content));
     }
     if let Some(scheme) = meta.scheme.as_deref() {
-        push_escaped_attribute(&mut node, SCHEME, scheme);
+        node.push_attribute((SCHEME, scheme));
     }
     if let Some(xml_lang) = meta.xml_lang.as_deref() {
-        push_escaped_attribute(&mut node, "xml:lang", xml_lang);
+        node.push_attribute(("xml:lang", xml_lang));
     }
     if let Some(dir) = meta.dir {
-        push_escaped_attribute(&mut node, DIR, &dir.to_string());
+        node.push_attribute((DIR, dir.to_string().as_str()));
     }
     if let Some(id) = meta.id.as_deref() {
-        push_escaped_attribute(&mut node, ID, id);
+        node.push_attribute((ID, id));
     }
     writer.write_event(Event::Empty(node))?;
     Ok(())
@@ -1363,19 +1280,19 @@ fn write_sequence_child(writer: &mut Writer<Vec<u8>>, child: &SmilSequenceChild)
 fn write_seq(writer: &mut Writer<Vec<u8>>, seq: &SmilSeq) -> Result<()> {
     let mut node = BytesStart::new(SEQ);
     if let Some(id) = seq.id.as_deref() {
-        push_escaped_attribute(&mut node, ID, id);
+        node.push_attribute((ID, id));
     }
     if let Some(epub_type) = seq.epub_type.as_deref() {
-        push_escaped_attribute(&mut node, "epub:type", epub_type);
+        node.push_attribute(("epub:type", epub_type));
     }
     if let Some(class) = seq.class.as_deref() {
-        push_escaped_attribute(&mut node, CLASS, class);
+        node.push_attribute((CLASS, class));
     }
     if let Some(custom_test) = seq.custom_test.as_deref() {
-        push_escaped_attribute(&mut node, CUSTOM_TEST, custom_test);
+        node.push_attribute((CUSTOM_TEST, custom_test));
     }
     if let Some(textref) = seq.authored_textref.as_ref() {
-        push_escaped_attribute(&mut node, "epub:textref", textref.as_str());
+        node.push_attribute(("epub:textref", textref.as_str()));
     }
     writer.write_event(Event::Start(node))?;
     for child in &seq.children {
@@ -1388,25 +1305,37 @@ fn write_seq(writer: &mut Writer<Vec<u8>>, seq: &SmilSeq) -> Result<()> {
 fn write_par(writer: &mut Writer<Vec<u8>>, par: &SmilPar) -> Result<()> {
     let mut node = BytesStart::new(PAR);
     if let Some(id) = par.id.as_deref() {
-        push_escaped_attribute(&mut node, ID, id);
+        node.push_attribute((ID, id));
     }
     if let Some(epub_type) = par.epub_type.as_deref() {
-        push_escaped_attribute(&mut node, "epub:type", epub_type);
+        node.push_attribute(("epub:type", epub_type));
     }
     if let Some(class) = par.class.as_deref() {
-        push_escaped_attribute(&mut node, CLASS, class);
+        node.push_attribute((CLASS, class));
     }
     if let Some(custom_test) = par.custom_test.as_deref() {
-        push_escaped_attribute(&mut node, CUSTOM_TEST, custom_test);
+        node.push_attribute((CUSTOM_TEST, custom_test));
     }
     if let Some(textref) = par.authored_textref.as_ref() {
-        push_escaped_attribute(&mut node, "epub:textref", textref.as_str());
+        node.push_attribute(("epub:textref", textref.as_str()));
     }
     writer.write_event(Event::Start(node))?;
-    for child in &par.children {
-        match child {
-            SmilParallelChild::Text(text) => write_text(writer, text)?,
-            SmilParallelChild::Audio(audio) => write_audio(writer, audio)?,
+    match par.order {
+        SmilParOrder::TextFirst => {
+            if let Some(text) = &par.text {
+                write_text(writer, text)?;
+            }
+            if let Some(audio) = &par.audio {
+                write_audio(writer, audio)?;
+            }
+        }
+        SmilParOrder::AudioFirst => {
+            if let Some(audio) = &par.audio {
+                write_audio(writer, audio)?;
+            }
+            if let Some(text) = &par.text {
+                write_text(writer, text)?;
+            }
         }
     }
     writer.write_event(Event::End(BytesEnd::new(PAR)))?;
@@ -1416,16 +1345,16 @@ fn write_par(writer: &mut Writer<Vec<u8>>, par: &SmilPar) -> Result<()> {
 fn write_text(writer: &mut Writer<Vec<u8>>, text: &SmilText) -> Result<()> {
     let mut node = BytesStart::new(TEXT);
     if let Some(src) = text.authored_src.as_ref() {
-        push_escaped_attribute(&mut node, SRC, src.as_str());
+        node.push_attribute((SRC, src.as_str()));
     }
     if let Some(id) = text.id.as_deref() {
-        push_escaped_attribute(&mut node, ID, id);
+        node.push_attribute((ID, id));
     }
     if let Some(region) = text.region.as_deref() {
-        push_escaped_attribute(&mut node, REGION, region);
+        node.push_attribute((REGION, region));
     }
     if let Some(epub_type) = text.epub_type.as_deref() {
-        push_escaped_attribute(&mut node, "epub:type", epub_type);
+        node.push_attribute(("epub:type", epub_type));
     }
     writer.write_event(Event::Empty(node))?;
     Ok(())
@@ -1434,19 +1363,19 @@ fn write_text(writer: &mut Writer<Vec<u8>>, text: &SmilText) -> Result<()> {
 fn write_audio(writer: &mut Writer<Vec<u8>>, audio: &SmilAudio) -> Result<()> {
     let mut node = BytesStart::new(AUDIO);
     if let Some(src) = audio.authored_src.as_ref() {
-        push_escaped_attribute(&mut node, SRC, src.as_str());
+        node.push_attribute((SRC, src.as_str()));
     }
-    if let Some(clip_begin) = audio.clip_begin.as_deref() {
-        push_escaped_attribute(&mut node, CLIP_BEGIN, clip_begin);
+    if let Some(clip_begin) = audio.clip_begin.as_ref() {
+        node.push_attribute((CLIP_BEGIN, clip_begin.authored()));
     }
-    if let Some(clip_end) = audio.clip_end.as_deref() {
-        push_escaped_attribute(&mut node, CLIP_END, clip_end);
+    if let Some(clip_end) = audio.clip_end.as_ref() {
+        node.push_attribute((CLIP_END, clip_end.authored()));
     }
     if let Some(id) = audio.id.as_deref() {
-        push_escaped_attribute(&mut node, ID, id);
+        node.push_attribute((ID, id));
     }
     if let Some(epub_type) = audio.epub_type.as_deref() {
-        push_escaped_attribute(&mut node, "epub:type", epub_type);
+        node.push_attribute(("epub:type", epub_type));
     }
     writer.write_event(Event::Empty(node))?;
     Ok(())
@@ -1467,14 +1396,16 @@ pub(crate) struct SmilPendingReference {
     pub(crate) attribute: &'static str,
 }
 
-pub(crate) fn extract_smil_facts_from_reader<R: BufRead>(input: R) -> Result<SmilExtraction> {
-    parse_smil_with_limits(input, SmilParseLimits::unbounded())
-        .map(SmilDocument::into_analysis_parts)
+pub(crate) fn extract_smil_facts_from_reader<R: BufRead>(
+    input: R,
+    limits: SmilParseLimits,
+) -> Result<SmilExtraction> {
+    parse_smil_with_limits(input, limits).map(SmilDocument::into_analysis_parts)
 }
 
 #[cfg(test)]
 fn extract_smil_facts(xml: &str) -> Result<SmilExtraction> {
-    extract_smil_facts_from_reader(xml.as_bytes())
+    extract_smil_facts_from_reader(xml.as_bytes(), SmilParseLimits::default())
 }
 
 impl SmilDocument {
@@ -1553,35 +1484,63 @@ impl SmilProjection {
                         PAR,
                         "epub:textref",
                     );
-                    for child in par.children {
-                        self.push_parallel_child(child, node);
+                    match par.order {
+                        SmilParOrder::TextFirst => {
+                            if let Some(text) = par.text {
+                                self.push_text(text, node);
+                            }
+                            if let Some(audio) = par.audio {
+                                self.push_audio(audio, node);
+                            }
+                        }
+                        SmilParOrder::AudioFirst => {
+                            if let Some(audio) = par.audio {
+                                self.push_audio(audio, node);
+                            }
+                            if let Some(text) = par.text {
+                                self.push_text(text, node);
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
-    fn push_parallel_child(&mut self, child: SmilParallelChild, parent: SmilNodeId) {
-        let (fact, authored, kind, element) = match child {
-            SmilParallelChild::Text(text) => (
-                SmilNodeFact::Text {
-                    epub_types: epub_types(text.epub_type),
-                },
-                text.authored_src,
-                HrefRole::SmilText,
-                TEXT,
-            ),
-            SmilParallelChild::Audio(audio) => (
-                SmilNodeFact::Audio {
-                    clip_begin: analysis_time(audio.clip_begin),
-                    clip_end: analysis_time(audio.clip_end),
-                    epub_types: epub_types(audio.epub_type),
-                },
-                audio.authored_src,
-                HrefRole::SmilAudio,
-                AUDIO,
-            ),
-        };
+    fn push_text(&mut self, text: SmilText, parent: SmilNodeId) {
+        self.push_leaf(
+            SmilNodeFact::Text {
+                epub_types: epub_types(text.epub_type),
+            },
+            text.authored_src,
+            HrefRole::SmilText,
+            TEXT,
+            parent,
+        );
+    }
+
+    fn push_audio(&mut self, audio: SmilAudio, parent: SmilNodeId) {
+        self.push_leaf(
+            SmilNodeFact::Audio {
+                clip_begin: audio.clip_begin,
+                clip_end: audio.clip_end,
+                epub_types: epub_types(audio.epub_type),
+            },
+            audio.authored_src,
+            HrefRole::SmilAudio,
+            AUDIO,
+            parent,
+        );
+    }
+
+    fn push_leaf(
+        &mut self,
+        fact: SmilNodeFact,
+        authored: Option<AuthoredHref>,
+        kind: HrefRole,
+        element: &'static str,
+        parent: SmilNodeId,
+    ) {
         let node = SmilNodeId::new(self.nodes.len());
         self.nodes.push(fact);
         append_child(&mut self.nodes, parent, node);
@@ -1630,14 +1589,6 @@ fn append_child(nodes: &mut [SmilNodeFact], parent: SmilNodeId, child: SmilNodeI
 
 fn epub_types(value: Option<EpubString>) -> Vec<String> {
     value.as_deref().map(split_tokens).unwrap_or_default()
-}
-
-fn analysis_time(value: Option<String>) -> Option<SmilTime> {
-    value.map(|value| {
-        crate::media_overlay::parse_media_time(&value)
-            .map(SmilTime::Parsed)
-            .unwrap_or(SmilTime::Unrecognized)
-    })
 }
 
 fn collect_analysis_meta(
@@ -1690,18 +1641,33 @@ mod tests {
     }
 
     #[test]
-    fn audio_before_text_order_survives_parse_and_serialization() {
+    fn audio_before_text_round_trips_in_authored_order() {
         let xml = r#"<smil xmlns="http://www.w3.org/ns/SMIL"><body><par><audio src="audio.mp3"/><text src="chapter.xhtml#p1"/></par></body></smil>"#;
         let document = SmilDocument::parse(xml).unwrap();
         let SmilSequenceChild::Par(par) = &document.body().children()[0] else {
             panic!("expected par");
         };
 
-        assert!(matches!(par.children()[0], SmilParallelChild::Audio(_)));
-        assert!(matches!(par.children()[1], SmilParallelChild::Text(_)));
+        assert!(par.text().is_some());
+        assert!(par.audio().is_some());
+        assert_eq!(par.order(), SmilParOrder::AudioFirst);
 
-        let serialized = document.to_string().unwrap();
+        let serialized = document.to_xml().unwrap();
         assert!(serialized.find("<audio").unwrap() < serialized.find("<text").unwrap());
+    }
+
+    #[test]
+    fn text_before_audio_round_trips_in_authored_order() {
+        let xml = r#"<smil xmlns="http://www.w3.org/ns/SMIL"><body><par><text src="chapter.xhtml#p1"/><audio src="audio.mp3"/></par></body></smil>"#;
+        let document = SmilDocument::parse(xml).unwrap();
+        let SmilSequenceChild::Par(par) = &document.body().children()[0] else {
+            panic!("expected par");
+        };
+
+        assert_eq!(par.order(), SmilParOrder::TextFirst);
+
+        let serialized = document.to_xml().unwrap();
+        assert!(serialized.find("<text").unwrap() < serialized.find("<audio").unwrap());
     }
 
     #[test]
@@ -1712,7 +1678,7 @@ mod tests {
             panic!("expected par");
         };
 
-        assert!(par.children().is_empty());
+        assert!(par.text().is_none() && par.audio().is_none());
     }
 
     #[test]
@@ -1742,6 +1708,9 @@ mod tests {
         assert!(
             matches!(&facts.nodes()[2], SmilNodeFact::Audio { epub_types, .. } if epub_types == &["sound"])
         );
+        assert!(
+            matches!(&facts.nodes()[3], SmilNodeFact::Text { epub_types, .. } if epub_types == &["pagebreak"])
+        );
         assert_eq!(
             facts.nodes()[2]
                 .clip_begin()
@@ -1751,9 +1720,9 @@ mod tests {
                 .milliseconds(),
             1_250
         );
-        assert_eq!(facts.nodes()[2].clip_end(), Some(&SmilTime::Unrecognized));
-        assert!(
-            matches!(&facts.nodes()[3], SmilNodeFact::Text { epub_types, .. } if epub_types == &["pagebreak"])
+        assert_eq!(
+            facts.nodes()[2].clip_end().map(SmilTime::parsed),
+            Some(None)
         );
         assert_eq!(extraction.references.len(), 4);
         assert_eq!(extraction.references[0].node, SmilNodeId::new(0));
@@ -1816,7 +1785,7 @@ mod tests {
         let meta = &document.head().metadata()[0];
         assert_eq!(meta.name().map(EpubString::as_str), Some("title"));
         assert_eq!(meta.content().map(EpubString::as_str), Some("A"));
-        let serialized = document.to_string().unwrap();
+        let serialized = document.to_xml().unwrap();
         assert!(!serialized.contains("bad="));
         assert!(serialized.contains("name=\"title\""));
     }
@@ -1894,7 +1863,7 @@ mod tests {
     }
 
     #[test]
-    fn analysis_projection_does_not_inherit_standalone_structural_limits() {
+    fn analysis_projection_enforces_structural_limits() {
         let mut deep = String::from(r#"<smil xmlns="http://www.w3.org/ns/SMIL"><body>"#);
         for _ in 0..257 {
             deep.push_str("<seq>");
@@ -1908,7 +1877,10 @@ mod tests {
             SmilDocument::parse(&deep),
             Err(SmilError::NestingLimitExceeded { .. })
         ));
-        assert_eq!(extract_smil_facts(&deep).unwrap().facts.nodes().len(), 259);
+        assert!(matches!(
+            extract_smil_facts(&deep),
+            Err(SmilError::NestingLimitExceeded { .. })
+        ));
 
         let mut broad = String::from(r#"<smil xmlns="http://www.w3.org/ns/SMIL"><body>"#);
         for _ in 0..100_000 {
@@ -1919,10 +1891,10 @@ mod tests {
             SmilDocument::parse(&broad),
             Err(SmilError::NodeLimitExceeded { .. })
         ));
-        assert_eq!(
-            extract_smil_facts(&broad).unwrap().facts.nodes().len(),
-            100_000
-        );
+        assert!(matches!(
+            extract_smil_facts(&broad),
+            Err(SmilError::NodeLimitExceeded { .. })
+        ));
     }
 
     #[test]
@@ -1931,7 +1903,9 @@ mod tests {
         let mut bytes = vec![0xff, 0xfe];
         bytes.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
 
-        let extraction = extract_smil_facts_from_reader(std::io::Cursor::new(bytes)).unwrap();
+        let extraction =
+            extract_smil_facts_from_reader(std::io::Cursor::new(bytes), SmilParseLimits::default())
+                .unwrap();
         assert_eq!(extraction.facts.roots().len(), 1);
     }
 
@@ -1942,9 +1916,15 @@ mod tests {
         let SmilSequenceChild::Par(par) = &document.body().children()[0] else {
             panic!("expected par");
         };
-        assert_eq!(par.audio().unwrap().clip_begin(), Some(" 1.25s "));
-        assert_eq!(par.audio().unwrap().clip_end(), Some(" "));
-        let serialized = document.to_string().unwrap();
+        assert_eq!(
+            par.audio().unwrap().clip_begin().map(SmilTime::authored),
+            Some(" 1.25s ")
+        );
+        assert_eq!(
+            par.audio().unwrap().clip_end().map(SmilTime::authored),
+            Some(" ")
+        );
+        let serialized = document.to_xml().unwrap();
         assert!(serialized.contains("clipBegin=\" 1.25s \""));
         assert!(serialized.contains("clipEnd=\" \""));
 
@@ -1954,7 +1934,7 @@ mod tests {
             audio.clip_begin().and_then(|value| value.parsed()),
             Some(crate::media_overlay::MediaTime::new(1_250))
         );
-        assert_eq!(audio.clip_end(), Some(&SmilTime::Unrecognized));
+        assert_eq!(audio.clip_end().map(SmilTime::parsed), Some(None));
     }
 
     #[test]
@@ -1984,11 +1964,11 @@ mod tests {
             Some("  audio.mp3  ")
         );
         assert!(matches!(
-            par.audio().unwrap().parsed_src(),
+            par.audio().unwrap().authored_src().cloned().map(parse_href),
             Some(ParsedHref::Invalid { .. })
         ));
 
-        let serialized = document.to_string().unwrap();
+        let serialized = document.to_xml().unwrap();
         assert!(serialized.contains("epub:textref=\"\""));
         assert!(serialized.contains("src=\"\""));
         assert!(serialized.contains("src=\"  audio.mp3  \""));
@@ -2039,14 +2019,24 @@ mod tests {
             let SmilSequenceChild::Seq(seq) = child else {
                 panic!("expected seq");
             };
-            assert_reference_state(seq.authored_textref(), seq.parsed_textref(), raw, expected);
+            assert_reference_state(
+                seq.authored_textref(),
+                seq.authored_textref().cloned().map(parse_href),
+                raw,
+                expected,
+            );
             let SmilSequenceChild::Par(par) = &seq.children()[0] else {
                 panic!("expected par");
             };
-            assert_reference_state(par.authored_textref(), par.parsed_textref(), raw, expected);
+            assert_reference_state(
+                par.authored_textref(),
+                par.authored_textref().cloned().map(parse_href),
+                raw,
+                expected,
+            );
             assert_reference_state(
                 par.text().unwrap().authored_src(),
-                par.text().unwrap().parsed_src(),
+                par.text().unwrap().authored_src().cloned().map(parse_href),
                 raw,
                 expected,
             );
@@ -2057,7 +2047,7 @@ mod tests {
             };
             assert_reference_state(
                 par.audio().unwrap().authored_src(),
-                par.audio().unwrap().parsed_src(),
+                par.audio().unwrap().authored_src().cloned().map(parse_href),
                 audio_raw,
                 expected,
             );
@@ -2121,7 +2111,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(document.head().metadata()[0].dir(), None);
-        assert!(!document.to_string().unwrap().contains("sideways"));
+        assert!(!document.to_xml().unwrap().contains("sideways"));
     }
 
     #[test]
@@ -2129,7 +2119,7 @@ mod tests {
         let xml = r#"<smil xmlns="http://www.w3.org/ns/SMIL" xmlns:epub="http://www.idpf.org/2007/ops"><head><meta name="A &amp; &quot;B&quot;"/></head><body><par epub:textref="chapter.xhtml?a=1&amp;b=2"><audio src="bad&#0;target"/></par></body></smil>"#;
         let document = SmilDocument::parse(xml).unwrap();
 
-        let serialized = document.to_string().unwrap();
+        let serialized = document.to_xml().unwrap();
         assert!(serialized.contains(r#"name="A &amp; &quot;B&quot;""#));
         assert!(serialized.contains(r#"epub:textref="chapter.xhtml?a=1&amp;b=2""#));
         assert!(serialized.contains(r#"src="bad&amp;#0;target""#));
@@ -2142,7 +2132,7 @@ mod tests {
     #[test]
     fn roundtrip() {
         let smil = SmilDocument::parse(BASIC).unwrap();
-        let xml = smil.to_string().unwrap();
+        let xml = smil.to_xml().unwrap();
         let parsed = SmilDocument::parse(&xml).unwrap();
         assert_eq!(smil, parsed);
     }

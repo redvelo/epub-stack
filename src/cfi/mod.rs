@@ -2,12 +2,10 @@
 //!
 //! Use [`Cfi::parse`] for a complete `epubcfi(...)` fragment, or construct one from [`CfiPath`],
 //! [`Step`], [`Offset`], and [`Assertion`]. [`CfiRange`] represents a common parent with relative
-//! start and end paths. Formatting these values with [`Display`] produces CFI
-//! syntax. Resolve a valid [`Cfi`] against an [`Epub`](crate::Epub) to obtain [`ResolvedCfi`].
+//! start and end paths. [`Display`] produces CFI syntax; [`crate::Epub::resolve_cfi`] resolves it.
 //!
 //! Parsing and construction report invalid CFI syntax as [`CfiError`]. Resolving a CFI against a
-//! publication reports resource or document traversal failures as [`CfiResolveError`]. Individual
-//! constructors document the rules they enforce.
+//! publication reports resource or document traversal failures as [`CfiResolveError`].
 use core::fmt;
 use nom::{
     Finish, IResult, Parser,
@@ -23,17 +21,17 @@ use std::fmt::{Display, Formatter};
 
 mod resolution;
 
-/// XML decoding error exposed by live CFI resolution.
-pub use crate::xml::XmlDecodeError as CfiXmlDecodeError;
 /// Live CFI resolution errors and successful point/range results.
 pub use resolution::{
-    CfiResolveError, ResolvedCfi, ResolvedCfiLocation, ResolvedCfiPoint, ResolvedCfiRange,
+    AssertionMismatch, CfiResolveError, ContentDocumentFailure, ContentPathFailure, OffsetFailure,
+    PackagePathFailure, ResolvedCfi, ResolvedCfiLocation, ResolvedCfiPoint, ResolvedCfiRange,
 };
 
 type Result<T> = std::result::Result<T, CfiError>;
 
 /// A CFI syntax or construction failure.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum CfiError {
     /// A full CFI path had no steps.
     #[error("CFI path must include at least one step")]
@@ -48,15 +46,15 @@ pub enum CfiError {
     #[error("Invalid spatial offset: x={x}, y={y}")]
     InvalidSpatialOffset {
         /// Rejected horizontal percentage.
-        x: f32,
+        x: f64,
         /// Rejected vertical percentage.
-        y: f32,
+        y: f64,
     },
     /// A temporal value was non-finite or not representable in canonical CFI number syntax.
     #[error("Invalid temporal offset: {value}")]
     InvalidTemporalOffset {
         /// Rejected temporal value.
-        value: f32,
+        value: f64,
     },
     /// An assertion was empty.
     #[error("Invalid CFI assertion")]
@@ -82,12 +80,15 @@ pub enum CfiError {
 fn fragment(input: &str) -> IResult<&str, Cfi> {
     let (input, path) = path(input)?;
     let (input, range) = opt(range_suffix).parse(input)?;
-    let range = range.map(|(start, end)| CfiRange {
-        parent: path.clone(),
-        start,
-        end,
-    });
-    Ok((input, Cfi { path, range }))
+    let cfi = match range {
+        Some((start, end)) => Cfi::Range(CfiRange {
+            parent: path,
+            start,
+            end,
+        }),
+        None => Cfi::Point(path),
+    };
+    Ok((input, cfi))
 }
 
 fn range_suffix(input: &str) -> IResult<&str, (LocalPath, LocalPath)> {
@@ -116,8 +117,10 @@ fn path(input: &str) -> IResult<&str, CfiPath> {
     Ok((
         input,
         CfiPath {
-            steps,
-            tail: local.tail,
+            path: LocalPath {
+                steps,
+                tail: local.tail,
+            },
         },
     ))
 }
@@ -138,7 +141,10 @@ fn local_path(input: &str) -> IResult<&str, LocalPath> {
         input,
         LocalPath {
             steps,
-            tail: LocalPathTail::Offset(offset),
+            tail: match offset {
+                Some(offset) => LocalPathTail::Offset(offset),
+                None => LocalPathTail::None,
+            },
         },
     ))
 }
@@ -169,7 +175,7 @@ fn integer(input: &str) -> IResult<&str, usize> {
     Ok((input, value))
 }
 
-fn number(input: &str) -> IResult<&str, f32> {
+fn number(input: &str) -> IResult<&str, f64> {
     let (input, integer_digits) = digit1(input)?;
     if integer_digits.len() > 1 && integer_digits.starts_with('0') {
         return Err(nom::Err::Error(Error {
@@ -208,7 +214,7 @@ fn number(input: &str) -> IResult<&str, f32> {
 fn step(input: &str) -> IResult<&str, Step> {
     let (input, _) = tag("/").parse(input)?;
     let (input, step_value) = integer(input)?;
-    let (input, assertion) = opt(assertion).parse(input)?;
+    let (input, assertion) = opt(step_assertion).parse(input)?;
     Ok((
         input,
         Step {
@@ -219,60 +225,17 @@ fn step(input: &str) -> IResult<&str, Step> {
 }
 
 fn offset(input: &str) -> IResult<&str, Offset> {
-    let (input, offset) =
-        alt((temporal_spatial, temporal, spatial, character_offset)).parse(input)?;
-    let (input, assertion) = opt(assertion).parse(input)?;
-    let offset = match offset.kind {
-        OffsetKind::Character { value, .. } => Offset {
-            kind: OffsetKind::Character { value, assertion },
-        },
-        OffsetKind::Temporal { value } => {
-            if assertion.is_some() {
-                return Err(nom::Err::Error(Error {
-                    input,
-                    code: ErrorKind::Fail,
-                }));
-            }
-            Offset {
-                kind: OffsetKind::Temporal { value },
-            }
-        }
-        OffsetKind::Spatial { x, y } => {
-            if assertion.is_some() {
-                return Err(nom::Err::Error(Error {
-                    input,
-                    code: ErrorKind::Fail,
-                }));
-            }
-            Offset {
-                kind: OffsetKind::Spatial { x, y },
-            }
-        }
-        OffsetKind::TemporalSpatial { temporal, x, y } => {
-            if assertion.is_some() {
-                return Err(nom::Err::Error(Error {
-                    input,
-                    code: ErrorKind::Fail,
-                }));
-            }
-            Offset {
-                kind: OffsetKind::TemporalSpatial { temporal, x, y },
-            }
-        }
-    };
-    Ok((input, offset))
+    alt((temporal_spatial, temporal, spatial, character_offset)).parse(input)
 }
 
 fn character_offset(input: &str) -> IResult<&str, Offset> {
     let (input, _) = tag(":").parse(input)?;
     let (input, value) = integer(input)?;
+    let (input, assertion) = opt(text_assertion).parse(input)?;
     Ok((
         input,
         Offset {
-            kind: OffsetKind::Character {
-                value,
-                assertion: None,
-            },
+            value: OffsetValue::Character { value, assertion },
         },
     ))
 }
@@ -291,7 +254,7 @@ fn spatial(input: &str) -> IResult<&str, Offset> {
     Ok((
         input,
         Offset {
-            kind: OffsetKind::Spatial { x, y },
+            value: OffsetValue::Spatial { x, y },
         },
     ))
 }
@@ -302,7 +265,7 @@ fn temporal(input: &str) -> IResult<&str, Offset> {
     Ok((
         input,
         Offset {
-            kind: OffsetKind::Temporal { value },
+            value: OffsetValue::Temporal { value },
         },
     ))
 }
@@ -323,7 +286,7 @@ fn temporal_spatial(input: &str) -> IResult<&str, Offset> {
     Ok((
         input,
         Offset {
-            kind: OffsetKind::TemporalSpatial {
+            value: OffsetValue::TemporalSpatial {
                 temporal: temporal_value,
                 x,
                 y,
@@ -332,43 +295,54 @@ fn temporal_spatial(input: &str) -> IResult<&str, Offset> {
     ))
 }
 
-fn assertion(input: &str) -> IResult<&str, Assertion> {
-    delimited(tag("["), assertion_body, tag("]")).parse(input)
+fn step_assertion(input: &str) -> IResult<&str, Assertion> {
+    delimited(tag("["), step_assertion_body, tag("]")).parse(input)
 }
 
-fn assertion_body(input: &str) -> IResult<&str, Assertion> {
-    let (input, leading_comma) = opt(tag(",")).parse(input)?;
-    let preceding_comma = leading_comma.is_some();
-
-    if !preceding_comma && input.starts_with(';') {
+fn step_assertion_body(input: &str) -> IResult<&str, Assertion> {
+    if input.starts_with(';') {
         let (input, parameters) = many1(parameter).parse(input)?;
+        return Ok((input, Assertion::Parameters(parameters)));
+    }
+    let (input, value) = value(input)?;
+    let (input, parameters) = many0(parameter).parse(input)?;
+    Ok((input, Assertion::Id { value, parameters }))
+}
+
+fn text_assertion(input: &str) -> IResult<&str, Assertion> {
+    delimited(tag("["), text_assertion_body, tag("]")).parse(input)
+}
+
+fn text_assertion_body(input: &str) -> IResult<&str, Assertion> {
+    if let Some(rest) = input.strip_prefix(',') {
+        let (rest, after) = value(rest)?;
+        let (rest, parameters) = many0(parameter).parse(rest)?;
         return Ok((
-            input,
-            Assertion {
-                values: vec![],
+            rest,
+            Assertion::Text {
+                before: None,
+                after: Some(after),
                 parameters,
-                preceding_comma: false,
             },
         ));
     }
-
-    let (input, first_value) = value(input)?;
-    let mut values = vec![first_value];
-    let mut input = input;
-    if !preceding_comma
-        && let Ok((next_input, _)) = tag::<&str, &str, Error<&str>>(",").parse(input)
-    {
-        let (next_input, second_value) = value(next_input)?;
-        values.push(second_value);
-        input = next_input;
+    if input.starts_with(';') {
+        let (input, parameters) = many1(parameter).parse(input)?;
+        return Ok((input, Assertion::Parameters(parameters)));
     }
+    let (input, before) = value(input)?;
+    let (input, after) = opt(|input| {
+        let (input, _) = tag(",").parse(input)?;
+        value(input)
+    })
+    .parse(input)?;
     let (input, parameters) = many0(parameter).parse(input)?;
     Ok((
         input,
-        Assertion {
-            values,
+        Assertion::Text {
+            before: Some(before),
+            after,
             parameters,
-            preceding_comma,
         },
     ))
 }
@@ -382,7 +356,7 @@ fn parameter(input: &str) -> IResult<&str, Parameter> {
         ("s", [value]) if value == "b" => Parameter::side_bias(SideBias::Before),
         ("s", [value]) if value == "a" => Parameter::side_bias(SideBias::After),
         _ => Parameter {
-            kind: ParameterKind::Unknown { name, csv: values },
+            value: ParameterValue::Unknown { name, csv: values },
         },
     };
     Ok((input, param))
@@ -472,14 +446,20 @@ fn is_special_char(ch: char) -> bool {
     matches!(ch, '^' | '[' | ']' | '(' | ')' | ',' | ';' | '=')
 }
 
-/// Parsed EPUB CFI fragment (supports single paths and ranges).
-///
-/// Use `Cfi::parse` to parse the full `epubcfi(...)` fragment and
-/// `Cfi::range()` to access the optional range.
+/// A parsed EPUB CFI: either a single point in a book, or a span between two.
 #[derive(Debug, PartialEq, Clone)]
-pub struct Cfi {
-    path: CfiPath,
-    range: Option<CfiRange>,
+#[allow(clippy::large_enum_variant)]
+pub enum Cfi {
+    /// A single location.
+    Point(
+        /// Absolute path to the location.
+        CfiPath,
+    ),
+    /// A range between two locations sharing a common parent.
+    Range(
+        /// Common parent and relative endpoints.
+        CfiRange,
+    ),
 }
 
 impl Cfi {
@@ -488,33 +468,24 @@ impl Cfi {
         input.parse()
     }
 
-    /// Constructs a point CFI from a validated full path.
-    pub fn new(path: CfiPath) -> Result<Self> {
-        validate_path_assertions(&path)?;
-        Ok(Self { path, range: None })
-    }
-
-    /// Constructs a range CFI from its common parent and two relative endpoints.
-    pub fn new_range(parent: CfiPath, start: LocalPath, end: LocalPath) -> Result<Self> {
-        Self::from_range(CfiRange::new(parent, start, end)?)
-    }
-
-    /// Wraps a validated range as a CFI fragment.
-    pub fn from_range(range: CfiRange) -> Result<Self> {
-        range.validate()?;
-        Ok(Self {
-            path: range.parent.clone(),
-            range: Some(range),
-        })
-    }
-
-    /// The point path or range common parent path.
+    /// The point path, or the common parent path of a range.
     pub fn path(&self) -> &CfiPath {
-        &self.path
+        match self {
+            Self::Point(path) => path,
+            Self::Range(range) => range.parent(),
+        }
     }
-    /// The range components, if this is a range CFI.
-    pub fn range(&self) -> Option<&CfiRange> {
-        self.range.as_ref()
+}
+
+impl From<CfiPath> for Cfi {
+    fn from(path: CfiPath) -> Self {
+        Self::Point(path)
+    }
+}
+
+impl From<CfiRange> for Cfi {
+    fn from(range: CfiRange) -> Self {
+        Self::Range(range)
     }
 }
 
@@ -523,9 +494,9 @@ impl std::str::FromStr for Cfi {
     fn from_str(input: &str) -> std::result::Result<Self, Self::Err> {
         match all_consuming(epubcfi).parse(input).finish() {
             Ok((_, cfi)) => {
-                validate_path_assertions(&cfi.path)?;
-                if let Some(range) = &cfi.range {
-                    range.validate()?;
+                match &cfi {
+                    Cfi::Point(path) => validate_cfi_path(path)?,
+                    Cfi::Range(range) => range.validate()?,
                 }
                 Ok(cfi)
             }
@@ -541,19 +512,17 @@ impl std::str::FromStr for Cfi {
 
 impl Display for Cfi {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "epubcfi({}", self.path())?;
-        if let Some(range) = &self.range {
-            write!(f, ",{},{}", range.start(), range.end())?;
+        match self {
+            Self::Point(path) => write!(f, "epubcfi({path})"),
+            Self::Range(range) => write!(f, "epubcfi({range})"),
         }
-        write!(f, ")")
     }
 }
 
 /// A non-empty absolute CFI path, including its optional offset or redirect tail.
 #[derive(Debug, PartialEq, Clone)]
 pub struct CfiPath {
-    steps: Vec<Step>,
-    tail: LocalPathTail,
+    path: LocalPath,
 }
 
 impl CfiPath {
@@ -562,50 +531,49 @@ impl CfiPath {
         if steps.is_empty() {
             return Err(CfiError::EmptyPath);
         }
-        let path = Self { steps, tail };
-        validate_path_assertions(&path)?;
+        let path = Self {
+            path: LocalPath { steps, tail },
+        };
+        validate_cfi_path(&path)?;
         Ok(path)
     }
 
     /// Path steps in traversal order.
     pub fn steps(&self) -> &[Step] {
-        self.steps.as_slice()
+        self.path.steps()
     }
 
     /// The terminal offset or redirect representation.
     pub fn tail(&self) -> &LocalPathTail {
-        &self.tail
+        self.path.tail()
     }
 
     /// Replaces the tail and revalidates recursive assertion placement.
     pub fn with_tail(mut self, tail: LocalPathTail) -> Result<Self> {
-        self.tail = tail;
-        validate_path_assertions(&self)?;
+        self.path.tail = tail;
+        validate_cfi_path(&self)?;
         Ok(self)
     }
 
     /// The direct terminal offset; redirected offsets are not included.
     pub fn offset(&self) -> Option<&Offset> {
-        self.tail.offset()
+        self.path.offset()
     }
 
     /// The path following `!`, if present.
     pub fn redirected(&self) -> Option<&RedirectedPath> {
-        self.tail.redirected()
+        self.path.redirected()
     }
 
-    pub(crate) fn as_local_path(&self) -> LocalPath {
-        LocalPath {
-            steps: self.steps.clone(),
-            tail: self.tail.clone(),
-        }
+    pub(crate) fn as_local_path(&self) -> &LocalPath {
+        &self.path
     }
 
     /// Whether this un-offset path ends on an even element step.
     pub fn refers_to_element(&self) -> bool {
         self.offset().is_none()
             && self
-                .steps
+                .steps()
                 .last()
                 .map(|step| step.step % 2 == 0)
                 .unwrap_or(false)
@@ -614,16 +582,7 @@ impl CfiPath {
 
 impl Display for CfiPath {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}{}",
-            self.steps()
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<String>>()
-                .join(""),
-            self.tail
-        )
+        self.path.fmt(f)
     }
 }
 
@@ -632,7 +591,7 @@ impl std::str::FromStr for CfiPath {
     fn from_str(input: &str) -> std::result::Result<Self, Self::Err> {
         match all_consuming(path).parse(input).finish() {
             Ok((_, path)) => {
-                validate_path_assertions(&path)?;
+                validate_cfi_path(&path)?;
                 Ok(path)
             }
             Err(Error { input, code }) => Err(CfiError::Nom {
@@ -646,6 +605,8 @@ impl std::str::FromStr for CfiPath {
 }
 
 /// A relative CFI path used after a redirect or as a range endpoint.
+///
+/// The virtual `/0` step is accepted only as a terminal, unasserted, un-offset step.
 #[derive(Debug, PartialEq, Clone)]
 pub struct LocalPath {
     steps: Vec<Step>,
@@ -653,17 +614,10 @@ pub struct LocalPath {
 }
 
 impl LocalPath {
-    /// Builds a local path; all ordinary steps must be positive.
+    /// Builds a local path and validates step and tail assertion placement.
     pub fn new(steps: Vec<Step>, tail: LocalPathTail) -> Result<Self> {
         let path = Self { steps, tail };
-        validate_local_path_assertions(&path)?;
-        Ok(path)
-    }
-
-    /// Builds a range endpoint, permitting `/0` only as its terminal, unasserted, un-offset step.
-    pub fn range_boundary(steps: Vec<Step>, tail: LocalPathTail) -> Result<Self> {
-        let path = Self { steps, tail };
-        validate_range_endpoint_assertions(&path)?;
+        validate_local_path(&path)?;
         Ok(path)
     }
 
@@ -688,16 +642,10 @@ impl LocalPath {
 
 impl Display for LocalPath {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}{}",
-            self.steps()
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<String>>()
-                .join(""),
-            self.tail
-        )
+        for step in self.steps() {
+            write!(f, "{step}")?;
+        }
+        write!(f, "{}", self.tail)
     }
 }
 
@@ -706,7 +654,7 @@ impl std::str::FromStr for LocalPath {
     fn from_str(input: &str) -> std::result::Result<Self, Self::Err> {
         match all_consuming(local_path).parse(input).finish() {
             Ok((_, local)) => {
-                validate_local_path_assertions(&local)?;
+                validate_local_path(&local)?;
                 Ok(local)
             }
             Err(Error { input, code }) => Err(CfiError::Nom {
@@ -721,9 +669,7 @@ impl std::str::FromStr for LocalPath {
 
 /// A CFI range represented by a common parent and relative start/end paths.
 ///
-/// Build a range when the start and end share a parent. Construction checks path shape and rejects
-/// side bias anywhere in the range. Endpoint order is established during live resolution, which
-/// rejects reversed ranges.
+/// Construction checks path shape and rejects side bias. Resolution checks endpoint order.
 #[derive(Debug, PartialEq, Clone)]
 pub struct CfiRange {
     parent: CfiPath,
@@ -732,17 +678,22 @@ pub struct CfiRange {
 }
 
 impl CfiRange {
-    /// Constructs and validates a range.
+    /// Constructs a range from validated parts, rejecting side-bias parameters.
     pub fn new(parent: CfiPath, start: LocalPath, end: LocalPath) -> Result<Self> {
         let range = Self { parent, start, end };
-        range.validate()?;
+        if path_has_side_bias(&range.parent)
+            || local_path_has_side_bias(&range.start)
+            || local_path_has_side_bias(&range.end)
+        {
+            return Err(CfiError::RangeSideBiasUnsupported);
+        }
         Ok(range)
     }
 
-    pub(crate) fn validate(&self) -> Result<()> {
-        validate_path_assertions(&self.parent)?;
-        validate_range_endpoint_assertions(&self.start)?;
-        validate_range_endpoint_assertions(&self.end)?;
+    fn validate(&self) -> Result<()> {
+        validate_cfi_path(&self.parent)?;
+        validate_local_path(&self.start)?;
+        validate_local_path(&self.end)?;
         if path_has_side_bias(&self.parent)
             || local_path_has_side_bias(&self.start)
             || local_path_has_side_bias(&self.end)
@@ -791,12 +742,15 @@ impl Display for CfiRange {
 }
 
 /// Terminal state of a full or local path.
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Default)]
 pub enum LocalPathTail {
-    /// No offset or one terminal offset.
+    /// No offset and no indirection.
+    #[default]
+    None,
+    /// One terminal offset.
     Offset(
-        /// Optional terminal offset.
-        Option<Offset>,
+        /// Terminal offset.
+        Offset,
     ),
     /// Indirection through `!`.
     Redirect(
@@ -809,8 +763,8 @@ impl LocalPathTail {
     /// The direct offset, if this tail contains one.
     pub fn offset(&self) -> Option<&Offset> {
         match self {
-            LocalPathTail::Offset(offset) => offset.as_ref(),
-            LocalPathTail::Redirect(_) => None,
+            LocalPathTail::Offset(offset) => Some(offset),
+            LocalPathTail::None | LocalPathTail::Redirect(_) => None,
         }
     }
 
@@ -818,23 +772,17 @@ impl LocalPathTail {
     pub fn redirected(&self) -> Option<&RedirectedPath> {
         match self {
             LocalPathTail::Redirect(path) => Some(path),
-            LocalPathTail::Offset(_) => None,
+            LocalPathTail::None | LocalPathTail::Offset(_) => None,
         }
-    }
-}
-
-impl Default for LocalPathTail {
-    fn default() -> Self {
-        LocalPathTail::Offset(None)
     }
 }
 
 impl Display for LocalPathTail {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            LocalPathTail::Offset(Some(offset)) => write!(f, "{}", offset),
-            LocalPathTail::Offset(None) => Ok(()),
-            LocalPathTail::Redirect(path) => write!(f, "!{}", path),
+            LocalPathTail::None => Ok(()),
+            LocalPathTail::Offset(offset) => write!(f, "{offset}"),
+            LocalPathTail::Redirect(path) => write!(f, "!{path}"),
         }
     }
 }
@@ -857,14 +805,14 @@ pub enum RedirectedPath {
 impl Display for RedirectedPath {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            RedirectedPath::Offset(offset) => write!(f, "{}", offset),
-            RedirectedPath::Path(path) => write!(f, "{}", path),
+            RedirectedPath::Offset(offset) => write!(f, "{offset}"),
+            RedirectedPath::Path(path) => write!(f, "{path}"),
         }
     }
 }
 
 /// One numeric CFI traversal step with an optional assertion.
-#[derive(Debug, PartialEq, Eq, Clone, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Step {
     /// Child Elements are even indexed, starting with 2
     step: usize,
@@ -878,7 +826,7 @@ impl Step {
             return Err(CfiError::InvalidStep { step });
         }
         let step = Self { step, assertion };
-        validate_steps(std::slice::from_ref(&step), false)?;
+        validate_steps(std::slice::from_ref(&step))?;
         Ok(step)
     }
 
@@ -902,48 +850,44 @@ impl Step {
     /// Adds or replaces the assertion and validates its placement on this step.
     pub fn with_assertion(mut self, assertion: Assertion) -> Result<Self> {
         self.assertion = Some(assertion);
-        validate_steps(std::slice::from_ref(&self), false)?;
+        validate_steps(std::slice::from_ref(&self))?;
         Ok(self)
     }
 }
 
 impl Display for Step {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "/{}{}",
-            self.step,
-            match &self.assertion {
-                Some(a) => a.to_string(),
-                None => "".to_string(),
-            }
-        )
+        write!(f, "/{}", self.step)?;
+        match &self.assertion {
+            Some(assertion) => assertion.fmt(f),
+            None => Ok(()),
+        }
     }
 }
 
 /// A character, temporal, spatial, or combined temporal-spatial CFI offset.
-#[derive(Debug, PartialEq, Clone, PartialOrd)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct Offset {
-    kind: OffsetKind,
+    value: OffsetValue,
 }
 
-#[derive(Debug, PartialEq, Clone, PartialOrd)]
-enum OffsetKind {
+#[derive(Debug, PartialEq, Clone)]
+enum OffsetValue {
     Character {
         value: usize,
         assertion: Option<Assertion>,
     },
     Temporal {
-        value: f32,
+        value: f64,
     },
     Spatial {
-        x: f32,
-        y: f32,
+        x: f64,
+        y: f64,
     },
     TemporalSpatial {
-        temporal: f32,
-        x: f32,
-        y: f32,
+        temporal: f64,
+        x: f64,
+        y: f64,
     },
 }
 
@@ -951,55 +895,50 @@ impl Offset {
     /// Constructs a character offset with an optional text or parameter assertion.
     pub fn character(value: usize, assertion: Option<Assertion>) -> Result<Self> {
         let offset = Self {
-            kind: OffsetKind::Character { value, assertion },
+            value: OffsetValue::Character { value, assertion },
         };
         validate_offset_assertion(&offset)?;
         Ok(offset)
     }
 
     /// Constructs a non-negative canonical temporal offset.
-    pub fn temporal(value: f32) -> Result<Self> {
+    pub fn temporal(value: f64) -> Result<Self> {
         validate_temporal(value)?;
         Ok(Self {
-            kind: OffsetKind::Temporal { value },
+            value: OffsetValue::Temporal { value },
         })
     }
 
     /// Constructs spatial percentage coordinates in the inclusive range 0 through 100.
-    pub fn spatial(x: f32, y: f32) -> Result<Self> {
+    pub fn spatial(x: f64, y: f64) -> Result<Self> {
         validate_spatial(x, y)?;
         Ok(Self {
-            kind: OffsetKind::Spatial { x, y },
+            value: OffsetValue::Spatial { x, y },
         })
     }
 
     /// Constructs a canonical temporal offset with bounded spatial percentages.
-    pub fn temporal_spatial(temporal: f32, x: f32, y: f32) -> Result<Self> {
+    pub fn temporal_spatial(temporal: f64, x: f64, y: f64) -> Result<Self> {
         validate_temporal(temporal)?;
         validate_spatial(x, y)?;
         Ok(Self {
-            kind: OffsetKind::TemporalSpatial { temporal, x, y },
+            value: OffsetValue::TemporalSpatial { temporal, x, y },
         })
     }
 
-    /// The character value, if this is a character offset.
-    pub fn character_value(&self) -> Option<usize> {
-        self.as_character().map(|(value, _)| value)
-    }
-
-    /// The character value and optional assertion, if applicable.
+    /// The character value and optional assertion, if this is a character offset.
     pub fn as_character(&self) -> Option<(usize, Option<&Assertion>)> {
-        match &self.kind {
-            OffsetKind::Character { value, assertion } => Some((*value, assertion.as_ref())),
+        match &self.value {
+            OffsetValue::Character { value, assertion } => Some((*value, assertion.as_ref())),
             _ => None,
         }
     }
 
     /// The temporal component of temporal and combined offsets.
-    pub fn temporal_value(&self) -> Option<f32> {
-        match &self.kind {
-            OffsetKind::Temporal { value }
-            | OffsetKind::TemporalSpatial {
+    pub fn temporal_value(&self) -> Option<f64> {
+        match &self.value {
+            OffsetValue::Temporal { value }
+            | OffsetValue::TemporalSpatial {
                 temporal: value, ..
             } => Some(*value),
             _ => None,
@@ -1007,19 +946,11 @@ impl Offset {
     }
 
     /// The `(x, y)` coordinates for spatial and combined offsets.
-    pub fn spatial_value(&self) -> Option<(f32, f32)> {
-        match &self.kind {
-            OffsetKind::Spatial { x, y } | OffsetKind::TemporalSpatial { x, y, .. } => {
+    pub fn spatial_value(&self) -> Option<(f64, f64)> {
+        match &self.value {
+            OffsetValue::Spatial { x, y } | OffsetValue::TemporalSpatial { x, y, .. } => {
                 Some((*x, *y))
             }
-            _ => None,
-        }
-    }
-
-    /// The assertion attached to a character offset.
-    pub fn assertion(&self) -> Option<&Assertion> {
-        match &self.kind {
-            OffsetKind::Character { assertion, .. } => assertion.as_ref(),
             _ => None,
         }
     }
@@ -1027,104 +958,132 @@ impl Offset {
 
 impl Display for Offset {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match &self.kind {
-            OffsetKind::Character { value, assertion } => write!(
-                f,
-                ":{}{}",
-                value,
+        match &self.value {
+            OffsetValue::Character { value, assertion } => {
+                write!(f, ":{value}")?;
                 match assertion {
-                    Some(l) => l.to_string(),
-                    None => "".to_string(),
+                    Some(assertion) => assertion.fmt(f),
+                    None => Ok(()),
                 }
-            ),
-            OffsetKind::Temporal { value } => write!(f, "~{}", value),
-            OffsetKind::Spatial { x, y } => write!(f, "@{}:{}", x, y),
-            OffsetKind::TemporalSpatial { temporal, x, y } => {
-                write!(f, "~{}@{}:{}", temporal, x, y)
+            }
+            OffsetValue::Temporal { value } => write!(f, "~{value}"),
+            OffsetValue::Spatial { x, y } => write!(f, "@{x}:{y}"),
+            OffsetValue::TemporalSpatial { temporal, x, y } => {
+                write!(f, "~{temporal}@{x}:{y}")
             }
         }
     }
 }
 
-/// Escaped assertion values and extension parameters attached to a step or character offset.
-#[derive(Debug, PartialEq, Eq, Clone, PartialOrd, Ord)]
-pub struct Assertion {
-    values: Vec<String>,
-    parameters: Vec<Parameter>,
-    preceding_comma: bool,
+/// An assertion attached to a step or character offset.
+///
+/// The variant states where the assertion is valid: [`Self::Id`] asserts the element ID of an even
+/// element step, and [`Self::Text`] asserts the source text around a character offset.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum Assertion {
+    /// An element ID assertion on an even element step.
+    Id {
+        /// Asserted element ID.
+        value: String,
+        /// Extension parameters in source order.
+        parameters: Vec<Parameter>,
+    },
+    /// Preceding and following source text around a character offset.
+    Text {
+        /// Text expected to precede the offset.
+        before: Option<String>,
+        /// Text expected to follow the offset.
+        after: Option<String>,
+        /// Extension parameters in source order.
+        parameters: Vec<Parameter>,
+    },
+    /// Parameters with no assertion value.
+    Parameters(
+        /// Extension parameters in source order.
+        Vec<Parameter>,
+    ),
 }
 
 impl Assertion {
-    /// Constructs a non-empty assertion and validates value and parameter syntax.
-    pub fn new(
-        values: Vec<String>,
-        parameters: Vec<Parameter>,
-        preceding_comma: bool,
-    ) -> Result<Self> {
-        let assertion = Self {
-            values,
-            parameters,
-            preceding_comma,
+    /// Constructs an element ID assertion.
+    pub fn id(value: impl Into<String>) -> Result<Self> {
+        let assertion = Self::Id {
+            value: value.into(),
+            parameters: Vec::new(),
         };
         validate_assertion(&assertion)?;
         Ok(assertion)
     }
 
-    /// Constructs a one-value assertion, typically an element ID assertion.
-    pub fn value(value: impl Into<String>) -> Result<Self> {
-        Self::new(vec![value.into()], Vec::new(), false)
-    }
-
-    /// Constructs a two-value preceding/following text assertion for a character offset.
-    pub fn text(preceding: impl Into<String>, following: impl Into<String>) -> Result<Self> {
-        Self::new(vec![preceding.into(), following.into()], Vec::new(), false)
+    /// Constructs a preceding/following text assertion; at least one side must be present.
+    pub fn text(
+        before: Option<impl Into<String>>,
+        after: Option<impl Into<String>>,
+    ) -> Result<Self> {
+        let assertion = Self::Text {
+            before: before.map(Into::into),
+            after: after.map(Into::into),
+            parameters: Vec::new(),
+        };
+        validate_assertion(&assertion)?;
+        Ok(assertion)
     }
 
     /// Constructs an assertion containing parameters but no assertion value.
-    pub fn parameter_only(parameters: Vec<Parameter>) -> Result<Self> {
-        Self::new(Vec::new(), parameters, false)
+    pub fn parameters(parameters: Vec<Parameter>) -> Result<Self> {
+        let assertion = Self::Parameters(parameters);
+        validate_assertion(&assertion)?;
+        Ok(assertion)
     }
 
-    /// Unescaped assertion values in source order.
-    pub fn values(&self) -> &[String] {
-        self.values.as_slice()
+    /// Adds parameters to an ID or text assertion.
+    pub fn with_parameters(mut self, added: Vec<Parameter>) -> Result<Self> {
+        match &mut self {
+            Self::Id { parameters, .. }
+            | Self::Text { parameters, .. }
+            | Self::Parameters(parameters) => parameters.extend(added),
+        }
+        validate_assertion(&self)?;
+        Ok(self)
     }
 
     /// Assertion parameters in source order.
-    pub fn parameters(&self) -> &[Parameter] {
-        self.parameters.as_slice()
+    pub fn parameter_values(&self) -> &[Parameter] {
+        match self {
+            Self::Id { parameters, .. }
+            | Self::Text { parameters, .. }
+            | Self::Parameters(parameters) => parameters.as_slice(),
+        }
     }
 
-    /// Whether the assertion starts with a comma (following-text-only form).
-    pub fn preceding_comma(&self) -> bool {
-        self.preceding_comma
-    }
-
-    /// Changes following-text-only form and revalidates assertion shape.
-    pub fn with_preceding_comma(mut self, preceding_comma: bool) -> Result<Self> {
-        self.preceding_comma = preceding_comma;
-        validate_assertion(&self)?;
-        Ok(self)
+    /// The asserted element ID, if this is an ID assertion.
+    pub fn id_value(&self) -> Option<&str> {
+        match self {
+            Self::Id { value, .. } => Some(value.as_str()),
+            Self::Text { .. } | Self::Parameters(_) => None,
+        }
     }
 }
 
 impl Display for Assertion {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "[{}{}{}]",
-            if self.preceding_comma() { "," } else { "" },
-            self.values
-                .iter()
-                .map(|value| escape_value(value))
-                .collect::<Vec<_>>()
-                .join(","),
-            self.parameters
-                .iter()
-                .map(|x: &Parameter| x.to_string())
-                .collect::<Vec<String>>()
-                .join("")
-        )
+        write!(f, "[")?;
+        match self {
+            Self::Id { value, .. } => write!(f, "{}", escape_value(value))?,
+            Self::Text { before, after, .. } => {
+                if let Some(before) = before {
+                    write!(f, "{}", escape_value(before))?;
+                }
+                if let Some(after) = after {
+                    write!(f, ",{}", escape_value(after))?;
+                }
+            }
+            Self::Parameters(_) => {}
+        }
+        for parameter in self.parameter_values() {
+            parameter.fmt(f)?;
+        }
+        write!(f, "]")
     }
 }
 
@@ -1132,13 +1091,13 @@ impl Display for Assertion {
 ///
 /// Side bias is the standardized parameter; unknown name/CSV pairs preserve implementation-defined
 /// extensions and are escaped during formatting.
-#[derive(Debug, PartialEq, Eq, Clone, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Parameter {
-    kind: ParameterKind,
+    value: ParameterValue,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, PartialOrd, Ord)]
-enum ParameterKind {
+#[derive(Debug, PartialEq, Eq, Clone)]
+enum ParameterValue {
     SideBias(SideBias),
     Unknown { name: String, csv: Vec<String> },
 }
@@ -1147,14 +1106,14 @@ impl Parameter {
     /// Constructs the standardized side-bias parameter.
     pub fn side_bias(side_bias: SideBias) -> Self {
         Self {
-            kind: ParameterKind::SideBias(side_bias),
+            value: ParameterValue::SideBias(side_bias),
         }
     }
 
     /// Constructs an extension parameter with a non-empty, space-free name and non-empty values.
     pub fn unknown(name: impl Into<String>, csv: Vec<String>) -> Result<Self> {
         let parameter = Self {
-            kind: ParameterKind::Unknown {
+            value: ParameterValue::Unknown {
                 name: name.into(),
                 csv,
             },
@@ -1165,18 +1124,26 @@ impl Parameter {
 
     /// The standardized side-bias value, if this is that parameter.
     pub fn side_bias_value(&self) -> Option<SideBias> {
-        match self.kind {
-            ParameterKind::SideBias(value) => Some(value),
-            ParameterKind::Unknown { .. } => None,
+        match self.value {
+            ParameterValue::SideBias(value) => Some(value),
+            ParameterValue::Unknown { .. } => None,
+        }
+    }
+
+    /// The unescaped name and values of an extension parameter.
+    pub fn unknown_value(&self) -> Option<(&str, &[String])> {
+        match &self.value {
+            ParameterValue::Unknown { name, csv } => Some((name.as_str(), csv.as_slice())),
+            ParameterValue::SideBias(_) => None,
         }
     }
 }
 
 impl Display for Parameter {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match &self.kind {
-            ParameterKind::SideBias(x) => x.fmt(f),
-            ParameterKind::Unknown { name, csv } => write!(
+        match &self.value {
+            ParameterValue::SideBias(x) => x.fmt(f),
+            ParameterValue::Unknown { name, csv } => write!(
                 f,
                 ";{}={}",
                 escape_value(name),
@@ -1189,18 +1156,18 @@ impl Display for Parameter {
     }
 }
 
-fn validate_path_assertions(path: &CfiPath) -> Result<()> {
-    validate_steps(path.steps(), false)?;
-    validate_tail_assertions(path.tail())
+fn validate_cfi_path(path: &CfiPath) -> Result<()> {
+    if path.steps().is_empty() {
+        return Err(CfiError::EmptyPath);
+    }
+    if let Some(step) = path.steps().iter().find(|step| step.step() == 0) {
+        return Err(CfiError::InvalidStep { step: step.step() });
+    }
+    validate_local_path(path.as_local_path())
 }
 
-fn validate_local_path_assertions(path: &LocalPath) -> Result<()> {
-    validate_steps(path.steps(), false)?;
-    validate_tail_assertions(path.tail())
-}
-
-fn validate_range_endpoint_assertions(path: &LocalPath) -> Result<()> {
-    validate_steps(path.steps(), true)?;
+fn validate_local_path(path: &LocalPath) -> Result<()> {
+    validate_steps(path.steps())?;
     validate_tail_assertions(path.tail())?;
     if path.steps().last().is_some_and(|step| step.step() == 0) && path.offset().is_some() {
         return Err(CfiError::InvalidStep { step: 0 });
@@ -1208,29 +1175,27 @@ fn validate_range_endpoint_assertions(path: &LocalPath) -> Result<()> {
     Ok(())
 }
 
-fn validate_steps(steps: &[Step], allow_terminal_virtual_boundary: bool) -> Result<()> {
+fn validate_steps(steps: &[Step]) -> Result<()> {
     for (index, step) in steps.iter().enumerate() {
-        if step.step() == 0
-            && !(allow_terminal_virtual_boundary && index == steps.len().saturating_sub(1))
-        {
-            return Err(CfiError::InvalidStep { step: 0 });
-        }
-        if step.step() == 0 && step.assertion().is_some() {
-            return Err(CfiError::UnsupportedAssertionPlacement);
+        if step.step() == 0 {
+            if index != steps.len().saturating_sub(1) {
+                return Err(CfiError::InvalidStep { step: 0 });
+            }
+            if step.assertion().is_some() {
+                return Err(CfiError::UnsupportedAssertionPlacement);
+            }
+            continue;
         }
         let Some(assertion) = step.assertion() else {
             continue;
         };
         validate_assertion(assertion)?;
-        if assertion.values().is_empty() && assertion.parameters().is_empty() {
-            return Err(CfiError::UnsupportedAssertionPlacement);
-        }
-        if !assertion.values().is_empty()
-            && (step.step() % 2 != 0
-                || assertion.preceding_comma()
-                || assertion.values().len() != 1)
-        {
-            return Err(CfiError::UnsupportedAssertionPlacement);
+        match assertion {
+            Assertion::Id { .. } if step.step() % 2 != 0 => {
+                return Err(CfiError::UnsupportedAssertionPlacement);
+            }
+            Assertion::Text { .. } => return Err(CfiError::UnsupportedAssertionPlacement),
+            _ => {}
         }
     }
     Ok(())
@@ -1238,66 +1203,66 @@ fn validate_steps(steps: &[Step], allow_terminal_virtual_boundary: bool) -> Resu
 
 fn assertion_has_side_bias(assertion: &Assertion) -> bool {
     assertion
-        .parameters()
+        .parameter_values()
         .iter()
         .any(|parameter| parameter.side_bias_value().is_some())
 }
 
 fn validate_tail_assertions(tail: &LocalPathTail) -> Result<()> {
     match tail {
-        LocalPathTail::Offset(Some(offset))
-        | LocalPathTail::Redirect(RedirectedPath::Offset(offset)) => {
+        LocalPathTail::Offset(offset) | LocalPathTail::Redirect(RedirectedPath::Offset(offset)) => {
             validate_offset_assertion(offset)?;
         }
-        LocalPathTail::Redirect(RedirectedPath::Path(path)) => validate_path_assertions(path)?,
-        LocalPathTail::Offset(None) => {}
+        LocalPathTail::Redirect(RedirectedPath::Path(path)) => validate_cfi_path(path)?,
+        LocalPathTail::None => {}
     }
     Ok(())
 }
 
 fn validate_offset_assertion(offset: &Offset) -> Result<()> {
-    let OffsetKind::Character {
+    let OffsetValue::Character {
         assertion: Some(assertion),
         ..
-    } = &offset.kind
+    } = &offset.value
     else {
         return Ok(());
     };
     validate_assertion(assertion)?;
-    let value_count = assertion.values().len();
-    let valid = if assertion.preceding_comma() {
-        value_count == 1
-    } else {
-        matches!(value_count, 1 | 2) || (value_count == 0 && !assertion.parameters().is_empty())
-    };
-    if !valid {
-        return Err(CfiError::UnsupportedAssertionPlacement);
-    }
-    Ok(())
-}
-
-fn validate_assertion_values(assertion: &Assertion) -> Result<()> {
-    if assertion.values().iter().any(String::is_empty)
-        || (assertion.preceding_comma() && assertion.values().len() != 1)
-    {
+    if matches!(assertion, Assertion::Id { .. }) {
         return Err(CfiError::UnsupportedAssertionPlacement);
     }
     Ok(())
 }
 
 fn validate_assertion(assertion: &Assertion) -> Result<()> {
-    validate_assertion_values(assertion)?;
-    if assertion.values().is_empty() && assertion.parameters().is_empty() {
-        return Err(CfiError::InvalidAssertion);
+    match assertion {
+        Assertion::Id { value, .. } => {
+            if value.is_empty() {
+                return Err(CfiError::UnsupportedAssertionPlacement);
+            }
+        }
+        Assertion::Text { before, after, .. } => {
+            if before.is_none() && after.is_none() {
+                return Err(CfiError::InvalidAssertion);
+            }
+            if before.iter().chain(after).any(|value| value.is_empty()) {
+                return Err(CfiError::UnsupportedAssertionPlacement);
+            }
+        }
+        Assertion::Parameters(parameters) => {
+            if parameters.is_empty() {
+                return Err(CfiError::InvalidAssertion);
+            }
+        }
     }
-    for parameter in assertion.parameters() {
+    for parameter in assertion.parameter_values() {
         validate_parameter(parameter)?;
     }
     Ok(())
 }
 
 fn validate_parameter(parameter: &Parameter) -> Result<()> {
-    let ParameterKind::Unknown { name, csv } = &parameter.kind else {
+    let ParameterValue::Unknown { name, csv } = &parameter.value else {
         return Ok(());
     };
     if name.is_empty() || name.contains(' ') || csv.is_empty() || csv.iter().any(String::is_empty) {
@@ -1306,27 +1271,27 @@ fn validate_parameter(parameter: &Parameter) -> Result<()> {
     Ok(())
 }
 
-fn validate_temporal(value: f32) -> Result<()> {
+fn validate_temporal(value: f64) -> Result<()> {
     if !is_formattable_number(value) {
         return Err(CfiError::InvalidTemporalOffset { value });
     }
     Ok(())
 }
 
-fn validate_spatial(x: f32, y: f32) -> Result<()> {
+fn validate_spatial(x: f64, y: f64) -> Result<()> {
     if !is_formattable_number(x) || !is_formattable_number(y) || x > 100.0 || y > 100.0 {
         return Err(CfiError::InvalidSpatialOffset { x, y });
     }
     Ok(())
 }
 
-fn is_formattable_number(value: f32) -> bool {
+fn is_formattable_number(value: f64) -> bool {
     let formatted = value.to_string();
     all_consuming(number).parse(formatted.as_str()).is_ok()
 }
 
 fn path_has_side_bias(path: &CfiPath) -> bool {
-    steps_have_side_bias(path.steps()) || tail_has_side_bias(path.tail())
+    local_path_has_side_bias(path.as_local_path())
 }
 
 fn local_path_has_side_bias(path: &LocalPath) -> bool {
@@ -1341,17 +1306,18 @@ fn steps_have_side_bias(steps: &[Step]) -> bool {
 
 fn tail_has_side_bias(tail: &LocalPathTail) -> bool {
     match tail {
-        LocalPathTail::Offset(Some(offset))
-        | LocalPathTail::Redirect(RedirectedPath::Offset(offset)) => offset_has_side_bias(offset),
+        LocalPathTail::Offset(offset) | LocalPathTail::Redirect(RedirectedPath::Offset(offset)) => {
+            offset_has_side_bias(offset)
+        }
         LocalPathTail::Redirect(RedirectedPath::Path(path)) => path_has_side_bias(path),
-        LocalPathTail::Offset(None) => false,
+        LocalPathTail::None => false,
     }
 }
 
 fn offset_has_side_bias(offset: &Offset) -> bool {
     matches!(
-        &offset.kind,
-        OffsetKind::Character {
+        &offset.value,
+        OffsetValue::Character {
             assertion: Some(assertion),
             ..
         } if assertion_has_side_bias(assertion)
@@ -1373,7 +1339,7 @@ fn escape_value(value: &str) -> String {
 }
 
 /// Which side of a location should be preferred after content changes.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum SideBias {
     /// Prefer content before the location (`;s=b`).
     Before,
@@ -1439,25 +1405,33 @@ mod tests {
         ));
         assert!(matches!(
             "/2[before,after]".parse::<LocalPath>(),
-            Err(CfiError::UnsupportedAssertionPlacement)
+            Err(CfiError::Nom { .. })
         ));
     }
 
     #[test]
     fn character_offset_preserves_escaped_text_assertions() {
         let path = "/1:3[aa^[bb^]^^,cc^,dd]".parse::<LocalPath>().unwrap();
-        let assertion = path.offset().unwrap().assertion().unwrap();
-        assert_eq!(assertion.values(), ["aa[bb]^", "cc,dd"]);
+        let (_, assertion) = path.offset().unwrap().as_character().unwrap();
+        assert!(matches!(
+            assertion,
+            Some(Assertion::Text { before: Some(before), after: Some(after), .. })
+                if before == "aa[bb]^" && after == "cc,dd"
+        ));
         assert_eq!(path.to_string(), "/1:3[aa^[bb^]^^,cc^,dd]");
     }
 
     #[test]
     fn range_endpoints_preserve_text_assertions() {
         let range = "/6,/1:1[a,b],/1:2[b,c]".parse::<CfiRange>().unwrap();
-        let start = range.start().offset().unwrap().assertion().unwrap();
-        let end = range.end().offset().unwrap().assertion().unwrap();
-        assert_eq!(start.values(), ["a", "b"]);
-        assert_eq!(end.values(), ["b", "c"]);
+        for (endpoint, expected) in [(range.start(), ("a", "b")), (range.end(), ("b", "c"))] {
+            let (_, assertion) = endpoint.offset().unwrap().as_character().unwrap();
+            assert!(matches!(
+                assertion,
+                Some(Assertion::Text { before: Some(before), after: Some(after), .. })
+                    if before == expected.0 && after == expected.1
+            ));
+        }
     }
 
     #[test]
@@ -1485,7 +1459,7 @@ mod tests {
     }
 
     #[test]
-    fn virtual_zero_step_is_only_valid_at_the_end_of_a_range_endpoint() {
+    fn virtual_zero_step_is_only_valid_as_a_terminal_local_step() {
         assert!("/6,/0,/2".parse::<CfiRange>().is_ok());
         assert!(matches!(
             "/0".parse::<CfiPath>(),
@@ -1504,52 +1478,56 @@ mod tests {
     #[test]
     fn programmatic_assertions_follow_parser_value_grammar() {
         assert!(matches!(
-            Assertion::new(Vec::new(), Vec::new(), false),
+            Assertion::parameters(Vec::new()),
             Err(CfiError::InvalidAssertion)
         ));
         assert!(matches!(
-            Assertion::new(Vec::new(), Vec::new(), true),
-            Err(CfiError::UnsupportedAssertionPlacement)
+            Assertion::text(None::<String>, None::<String>),
+            Err(CfiError::InvalidAssertion)
         ));
         assert!(matches!(
-            Assertion::new(vec![String::new()], Vec::new(), false),
+            Assertion::id(String::new()),
             Err(CfiError::UnsupportedAssertionPlacement)
         ));
 
-        let two_values = Assertion::new(vec!["a".into(), "b".into()], Vec::new(), false).unwrap();
+        let text = Assertion::text(Some("a"), Some("b")).unwrap();
         assert!(matches!(
-            Step::new(2, Some(two_values)),
+            Step::new(2, Some(text)),
+            Err(CfiError::UnsupportedAssertionPlacement)
+        ));
+        assert!(matches!(
+            Step::new(1, Some(Assertion::id("section").unwrap())),
+            Err(CfiError::UnsupportedAssertionPlacement)
+        ));
+        assert!(matches!(
+            Offset::character(0, Some(Assertion::id("section").unwrap())),
             Err(CfiError::UnsupportedAssertionPlacement)
         ));
     }
 
     #[test]
     fn programmatic_points_and_ranges_round_trip() {
-        let point = Cfi::new(
-            CfiPath::new(vec![Step::new(6, None).unwrap()], LocalPathTail::default()).unwrap(),
-        )
-        .unwrap();
+        let point = Cfi::Point(
+            CfiPath::new(vec![Step::new(6, None).unwrap()], LocalPathTail::None).unwrap(),
+        );
         assert_eq!(point.to_string().parse::<Cfi>().unwrap(), point);
 
-        let id = Assertion::new(vec!["chapter".into()], Vec::new(), false).unwrap();
+        let id = Assertion::id("chapter").unwrap();
         let parent = CfiPath::new(
             vec![Step::new(6, None).unwrap(), Step::new(4, Some(id)).unwrap()],
             LocalPathTail::Redirect(RedirectedPath::Path(Box::new(
-                CfiPath::new(vec![Step::new(2, None).unwrap()], LocalPathTail::default()).unwrap(),
+                CfiPath::new(vec![Step::new(2, None).unwrap()], LocalPathTail::None).unwrap(),
             ))),
         )
         .unwrap();
-        let start_assertion =
-            Assertion::new(vec!["before".into(), "after".into()], Vec::new(), false).unwrap();
-        let start = LocalPath::range_boundary(
+        let start_assertion = Assertion::text(Some("before"), Some("after")).unwrap();
+        let start = LocalPath::new(
             vec![Step::new(1, None).unwrap()],
-            LocalPathTail::Offset(Some(Offset::character(3, Some(start_assertion)).unwrap())),
+            LocalPathTail::Offset(Offset::character(3, Some(start_assertion)).unwrap()),
         )
         .unwrap();
-        let end =
-            LocalPath::range_boundary(vec![Step::virtual_boundary()], LocalPathTail::default())
-                .unwrap();
-        let cfi = Cfi::new_range(parent, start, end).unwrap();
+        let end = LocalPath::new(vec![Step::virtual_boundary()], LocalPathTail::None).unwrap();
+        let cfi = Cfi::Range(CfiRange::new(parent, start, end).unwrap());
         let formatted = cfi.to_string();
 
         assert_eq!(formatted.parse::<Cfi>().unwrap(), cfi);
@@ -1559,7 +1537,7 @@ mod tests {
     fn programmatic_construction_rejects_parser_invalid_states() {
         let invalid_step = Step::virtual_boundary();
         assert!(matches!(
-            CfiPath::new(vec![invalid_step], LocalPathTail::default()),
+            CfiPath::new(vec![invalid_step], LocalPathTail::None),
             Err(CfiError::InvalidStep { step: 0 })
         ));
         assert!(matches!(
@@ -1567,7 +1545,7 @@ mod tests {
             Err(CfiError::InvalidSpatialOffset { x, y }) if x == 100.1 && y == 0.0
         ));
         assert!(matches!(
-            Offset::temporal(f32::NAN),
+            Offset::temporal(f64::NAN),
             Err(CfiError::InvalidTemporalOffset { value }) if value.is_nan()
         ));
         assert!(matches!(
@@ -1577,13 +1555,15 @@ mod tests {
     }
 
     #[test]
+    fn temporal_offsets_keep_double_precision() {
+        let offset = Offset::temporal(3600.0001).unwrap();
+        assert_eq!(offset.temporal_value(), Some(3600.0001));
+        assert_eq!(offset.to_string(), "~3600.0001");
+    }
+
+    #[test]
     fn every_offset_constructor_round_trips() {
-        let assertion = Assertion::new(
-            Vec::new(),
-            vec![Parameter::side_bias(SideBias::After)],
-            false,
-        )
-        .unwrap();
+        let assertion = Assertion::parameters(vec![Parameter::side_bias(SideBias::After)]).unwrap();
         let offsets = [
             Offset::character(0, Some(assertion)).unwrap(),
             Offset::temporal(1.25).unwrap(),
@@ -1594,10 +1574,21 @@ mod tests {
         for offset in offsets {
             let path = LocalPath::new(
                 vec![Step::new(1, None).unwrap()],
-                LocalPathTail::Offset(Some(offset)),
+                LocalPathTail::Offset(offset),
             )
             .unwrap();
             assert_eq!(path.to_string().parse::<LocalPath>().unwrap(), path);
         }
+    }
+
+    #[test]
+    fn unknown_parameters_expose_name_and_values() {
+        let path = "/2[test;Ф=Ф,def]".parse::<LocalPath>().unwrap();
+        let assertion = path.steps()[0].assertion().unwrap();
+        let parameter = &assertion.parameter_values()[0];
+        assert_eq!(
+            parameter.unknown_value(),
+            Some(("Ф", ["Ф".to_string(), "def".to_string()].as_slice()))
+        );
     }
 }

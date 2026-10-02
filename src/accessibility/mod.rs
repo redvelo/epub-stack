@@ -1,4 +1,4 @@
-//! Accessibility metadata, conformance claims, and source observations for application policy.
+//! Accessibility metadata, conformance claims, and source observations.
 //!
 //! Applications can inspect declared access modes, features, hazards, summaries, certification,
 //! and conformance claims through [`AccessibilityFacts`].
@@ -6,33 +6,31 @@
 //! alternatives and ARIA attributes, document structure, media overlays, media tracks, and
 //! WebVTT details with their source resources.
 //!
-//! These models report authored declarations and observed source facts; they do not validate the
-//! EPUB or decide accessibility conformance. Consult [`crate::analysis::coverage::Coverage`] to
-//! determine whether source extraction and media inspection were complete. Values belong to one
-//! analysis snapshot and are not a lossless XML representation.
+//! Authored claims and observations are not conformance verdicts. Check
+//! [`crate::analysis::coverage::Coverage`] for incomplete extraction or inspection.
 
 mod facts;
 mod metadata;
 
-use crate::analysis::ResourceFacts;
+use crate::analysis::ResourceAnalysis;
 use crate::analysis::inspection::{MediaTrack, WebVtt};
 use crate::analysis::reference::ReferenceSlot;
-use crate::content::{ContentFacts, StructureFact};
+use crate::content::StructureFact;
 use crate::media_overlay::{MediaOverlayAssociationRef, SmilFacts};
-use crate::navigation::{Navigation, NavigationDocument, NavigationPoint, NavigationSource};
+use crate::navigation::{NavigationDocument, NavigationPoint, NavigationSource};
 use crate::package::{
     Package,
     metadata::{Meta, MetadataLink},
 };
-use crate::resource::{ResourceAddress, ResourceIndex, ResourceKey, ResourceRecord};
+use crate::resource::{ResourceAddress, ResourceIndex, ResourceOrdinal, ResourceRef};
+use crate::semantics::UnrecognizedTerm;
+use crate::vocab::VocabToken;
 use std::collections::HashMap;
+use std::str::FromStr;
 
 use metadata::collect_metadata;
 
-pub use facts::{
-    AccessibilityElementFact, AccessibilityFact, AccessibilityHeadingLevelFact,
-    AccessibilityValueFact, SvgAccessibilityTextFact,
-};
+pub use facts::{AccessibilityFact, AccessibilityObservation};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Declared accessibility metadata, conformance claims, and extracted source observations.
@@ -68,11 +66,11 @@ impl AccessibilityFacts {
 
     pub(crate) fn build(
         package: &Package,
-        navigation: &Navigation,
+        navigation: Option<&NavigationDocument>,
         secondary_navigation: &[NavigationDocument],
         resources: &ResourceIndex,
-        resource_facts: &[ResourceFacts],
-        content_occurrences: Vec<(ResourceKey, AccessibilityFact)>,
+        resource_facts: &[ResourceAnalysis],
+        content_occurrences: Vec<(ResourceOrdinal, AccessibilityFact)>,
         package_link_references: &[Option<ReferenceSlot>],
     ) -> Self {
         let (metadata, claims) = collect_metadata(package, package_link_references);
@@ -89,12 +87,12 @@ impl AccessibilityFacts {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AccessibilityContentOccurrence {
-    resource: ResourceKey,
+    resource: ResourceOrdinal,
     fact: AccessibilityFact,
 }
 
 impl AccessibilityContentOccurrence {
-    pub(crate) fn resource(&self) -> ResourceKey {
+    pub(crate) fn resource(&self) -> ResourceOrdinal {
         self.resource
     }
 
@@ -119,9 +117,11 @@ impl AccessibilityMetadata {
     /// Iterates retained metadata values with the requested interpreted property.
     pub fn values_of(
         &self,
-        kind: AccessibilityMetadataKind,
+        property: AccessibilityProperty,
     ) -> impl Iterator<Item = &AccessibilityMetadataValue> {
-        self.values.iter().filter(move |value| value.kind == kind)
+        self.values
+            .iter()
+            .filter(move |value| value.property == property)
     }
 
     /// Iterates authored certifier-report links.
@@ -136,7 +136,7 @@ impl AccessibilityMetadata {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 /// The recognized property represented by an accessibility metadata value.
-pub enum AccessibilityMetadataKind {
+pub enum AccessibilityProperty {
     /// The `schema:accessMode` property.
     AccessMode,
     /// The `schema:accessModeSufficient` property.
@@ -187,14 +187,14 @@ pub enum PageBreakSourceTerm {
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// One retained package metadata value with its interpreted accessibility property.
 pub struct AccessibilityMetadataValue {
-    kind: AccessibilityMetadataKind,
+    property: AccessibilityProperty,
     authored: Meta,
 }
 
 impl AccessibilityMetadataValue {
     /// Returns the interpreted property.
-    pub fn kind(&self) -> AccessibilityMetadataKind {
-        self.kind
+    pub fn property(&self) -> AccessibilityProperty {
+        self.property
     }
 
     /// Returns the retained package metadata element.
@@ -202,36 +202,39 @@ impl AccessibilityMetadataValue {
         &self.authored
     }
 
-    /// Returns its authored content when present.
-    pub fn value(&self) -> Option<&str> {
+    fn content(&self) -> Option<&str> {
         self.authored.content().map(|value| value.as_str())
     }
 
-    /// Interprets recognized access-mode tokens for applicable properties.
-    pub fn access_modes(&self) -> Option<Vec<AccessMode>> {
+    /// Iterates authored access-mode tokens for applicable properties.
+    ///
+    /// Every authored token is yielded in source order, whether or not this crate recognizes it:
+    /// an unrecognized token in a `schema:accessModeSufficient` set means the set is not
+    /// satisfied by its recognized members alone. Non-applicable properties yield nothing; use
+    /// [`Self::property`] to distinguish that from an applicable property with no tokens.
+    pub fn access_modes(&self) -> impl Iterator<Item = VocabToken<AccessMode>> + '_ {
         matches!(
-            self.kind,
-            AccessibilityMetadataKind::AccessMode | AccessibilityMetadataKind::AccessModeSufficient
+            self.property,
+            AccessibilityProperty::AccessMode | AccessibilityProperty::AccessModeSufficient
         )
-        .then(|| {
-            self.value()?
-                .split(',')
-                .flat_map(str::split_whitespace)
-                .map(AccessMode::parse)
-                .collect()
-        })?
+        .then(|| self.authored.content().map(|value| value.as_str()))
+        .flatten()
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .flat_map(str::split_whitespace)
+        .filter_map(|token| VocabToken::try_new(token).ok())
     }
 
     /// Interprets the value as a recognized accessibility feature when applicable.
     pub fn feature(&self) -> Option<AccessibilityFeature> {
-        (self.kind == AccessibilityMetadataKind::Feature)
-            .then(|| self.value().and_then(AccessibilityFeature::parse))?
+        (self.property == AccessibilityProperty::Feature)
+            .then(|| self.content().and_then(AccessibilityFeature::parse))?
     }
 
     /// Interprets the value as a recognized accessibility hazard when applicable.
     pub fn hazard(&self) -> Option<AccessibilityHazard> {
-        (self.kind == AccessibilityMetadataKind::Hazard)
-            .then(|| self.value().and_then(AccessibilityHazard::parse))?
+        (self.property == AccessibilityProperty::Hazard)
+            .then(|| self.content().and_then(AccessibilityHazard::parse))?
     }
 }
 
@@ -260,6 +263,15 @@ pub enum AccessMode {
     Textual,
     /// Information perceived through sight.
     Visual,
+}
+
+impl FromStr for AccessMode {
+    type Err = UnrecognizedTerm;
+
+    /// Parses an exact, case-sensitive Schema.org access-mode token.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value).ok_or(UnrecognizedTerm)
+    }
 }
 
 impl AccessMode {
@@ -485,11 +497,6 @@ impl AccessibilityClaim {
         &self.authored
     }
 
-    /// Returns the authored claim text when present.
-    pub fn value(&self) -> Option<&str> {
-        self.authored.content().map(|value| value.as_str())
-    }
-
     /// Returns the exact recognized conformance tuple.
     pub fn conformance(&self) -> Option<AccessibilityConformance> {
         self.conformance
@@ -555,10 +562,6 @@ pub enum WcagLevel {
 }
 
 /// One accessibility-relevant navigation, content, structure, overlay, or media observation.
-///
-/// Every observation belongs to one analysis snapshot. These are factual inputs for application
-/// policy, not validation results or conformance verdicts. Coverage determines whether all
-/// expected sources were available.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub enum AccessibilityObservationRef<'a> {
@@ -567,26 +570,26 @@ pub enum AccessibilityObservationRef<'a> {
         /// The analyzed navigation-list properties.
         observation: &'a AccessibilityNavigationObservation,
         /// The navigation document resource, when present in the resource index.
-        resource: Option<&'a ResourceRecord>,
+        resource: Option<ResourceRef<'a>>,
     },
     /// One accessibility fact extracted from XHTML or SVG.
     Content {
         /// The source resource.
-        resource: &'a ResourceRecord,
+        resource: ResourceRef<'a>,
         /// The extracted accessibility fact.
         fact: &'a AccessibilityFact,
     },
     /// One structural fact relevant to accessibility consumers.
     Structure {
         /// The source resource.
-        resource: &'a ResourceRecord,
+        resource: ResourceRef<'a>,
         /// The extracted structural fact.
         fact: &'a StructureFact,
     },
     /// An analyzed standalone SMIL document.
     Smil {
         /// The SMIL resource.
-        resource: &'a ResourceRecord,
+        resource: ResourceRef<'a>,
         /// The analyzed SMIL facts.
         facts: &'a SmilFacts,
     },
@@ -595,44 +598,31 @@ pub enum AccessibilityObservationRef<'a> {
     /// One inspected audio or video track.
     MediaTrack {
         /// The media resource.
-        resource: &'a ResourceRecord,
+        resource: ResourceRef<'a>,
         /// The inspected track.
         track: &'a MediaTrack,
     },
     /// An inspected WebVTT resource.
     WebVtt {
         /// The WebVTT resource.
-        resource: &'a ResourceRecord,
+        resource: ResourceRef<'a>,
         /// The inspected WebVTT facts.
         webvtt: &'a WebVtt,
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-/// The recognized role of a navigation-list observation.
-pub enum AccessibilityNavigationKind {
-    /// A table-of-contents list.
-    Toc,
-    /// A page-navigation list.
-    PageList,
-    /// A landmarks list.
-    Landmarks,
-    /// A list without one of the principal navigation roles.
-    Other,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Factual properties of one selected EPUB NAV or NCX list.
 pub struct AccessibilityNavigationObservation {
-    resource: Option<ResourceKey>,
+    resource: Option<ResourceOrdinal>,
     source: NavigationSource,
-    kind: AccessibilityNavigationKind,
+    semantic: Option<crate::semantics::EpubStructuralSemantic>,
     hidden: bool,
     point_count: usize,
 }
 
 impl AccessibilityNavigationObservation {
-    pub(crate) fn resource_key(&self) -> Option<ResourceKey> {
+    pub(crate) fn resource_key(&self) -> Option<ResourceOrdinal> {
         self.resource
     }
 
@@ -641,9 +631,9 @@ impl AccessibilityNavigationObservation {
         self.source
     }
 
-    /// Returns the interpreted navigation-list role.
-    pub fn kind(&self) -> AccessibilityNavigationKind {
-        self.kind
+    /// Returns the list's authored structural semantic, when it has a recognized one.
+    pub fn semantic(&self) -> Option<crate::semantics::EpubStructuralSemantic> {
+        self.semantic
     }
 
     /// Returns whether the list was authored as hidden.
@@ -658,12 +648,11 @@ impl AccessibilityNavigationObservation {
 }
 
 fn collect_navigation(
-    navigation: &Navigation,
+    navigation: Option<&NavigationDocument>,
     secondary_navigation: &[NavigationDocument],
     resources: &ResourceIndex,
 ) -> Vec<AccessibilityNavigationObservation> {
     navigation
-        .document()
         .into_iter()
         .chain(secondary_navigation)
         .flat_map(|document| collect_navigation_document(document, resources))
@@ -675,33 +664,16 @@ fn collect_navigation_document(
     resources: &ResourceIndex,
 ) -> Vec<AccessibilityNavigationObservation> {
     let address = ResourceAddress::Local(document.path().clone());
-    let resource = resources
-        .resources_at(&address)
-        .next()
-        .map(|record| record.key());
+    let resource = resources.resource_at(&address).map(ResourceRef::ordinal);
     document
         .lists()
         .iter()
-        .map(|list| {
-            let kind = match list.semantic() {
-                Some(crate::semantics::EpubStructuralSemantic::Toc) => {
-                    AccessibilityNavigationKind::Toc
-                }
-                Some(crate::semantics::EpubStructuralSemantic::PageList) => {
-                    AccessibilityNavigationKind::PageList
-                }
-                Some(crate::semantics::EpubStructuralSemantic::Landmarks) => {
-                    AccessibilityNavigationKind::Landmarks
-                }
-                _ => AccessibilityNavigationKind::Other,
-            };
-            AccessibilityNavigationObservation {
-                resource,
-                source: document.source(),
-                kind,
-                hidden: list.hidden(),
-                point_count: count_navigation_points(list.points()),
-            }
+        .map(|list| AccessibilityNavigationObservation {
+            resource,
+            source: document.source(),
+            semantic: list.semantic(),
+            hidden: list.hidden(),
+            point_count: count_navigation_points(list.points()),
         })
         .collect()
 }
@@ -714,10 +686,10 @@ fn count_navigation_points(points: &[NavigationPoint]) -> usize {
 }
 
 fn collect_content(
-    facts: &[ResourceFacts],
-    occurrences: Vec<(ResourceKey, AccessibilityFact)>,
+    facts: &[ResourceAnalysis],
+    occurrences: Vec<(ResourceOrdinal, AccessibilityFact)>,
 ) -> Vec<AccessibilityContentOccurrence> {
-    let mut by_resource = HashMap::<ResourceKey, Vec<AccessibilityFact>>::new();
+    let mut by_resource = HashMap::<ResourceOrdinal, Vec<AccessibilityFact>>::new();
     let mut content_occurrences = Vec::with_capacity(occurrences.len());
     for (resource, fact) in occurrences {
         by_resource.entry(resource).or_default().push(fact);
@@ -727,14 +699,14 @@ fn collect_content(
         let Some(content) = resource_facts.content().value() else {
             continue;
         };
-        if !matches!(content, ContentFacts::Xhtml(_) | ContentFacts::Svg(_)) {
+        if content.as_xhtml().is_none() && content.as_svg().is_none() {
             continue;
         }
         for fact in by_resource.remove(&resource).unwrap_or_default() {
             content_occurrences.push(AccessibilityContentOccurrence { resource, fact });
         }
     }
-    assert!(
+    debug_assert!(
         by_resource.is_empty(),
         "every extracted accessibility occurrence must belong to retained content facts"
     );

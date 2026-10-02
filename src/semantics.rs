@@ -2,18 +2,18 @@
 //!
 //! Use [`EpubStructuralSemantic`] for `epub:type` terms, [`DpubAriaRole`] for DPUB-ARIA roles,
 //! [`TextDirection`] for direction attributes, and [`HeadingLevel`] for HTML heading levels.
-//! [`EpubString`] trims leading and trailing Unicode whitespace and rejects an empty result.
-//! Vocabulary enums expose their canonical spellings through `as_str` without assigning
-//! publication policy to unknown or deprecated values.
+//! [`SemanticToken`] records one authored or native token together with its recognized meaning.
+//! Vocabulary enums expose canonical spellings through `as_str`.
 
-/// Shared trimmed, non-empty EPUB text scalars and their construction error.
-pub use crate::string::{EpubString, EpubStringEmpty};
-
+use crate::string::{EpubString, EpubStringEmpty};
+use crate::vocab::VocabToken;
 use std::fmt;
 use std::str::FromStr;
 
 /// A constrained HTML heading level from 1 through 6.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize), serde(transparent))]
+#[cfg_attr(feature = "specta", derive(specta::Type), specta(transparent))]
 pub struct HeadingLevel(u8);
 
 impl HeadingLevel {
@@ -28,10 +28,13 @@ impl HeadingLevel {
     }
 }
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, strum_macros::Display, strum_macros::EnumString,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "lowercase")
 )]
-#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 /// Text direction accepted by EPUB `dir` attributes.
 pub enum TextDirection {
     /// Left-to-right text.
@@ -42,6 +45,161 @@ pub enum TextDirection {
     Auto,
 }
 
+impl TextDirection {
+    /// Returns the canonical lowercase attribute value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ltr => "ltr",
+            Self::Rtl => "rtl",
+            Self::Auto => "auto",
+        }
+    }
+
+    /// Parses an attribute value, ignoring ASCII case.
+    pub fn from_token(value: &str) -> Option<Self> {
+        [Self::Ltr, Self::Rtl, Self::Auto]
+            .into_iter()
+            .find(|direction| direction.as_str().eq_ignore_ascii_case(value))
+    }
+}
+
+impl fmt::Display for TextDirection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// One authored or native token that establishes structural meaning.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(
+        tag = "source",
+        rename_all = "kebab-case",
+        rename_all_fields = "camelCase"
+    )
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub enum SemanticToken {
+    /// One whitespace-separated `epub:type` token.
+    EpubType {
+        /// The authored token and its recognized EPUB structural meaning.
+        token: VocabToken<EpubStructuralSemantic>,
+    },
+    /// One whitespace-separated ARIA `role` token.
+    AriaRole {
+        /// The authored token and its recognized DPUB role.
+        token: VocabToken<DpubAriaRole>,
+    },
+    /// One whitespace-separated NCX `class` token.
+    NcxClass {
+        /// The exact token spelling.
+        token: EpubString,
+    },
+    /// Native semantics contributed by an HTML element itself.
+    HtmlElement {
+        /// The element's structural meaning.
+        element: HtmlStructuralElement,
+    },
+}
+
+impl SemanticToken {
+    /// Classifies one authored `epub:type` token, which is recognized case-sensitively.
+    pub fn epub_type(value: impl AsRef<str>) -> Result<Self, EpubStringEmpty> {
+        VocabToken::try_new(value).map(|token| Self::EpubType { token })
+    }
+
+    /// Classifies one authored ARIA `role` token, which is recognized case-insensitively.
+    pub fn aria_role(value: impl AsRef<str>) -> Result<Self, EpubStringEmpty> {
+        VocabToken::try_new(value).map(|token| Self::AriaRole { token })
+    }
+
+    /// Retains one authored NCX `class` token, which has no recognized vocabulary.
+    pub fn ncx_class(value: impl AsRef<str>) -> Result<Self, EpubStringEmpty> {
+        EpubString::try_new(value).map(|token| Self::NcxClass { token })
+    }
+
+    /// Returns the authored token or lowercase HTML element name.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::EpubType { token } => token.as_str(),
+            Self::AriaRole { token } => token.as_str(),
+            Self::NcxClass { token } => token.as_str(),
+            Self::HtmlElement { element } => element.as_str(),
+        }
+    }
+
+    /// Returns a recognized EPUB meaning for an `epub:type` token.
+    pub fn epub_semantic(&self) -> Option<EpubStructuralSemantic> {
+        match self {
+            Self::EpubType { token } => token.known_value(),
+            Self::AriaRole { .. } | Self::NcxClass { .. } | Self::HtmlElement { .. } => None,
+        }
+    }
+
+    /// Returns a recognized DPUB meaning for an ARIA `role` token.
+    pub fn dpub_role(&self) -> Option<DpubAriaRole> {
+        match self {
+            Self::AriaRole { token } => token.known_value(),
+            Self::EpubType { .. } | Self::NcxClass { .. } | Self::HtmlElement { .. } => None,
+        }
+    }
+
+    /// Returns the direct EPUB meaning, or the EPUB meaning related to a DPUB role.
+    pub fn related_epub_semantic(&self) -> Option<EpubStructuralSemantic> {
+        self.epub_semantic().or_else(|| {
+            self.dpub_role()
+                .and_then(DpubAriaRole::related_epub_semantic)
+        })
+    }
+}
+
+/// An HTML element with native structural meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "kebab-case")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub enum HtmlStructuralElement {
+    /// `section`.
+    Section,
+    /// `nav`.
+    Navigation,
+    /// `aside`.
+    Aside,
+    /// `figure`.
+    Figure,
+    /// `table`.
+    Table,
+    /// An `h1` through `h6` element.
+    Heading(HeadingLevel),
+}
+
+impl HtmlStructuralElement {
+    /// Returns the lowercase HTML local name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Section => "section",
+            Self::Navigation => "nav",
+            Self::Aside => "aside",
+            Self::Figure => "figure",
+            Self::Table => "table",
+            Self::Heading(level) => match level.get() {
+                1 => "h1",
+                2 => "h2",
+                3 => "h3",
+                4 => "h4",
+                5 => "h5",
+                6 => "h6",
+                _ => unreachable!("HeadingLevel accepts only 1 through 6"),
+            },
+        }
+    }
+}
+
 macro_rules! vocabulary {
     (
         $(#[$meta:meta])*
@@ -50,9 +208,13 @@ macro_rules! vocabulary {
         }
     ) => {
         $(#[$meta])*
+        #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "kebab-case"))]
+        #[cfg_attr(feature = "specta", derive(specta::Type))]
         pub enum $name {
             $(
-                #[doc = concat!("The canonical `", $token, "` token.")]
+                #[cfg_attr(not(feature = "specta"), doc = concat!("The canonical `", $token, "` token."))]
+                #[cfg_attr(feature = "specta", doc = "A recognized canonical vocabulary token.")]
+                #[cfg_attr(feature = "serde", serde(rename = $token))]
                 $variant
             ),+
         }
@@ -82,23 +244,8 @@ macro_rules! vocabulary {
                 formatter.write_str(self.as_str())
             }
         }
-
-        impl FromStr for $name {
-            type Err = UnknownSemantic;
-
-            fn from_str(value: &str) -> Result<Self, Self::Err> {
-                Self::from_token(value).ok_or_else(|| UnknownSemantic(value.to_string()))
-            }
-        }
     };
 }
-
-/// Error returned when a string is not a recognized canonical semantic token.
-///
-/// The original token is retained for diagnostics and displayed by the error.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("unknown semantic token: {0}")]
-pub struct UnknownSemantic(String);
 
 vocabulary! {
     /// A recognized term from the EPUB Structural Semantics Vocabulary 1.1.
@@ -353,6 +500,29 @@ impl EpubStructuralSemantic {
     }
 }
 
+impl FromStr for EpubStructuralSemantic {
+    type Err = UnrecognizedTerm;
+
+    /// Parses an exact, case-sensitive canonical token, as compact URL references require.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::from_token(value).ok_or(UnrecognizedTerm)
+    }
+}
+
+impl FromStr for DpubAriaRole {
+    type Err = UnrecognizedTerm;
+
+    /// Parses a role using HTML's ASCII case-insensitive token semantics.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::from_html_token(value).ok_or(UnrecognizedTerm)
+    }
+}
+
+/// Authored text that is not a recognized vocabulary term.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("term is not recognized")]
+pub struct UnrecognizedTerm;
+
 impl DpubAriaRole {
     /// Parses a DPUB role using HTML's ASCII case-insensitive token semantics.
     pub fn from_html_token(value: &str) -> Option<Self> {
@@ -413,6 +583,17 @@ impl DpubAriaRole {
             Self::Toc => EpubStructuralSemantic::Toc,
             Self::Example | Self::PageFooter | Self::PageHeader => return None,
         })
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for HeadingLevel {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let level = u8::deserialize(deserializer)?;
+        Self::new(level).ok_or_else(|| serde::de::Error::custom("heading level is outside 1 to 6"))
     }
 }
 

@@ -22,29 +22,34 @@ impl MediaTime {
     }
 }
 
-/// The extraction result for an authored SMIL clock value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SmilTime {
-    /// The authored clock value was recognized and converted to millisecond precision.
-    Parsed(MediaTime),
-    /// A clock value was present but could not be recognized by the current parser.
-    Unrecognized,
+/// An authored media clock and its recognized millisecond value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SmilTime {
+    authored: String,
+    parsed: Option<MediaTime>,
 }
 
 impl SmilTime {
-    /// Returns the parsed media time, or `None` for an unrecognized authored value.
-    pub fn parsed(self) -> Option<MediaTime> {
-        match self {
-            Self::Parsed(time) => Some(time),
-            Self::Unrecognized => None,
-        }
+    pub(crate) fn new(authored: impl Into<String>) -> Self {
+        let authored = authored.into();
+        let parsed = parse_media_time(authored.trim());
+        Self { authored, parsed }
+    }
+
+    /// Returns the exact authored clock text.
+    pub fn authored(&self) -> &str {
+        &self.authored
+    }
+
+    /// Returns the recognized millisecond value, or `None` for unsupported clock syntax.
+    pub fn parsed(&self) -> Option<MediaTime> {
+        self.parsed
     }
 }
 
 /// Identifies a playback node within one [`SmilFacts`] value.
 ///
-/// IDs are local to their owning [`SmilFacts`]. They are not persistent SMIL identities and must
-/// not be reused with rebuilt or reanalyzed facts.
+/// IDs carry no owner identity and must not be mixed between [`SmilFacts`] values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SmilNodeId(usize);
 
@@ -84,8 +89,8 @@ pub enum SmilNodeFact {
     },
     /// A SMIL `audio` node with optional authored clip times and `epub:type` tokens.
     ///
-    /// A present [`SmilTime::Unrecognized`] distinguishes an unrecognized authored clock
-    /// from an absent clip attribute. Use
+    /// A present [`SmilTime`] whose [`SmilTime::parsed`] is `None` distinguishes an unrecognized
+    /// authored clock from an absent clip attribute. Use
     /// [`crate::media_overlay::SmilNodeRef::audio_reference`] to retrieve its authored target.
     Audio {
         /// The optional parsed or unrecognized `clipBegin` value.
@@ -100,8 +105,7 @@ pub enum SmilNodeFact {
 impl SmilNodeFact {
     /// Returns ordered child IDs for sequence and parallel nodes.
     ///
-    /// Text and audio nodes return an empty slice. Each ID is valid only with the
-    /// [`SmilFacts`] value that owns this node.
+    /// Text and audio nodes return an empty slice.
     pub fn children(&self) -> &[SmilNodeId] {
         match self {
             Self::Sequence { children, .. } | Self::Parallel { children, .. } => children,
@@ -122,7 +126,7 @@ impl SmilNodeFact {
     /// Returns the authored clip-begin result for an audio node.
     ///
     /// `None` means either that this is not an audio node or that no clip-begin value was
-    /// authored; [`SmilTime::Unrecognized`] records a present but unrecognized value.
+    /// authored; a [`SmilTime`] without a parsed value records a present but unrecognized clock.
     pub fn clip_begin(&self) -> Option<&SmilTime> {
         match self {
             Self::Audio { clip_begin, .. } => clip_begin.as_ref(),
@@ -133,7 +137,7 @@ impl SmilNodeFact {
     /// Returns the authored clip-end result for an audio node.
     ///
     /// `None` means either that this is not an audio node or that no clip-end value was
-    /// authored; [`SmilTime::Unrecognized`] records a present but unrecognized value.
+    /// authored; a [`SmilTime`] without a parsed value records a present but unrecognized clock.
     pub fn clip_end(&self) -> Option<&SmilTime> {
         match self {
             Self::Audio { clip_end, .. } => clip_end.as_ref(),
@@ -144,9 +148,7 @@ impl SmilNodeFact {
 
 /// Playback hierarchy, clip times, and skippable or escapable semantics from one SMIL document.
 ///
-/// Walk roots and children directly, or use [`crate::media_overlay::SmilNodeRef`] when resolved
-/// text and audio links are needed. Node IDs are valid only with this value and may coincidentally
-/// identify a different node in rebuilt or reanalyzed facts.
+/// Use [`crate::media_overlay::SmilNodeRef`] to access resolved text and audio links.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SmilFacts {
     roots: Vec<SmilNodeId>,
@@ -175,8 +177,6 @@ impl SmilFacts {
     }
 
     /// Returns root node IDs in source order.
-    ///
-    /// Each ID indexes only this [`SmilFacts`] value.
     pub fn roots(&self) -> &[SmilNodeId] {
         &self.roots
     }
@@ -188,9 +188,7 @@ impl SmilFacts {
 
     /// Returns the node identified by `id` when it exists in this value.
     ///
-    /// Because [`SmilNodeId`] carries no owner identity, an ID from other or rebuilt facts
-    /// can coincidentally address a node here. Callers are responsible for keeping IDs with
-    /// their owning [`SmilFacts`] value.
+    /// `id` must come from this [`SmilFacts`] value.
     pub fn node(&self, id: SmilNodeId) -> Option<&SmilNodeFact> {
         self.nodes.get(id.slot())
     }

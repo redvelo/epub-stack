@@ -1,105 +1,95 @@
 use super::resolution::*;
 use super::*;
+use std::collections::VecDeque;
 
 pub(super) fn collect_secondary_ncx_references(
     resources: &ResourceIndex,
-    facts: &[ResourceFacts],
-    mut results: HashMap<ResourceKey, std::result::Result<NavigationDocument, AnalysisIssue>>,
+    facts: &[ResourceAnalysis],
+    mut results: HashMap<ResourceOrdinal, std::result::Result<NavigationDocument, AnalysisIssue>>,
     references: &mut Vec<AuthoredReference>,
     coverage: &mut Vec<RelationshipCoverage>,
 ) {
     let mut seen = HashSet::new();
-    for declaration in resources.declarations().iter().filter(|declaration| {
+    for declaration in resources.declarations().filter(|declaration| {
         declaration
             .media_type()
             .is_some_and(crate::resource::MediaType::is_ncx)
     }) {
-        let DeclarationTarget::Resource(key) = declaration.target() else {
+        let Some(key) = declaration.target().resource() else {
             continue;
         };
-        if !seen.insert(*key) {
+        if !seen.insert(key) {
             continue;
         }
-        let Some(result) = results.remove(key) else {
+        let Some(result) = results.remove(&key) else {
             continue;
         };
         match result {
             Ok(document) => {
                 collect_navigation_document_references(
-                    &document, *key, resources, facts, references, None,
+                    &document, key, resources, facts, references, None,
                 );
                 coverage.push(RelationshipCoverage::new(
-                    RelationshipSource::Ncx(*key),
-                    CoverageState::Complete,
+                    RelationshipSource::Ncx(key),
+                    Completeness::Complete,
                 ));
             }
             Err(issue) => coverage.push(RelationshipCoverage::new(
-                RelationshipSource::Ncx(*key),
-                CoverageState::Unavailable(issue),
+                RelationshipSource::Ncx(key),
+                Completeness::Unavailable(issue),
             )),
         }
     }
 }
 
 pub(super) fn collect_navigation_references(
-    navigation: &Navigation,
+    navigation: Option<&NavigationDocument>,
     resources: &ResourceIndex,
-    facts: &[ResourceFacts],
-    xhtml_pending: &HashMap<
-        ResourceKey,
-        (Vec<LinkFact>, Option<AuthoredHref>, XhtmlLinkAssociations),
-    >,
+    facts: &[ResourceAnalysis],
     references: &mut Vec<AuthoredReference>,
     coverage: &mut Vec<RelationshipCoverage>,
 ) {
-    let Some(document) = navigation.document() else {
+    let Some(document) = navigation.as_ref() else {
         return;
     };
-    let Some(record) = resources
-        .resources_at(&ResourceAddress::Local(document.path().clone()))
-        .next()
+    let Some(record) = resources.resource_at(&ResourceAddress::Local(document.path().clone()))
     else {
         return;
     };
     let (source, state, authored_base) = match document.source() {
         NavigationSource::Ncx => (
-            RelationshipSource::Ncx(record.key()),
-            CoverageState::Complete,
+            RelationshipSource::Ncx(record.ordinal()),
+            Completeness::Complete,
             None,
         ),
         NavigationSource::EpubNav => {
-            let outcome = facts
-                .iter()
-                .find(|facts| facts.resource() == record.key())
-                .map(ResourceFacts::content);
-            let authored_base = xhtml_pending
-                .get(&record.key())
-                .and_then(|(_, authored_base, _)| authored_base.as_ref());
+            let outcome = facts_for_row(facts, record.ordinal()).map(ResourceAnalysis::content);
+            let authored_base = document.authored_base();
             match outcome {
                 Some(AnalysisOutcome::Complete(content)) => (
-                    RelationshipSource::Navigation(record.key()),
-                    CoverageState::Complete,
+                    RelationshipSource::Navigation(record.ordinal()),
+                    Completeness::Complete,
                     content.as_xhtml().and(authored_base),
                 ),
                 Some(AnalysisOutcome::Partial {
                     value: content,
                     issue,
                 }) => (
-                    RelationshipSource::Navigation(record.key()),
-                    CoverageState::Partial(*issue),
+                    RelationshipSource::Navigation(record.ordinal()),
+                    Completeness::Partial(*issue),
                     content.as_xhtml().and(authored_base),
                 ),
                 Some(AnalysisOutcome::Unavailable(issue)) => {
                     coverage.push(RelationshipCoverage::new(
-                        RelationshipSource::Navigation(record.key()),
-                        CoverageState::Unavailable(*issue),
+                        RelationshipSource::Navigation(record.ordinal()),
+                        Completeness::Unavailable(*issue),
                     ));
                     return;
                 }
                 Some(AnalysisOutcome::NotApplicable) | None => {
                     coverage.push(RelationshipCoverage::new(
-                        RelationshipSource::Navigation(record.key()),
-                        CoverageState::Unavailable(AnalysisIssue::Unsupported),
+                        RelationshipSource::Navigation(record.ordinal()),
+                        Completeness::Unavailable(AnalysisIssue::Unsupported),
                     ));
                     return;
                 }
@@ -108,7 +98,7 @@ pub(super) fn collect_navigation_references(
     };
     collect_navigation_document_references(
         document,
-        record.key(),
+        record.ordinal(),
         resources,
         facts,
         references,
@@ -119,9 +109,9 @@ pub(super) fn collect_navigation_references(
 
 fn collect_navigation_document_references(
     document: &NavigationDocument,
-    source: ResourceKey,
+    source: ResourceOrdinal,
     resources: &ResourceIndex,
-    facts: &[ResourceFacts],
+    facts: &[ResourceAnalysis],
     references: &mut Vec<AuthoredReference>,
     authored_base: Option<&AuthoredHref>,
 ) {
@@ -138,7 +128,7 @@ fn collect_navigation_document_references(
         let mut points = list.points().iter().collect::<Vec<_>>();
         while let Some(point) = points.pop() {
             if let Some(href) = point.authored_href() {
-                let context = ReferenceContext::Navigation(ElementAttribute::new(
+                let context = ReferenceContext::Element(ElementAttribute::new(
                     if document.source() == NavigationSource::Ncx {
                         "content"
                     } else {
@@ -183,7 +173,7 @@ fn collect_navigation_document_references(
 pub(super) fn navigation_reference_indices(
     links: &[LinkFact],
     references: &[AuthoredReference],
-    source: ResourceKey,
+    source: ResourceOrdinal,
 ) -> Vec<Option<usize>> {
     let navigation = references
         .iter()
@@ -203,32 +193,48 @@ pub(super) fn navigation_reference_indices(
         .collect::<Vec<_>>();
     let mut indices = vec![None; links.len()];
     let mut claimed = HashSet::new();
+    let mut matching_navigation = HashMap::<(HrefRole, &AuthoredHref), VecDeque<usize>>::new();
+    for (index, reference) in &navigation {
+        matching_navigation
+            .entry((reference.role(), reference.declared()))
+            .or_default()
+            .push_back(*index);
+    }
 
     for (index, link) in links.iter().enumerate() {
         let Some(kind) = link.navigation().map(navigation_reference_kind) else {
             continue;
         };
-        if let Some((reference_index, _)) = navigation.iter().find(|(index, reference)| {
-            reference.role() == kind
-                && reference.declared() == link.declared()
-                && !claimed.contains(index)
-        }) {
-            indices[index] = Some(*reference_index);
-            claimed.insert(*reference_index);
+        if let Some(reference_index) = matching_navigation
+            .get_mut(&(kind, link.declared()))
+            .and_then(VecDeque::pop_front)
+        {
+            indices[index] = Some(reference_index);
+            claimed.insert(reference_index);
         }
     }
 
+    let mut matching_hyperlinks = HashMap::<&AuthoredHref, VecDeque<usize>>::new();
+    for (index, link) in links.iter().enumerate() {
+        if matches!(link, LinkFact::Hyperlink(_)) {
+            matching_hyperlinks
+                .entry(link.declared())
+                .or_default()
+                .push_back(index);
+        }
+    }
     for (reference_index, reference) in navigation {
         if claimed.contains(&reference_index) {
             continue;
         }
-        if let Some((index, _)) = links.iter().enumerate().find(|(index, link)| {
-            indices[*index].is_none()
-                && matches!(link, LinkFact::Hyperlink(_))
-                && link.declared() == reference.declared()
-        }) {
-            indices[index] = Some(reference_index);
-            claimed.insert(reference_index);
+        let Some(matches) = matching_hyperlinks.get_mut(reference.declared()) else {
+            continue;
+        };
+        while let Some(index) = matches.pop_front() {
+            if indices[index].is_none() {
+                indices[index] = Some(reference_index);
+                break;
+            }
         }
     }
     indices

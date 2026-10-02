@@ -1,11 +1,11 @@
-use super::{AnalysisIssue, InspectionKind, RasterImageFormat};
-use crate::analysis::inspection::RasterImage;
+use super::{AnalysisIssue, InspectionData, RasterImageFormat};
+use crate::analysis::inspection::{RasterColorModel, RasterImage};
 
 pub(super) fn inspect(
     bytes: &[u8],
     format: RasterImageFormat,
     complete: bool,
-) -> (InspectionKind, Option<AnalysisIssue>) {
+) -> (InspectionData, Option<AnalysisIssue>) {
     let parsed = match format {
         RasterImageFormat::Jpeg => inspect_jpeg(bytes, complete),
         RasterImageFormat::Png => inspect_png(bytes, complete),
@@ -17,7 +17,7 @@ pub(super) fn inspect(
     let issue = (parsed.malformed || (complete && !parsed.header_complete))
         .then_some(AnalysisIssue::Malformed);
     (
-        InspectionKind::RasterImage(RasterImage::new(
+        InspectionData::RasterImage(RasterImage::new(
             format,
             parsed.width,
             parsed.height,
@@ -35,7 +35,7 @@ pub(super) fn inspect(
 struct RasterParts {
     width: Option<u32>,
     height: Option<u32>,
-    color_type: Option<String>,
+    color_type: Option<RasterColorModel>,
     bit_depth: Option<u8>,
     has_alpha: Option<bool>,
     animated: Option<bool>,
@@ -89,15 +89,12 @@ fn inspect_jpeg(bytes: &[u8], complete: bool) -> RasterParts {
             result.bit_depth = Some(data[0]);
             result.height = Some(u16::from_be_bytes([data[1], data[2]]) as u32);
             result.width = Some(u16::from_be_bytes([data[3], data[4]]) as u32);
-            result.color_type = Some(
-                match data[5] {
-                    1 => "grayscale",
-                    3 => "YCbCr",
-                    4 => "CMYK",
-                    _ => "unknown",
-                }
-                .to_string(),
-            );
+            result.color_type = match data[5] {
+                1 => Some(RasterColorModel::Grayscale),
+                3 => Some(RasterColorModel::YCbCr),
+                4 => Some(RasterColorModel::Cmyk),
+                _ => None,
+            };
             result.header_complete = true;
         }
         offset += length;
@@ -137,17 +134,14 @@ fn inspect_png(bytes: &[u8], complete: bool) -> RasterParts {
         return result;
     }
     result.bit_depth = Some(bit_depth);
-    result.color_type = Some(
-        match color {
-            0 => "grayscale",
-            2 => "truecolor",
-            3 => "indexed",
-            4 => "grayscale-alpha",
-            6 => "truecolor-alpha",
-            _ => "unknown",
-        }
-        .to_string(),
-    );
+    result.color_type = match color {
+        0 => Some(RasterColorModel::Grayscale),
+        2 => Some(RasterColorModel::Rgb),
+        3 => Some(RasterColorModel::Indexed),
+        4 => Some(RasterColorModel::GrayscaleAlpha),
+        6 => Some(RasterColorModel::Rgba),
+        _ => None,
+    };
     result.has_alpha = matches!(color, 4 | 6)
         .then_some(true)
         .or_else(|| complete.then_some(false));
@@ -195,7 +189,7 @@ fn inspect_gif(bytes: &[u8], complete: bool) -> RasterParts {
     let mut result = RasterParts {
         width: Some(u16::from_le_bytes([bytes[6], bytes[7]]) as u32),
         height: Some(u16::from_le_bytes([bytes[8], bytes[9]]) as u32),
-        color_type: Some("indexed".to_string()),
+        color_type: Some(RasterColorModel::Indexed),
         bit_depth: Some((bytes[10] & 0x07) + 1),
         has_alpha: None,
         animated: None,
@@ -411,14 +405,21 @@ fn inspect_jpeg_xl(bytes: &[u8], _complete: bool) -> RasterParts {
     let Ok(jxl_oxide::InitializeResult::Initialized(image)) = uninitialized.try_init() else {
         return RasterParts::default();
     };
-    let pixel_format = format!("{:?}", image.pixel_format()).to_ascii_lowercase();
+    let (color_type, has_alpha) = match image.pixel_format() {
+        jxl_oxide::PixelFormat::Gray => (RasterColorModel::Grayscale, false),
+        jxl_oxide::PixelFormat::Graya => (RasterColorModel::GrayscaleAlpha, true),
+        jxl_oxide::PixelFormat::Rgb => (RasterColorModel::Rgb, false),
+        jxl_oxide::PixelFormat::Rgba => (RasterColorModel::Rgba, true),
+        jxl_oxide::PixelFormat::Cmyk => (RasterColorModel::Cmyk, false),
+        jxl_oxide::PixelFormat::Cmyka => (RasterColorModel::CmykAlpha, true),
+    };
     let bit_depth = u8::try_from(image.image_header().metadata.bit_depth.bits_per_sample()).ok();
     RasterParts {
         width: Some(image.width()),
         height: Some(image.height()),
-        color_type: Some(pixel_format.clone()),
+        color_type: Some(color_type),
         bit_depth,
-        has_alpha: Some(pixel_format.contains('a')),
+        has_alpha: Some(has_alpha),
         animated: Some(image.image_header().metadata.animation.is_some()),
         has_icc_profile: Some(image.original_icc().is_some()),
         header_complete: true,
@@ -437,16 +438,21 @@ mod tests {
         png.extend_from_slice(&200u32.to_be_bytes());
         png.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
         png.extend_from_slice(b"\0\0\0\0IEND\0\0\0\0");
-        let (kind, issue) = inspect(&png, RasterImageFormat::Png, true);
+        let (data, issue) = inspect(&png, RasterImageFormat::Png, true);
         assert_eq!(issue, None);
-        let InspectionKind::RasterImage(image) = kind else {
+        let InspectionData::RasterImage(image) = data else {
             panic!()
         };
         assert_eq!((image.width(), image.height()), (Some(320), Some(200)));
 
         let result = super::super::inspect(&png, None, super::super::detect(&png), true);
         assert_eq!(
-            result.facts.detected_media_type().unwrap().essence(),
+            result
+                .facts
+                .unwrap()
+                .detected_media_type()
+                .unwrap()
+                .essence(),
             Some("image/png")
         );
     }
@@ -455,9 +461,9 @@ mod tests {
     fn malformed_png_structures_are_surfaced() {
         let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\x0cIHDR".to_vec();
         png.resize(33, 0);
-        let (kind, issue) = inspect(&png, RasterImageFormat::Png, true);
+        let (data, issue) = inspect(&png, RasterImageFormat::Png, true);
         assert_eq!(issue, Some(AnalysisIssue::Malformed));
-        let InspectionKind::RasterImage(image) = kind else {
+        let InspectionData::RasterImage(image) = data else {
             panic!()
         };
         assert_eq!((image.width(), image.height()), (None, None));
@@ -488,9 +494,9 @@ mod tests {
         let mut gif = b"GIF89a\x01\0\x01\0\0\0\0".to_vec();
         gif.extend_from_slice(b"\x21\xfe\x01\x2c\0");
         gif.extend_from_slice(b"\x2c\0\0\0\0\x01\0\x01\0\0\x02\x01\0\0\x3b");
-        let (kind, issue) = inspect(&gif, RasterImageFormat::Gif, true);
+        let (data, issue) = inspect(&gif, RasterImageFormat::Gif, true);
         assert_eq!(issue, None);
-        let InspectionKind::RasterImage(image) = kind else {
+        let InspectionData::RasterImage(image) = data else {
             panic!()
         };
         assert_eq!(image.animated(), Some(false));
@@ -503,8 +509,8 @@ mod tests {
             0x41, 0x3c, 0xb6, 0x3a, 0x51, 0xfe, 0x00, 0x47, 0x1e, 0xa0, 0x85, 0xb8, 0x27, 0x1a,
             0x48, 0x45, 0x84, 0x1b, 0x71, 0x4f, 0xa8, 0x3e, 0x8e, 0x30, 0x03, 0x92, 0x84, 0x01,
         ];
-        let (kind, issue) = inspect(&bytes, RasterImageFormat::JpegXl, true);
-        let InspectionKind::RasterImage(image) = kind else {
+        let (data, issue) = inspect(&bytes, RasterImageFormat::JpegXl, true);
+        let InspectionData::RasterImage(image) = data else {
             panic!()
         };
         assert_eq!(image.format(), RasterImageFormat::JpegXl);

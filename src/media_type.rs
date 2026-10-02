@@ -1,15 +1,13 @@
 //! Media type declarations for inspecting manifest resources without losing malformed input.
 //!
 //! [`MediaType`] trims surrounding whitespace and retains the remaining non-empty text.
-//! Malformed MIME syntax remains available through [`MediaType::raw`] and is reported by
+//! Malformed MIME syntax remains available through [`MediaType::as_str`] and is reported by
 //! [`MediaType::is_valid`] instead of preventing the publication from loading.
 
 use crate::analysis::inspection::{FontFormat, RasterImageFormat};
 use crate::string::EpubString;
-use std::borrow::Borrow;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::ops::Deref;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MediaTypeClassification {
@@ -21,25 +19,53 @@ pub(crate) enum MediaTypeClassification {
     Media(MediaContainer),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MediaContainer {
+/// A recognized audio or video container format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MediaContainer {
+    /// MPEG-1/2 Audio Layer III.
     Mp3,
+    /// AAC in ADTS framing.
     AacAdts,
+    /// Ogg.
     Ogg,
+    /// ISO base media file format (MP4).
     Mp4,
+    /// WebM.
     WebM,
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "specta", derive(specta::Type), specta(transparent))]
 /// A manifest media type that supports both source inspection and MIME queries.
 ///
 /// The stored text has surrounding whitespace removed but otherwise preserves spelling and
 /// parameters. MIME-based queries return `None` or `false` for malformed declarations. Equality
 /// and hashing use MIME semantics when both values are valid; otherwise they compare stored text.
-/// Direct comparison with `str` always compares the stored text.
 pub struct MediaType {
     raw: EpubString,
+    #[cfg_attr(feature = "specta", specta(skip))]
     parsed: Option<mime::Mime>,
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for MediaType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::new(&raw).ok_or_else(|| serde::de::Error::custom("media type is empty"))
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for MediaType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
 }
 
 impl MediaType {
@@ -58,15 +84,10 @@ impl MediaType {
     }
 
     /// Returns the stored declaration, with surrounding whitespace removed at construction.
-    pub fn raw(&self) -> &str {
-        self.raw.as_str()
-    }
-
-    /// Returns the stored declaration, with surrounding whitespace removed at construction.
     ///
-    /// This is an alias for [`Self::raw`], not a normalized MIME serialization.
+    /// This is the authored spelling, not a normalized MIME serialization.
     pub fn as_str(&self) -> &str {
-        self.raw()
+        self.raw.as_str()
     }
 
     /// Reports whether the authored value parses as MIME syntax.
@@ -104,13 +125,13 @@ impl MediaType {
         self.has_essence("application/x-dtbncx+xml")
     }
 
-    /// Reports whether a valid MIME value has the requested top-level type.
+    /// Reports whether a valid MIME value has the requested top-level type, such as `image`.
     ///
-    /// Returns `false` for malformed MIME declarations.
-    pub fn has_top_level_type(&self, type_: mime::Name<'static>) -> bool {
+    /// Returns `false` for malformed MIME declarations. Comparison is ASCII case-insensitive.
+    pub fn has_top_level_type(&self, type_: &str) -> bool {
         self.parsed
             .as_ref()
-            .is_some_and(|media_type| media_type.type_() == type_)
+            .is_some_and(|media_type| media_type.type_().as_str().eq_ignore_ascii_case(type_))
     }
 
     pub(crate) fn classification(&self) -> Option<MediaTypeClassification> {
@@ -149,7 +170,7 @@ impl MediaType {
             | "application/javascript"
             | "application/ecmascript"
             | "application/json" => Classification::GenericText,
-            _ if essence.ends_with("+xml") || self.has_top_level_type(mime::TEXT) => {
+            _ if essence.ends_with("+xml") || self.has_top_level_type("text") => {
                 Classification::GenericText
             }
             _ => return None,
@@ -157,7 +178,10 @@ impl MediaType {
         Some(classification)
     }
 
-    fn has_essence(&self, expected: &str) -> bool {
+    /// Reports whether the parsed essence equals `expected`, ignoring ASCII case.
+    ///
+    /// Returns `false` for malformed MIME declarations.
+    pub fn has_essence(&self, expected: &str) -> bool {
         self.essence()
             .is_some_and(|essence| essence.eq_ignore_ascii_case(expected))
     }
@@ -190,20 +214,6 @@ impl AsRef<str> for MediaType {
     }
 }
 
-impl Deref for MediaType {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        self.as_str()
-    }
-}
-
-impl Borrow<str> for MediaType {
-    fn borrow(&self) -> &str {
-        self.as_str()
-    }
-}
-
 impl fmt::Display for MediaType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -232,30 +242,6 @@ impl TryFrom<String> for MediaType {
     }
 }
 
-impl PartialEq<str> for MediaType {
-    fn eq(&self, other: &str) -> bool {
-        self.as_str() == other
-    }
-}
-
-impl PartialEq<&str> for MediaType {
-    fn eq(&self, other: &&str) -> bool {
-        self.as_str() == *other
-    }
-}
-
-impl PartialEq<MediaType> for str {
-    fn eq(&self, other: &MediaType) -> bool {
-        self == other.as_str()
-    }
-}
-
-impl PartialEq<MediaType> for &str {
-    fn eq(&self, other: &MediaType) -> bool {
-        *self == other.as_str()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,7 +250,7 @@ mod tests {
     fn media_type_preserves_raw_and_exposes_parsed_facts() {
         let media_type = MediaType::new("APPLICATION/XHTML+XML; charset=utf-8").unwrap();
 
-        assert_eq!(media_type.raw(), "APPLICATION/XHTML+XML; charset=utf-8");
+        assert_eq!(media_type.as_str(), "APPLICATION/XHTML+XML; charset=utf-8");
         assert!(media_type.is_valid());
         assert_eq!(media_type.essence(), Some("application/xhtml+xml"));
         assert!(media_type.is_xhtml());
@@ -274,7 +260,7 @@ mod tests {
     fn media_type_preserves_invalid_raw_value() {
         let media_type = MediaType::new("text/plain/html").unwrap();
 
-        assert_eq!(media_type.raw(), "text/plain/html");
+        assert_eq!(media_type.as_str(), "text/plain/html");
         assert!(!media_type.is_valid());
         assert_eq!(media_type.essence(), None);
     }

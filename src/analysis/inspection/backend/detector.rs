@@ -49,7 +49,9 @@ pub(super) fn detect(bytes: &[u8]) -> Option<Detection> {
 pub(super) fn is_avif(bytes: &[u8]) -> bool {
     ftyp_brands(bytes).is_some_and(|brands| {
         brands
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|brand| matches!(brand, b"avif" | b"avis"))
     })
 }

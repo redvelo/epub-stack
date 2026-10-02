@@ -1,27 +1,32 @@
 //! Stage, preview, and commit publication edits in memory.
 //!
 //! Start with [`Epub::edit`](crate::Epub::edit), chain operations on [`EpubEdit`], then call
-//! [`EpubEdit::preview`] to validate and inspect the proposed package, navigation, annotations,
-//! resources, and change list. [`EpubEditPreview::commit`] installs that preview in the open
-//! [`Epub`](crate::Epub); dropping either value leaves the publication unchanged.
+//! [`EpubEdit::preview`] to inspect the proposed state. [`EpubEditPreview::commit`] installs it
+//! in the open [`Epub`](crate::Epub); dropping either value leaves the publication unchanged.
 //!
 //! Committing does not write an EPUB. Export the committed in-memory state separately with
-//! [`Epub::export`](crate::Epub::export). Untouched resources keep their bytes, while package and
-//! navigation edits serialize changed XML and can normalize lexical details. Preview does not
-//! rerun full content analysis.
+//! [`Epub::export`](crate::Epub::export). Changed XML may be normalized. Preview does not rerun
+//! content analysis.
 
 pub use error::{
-    EditError, NavigationGenerationError, SelectionFailure, StructuralResourceKind,
-    StructuralXmlDecodeError, StructuralXmlOperationError,
+    EditError, GuideHrefFailure, SelectionFailure, StructuralResourceKind,
+    StructuralVerificationFailure,
 };
-pub use report::{EditChange, EditReport, StructuralEditKind};
+pub use report::EditChange;
 pub use transaction::{EpubEdit, EpubEditPreview};
 
-pub mod annotation;
 mod error;
-pub mod package;
 mod report;
+pub mod select;
 mod transaction;
 
-/// Navigation list, point, and insertion selectors.
-pub mod navigation;
+/// Chooses whether an embedded annotation change also removes resources the previous
+/// annotation set referenced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddedAnnotationResourceRemoval {
+    /// Change only `META-INF/annotations.json`, leaving previously referenced resources in
+    /// place.
+    SetOnly,
+    /// Also remove previously referenced resources that the new state no longer references.
+    SetAndReferencedResources,
+}

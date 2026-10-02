@@ -11,7 +11,7 @@ pub(super) fn collect_manifest_references(
             let target = manifest_id_target(resources, idref);
             manifest_reference(
                 references,
-                declaration.key(),
+                declaration.ordinal(),
                 idref.clone(),
                 ManifestRole::Fallback,
                 target,
@@ -21,7 +21,7 @@ pub(super) fn collect_manifest_references(
             let target = manifest_id_target(resources, idref);
             manifest_reference(
                 references,
-                declaration.key(),
+                declaration.ordinal(),
                 idref.clone(),
                 ManifestRole::MediaOverlay,
                 target,
@@ -31,36 +31,28 @@ pub(super) fn collect_manifest_references(
 }
 
 fn manifest_id_target(resources: &ResourceIndex, idref: &AuthoredIdRef) -> ManifestTarget {
-    let candidates = resources
-        .declarations_with_id(idref.as_str())
-        .map(ManifestDeclaration::key)
-        .collect::<Vec<_>>();
-    match candidates.as_slice() {
-        [] => ManifestTarget::Missing,
-        [declaration] => {
-            let resource = resources
-                .declaration(*declaration)
-                .ok()
-                .and_then(|declaration| match declaration.target() {
-                    DeclarationTarget::Resource(resource) => Some(*resource),
-                    DeclarationTarget::MissingHref | DeclarationTarget::InvalidHref(_) => None,
-                });
-            ManifestTarget::Declaration {
-                declaration: *declaration,
-                resource,
-            }
-        }
-        _ => ManifestTarget::Ambiguous { candidates },
+    match resources.resolve_idref(idref.as_str()) {
+        IdrefTarget::Invalid => ManifestTarget::InvalidManifestIdref,
+        IdrefTarget::Missing => ManifestTarget::Missing,
+        IdrefTarget::Declaration(declaration) => ManifestTarget::Declaration {
+            declaration,
+            resource: resources
+                .declaration(declaration)
+                .expect("resolved declaration belongs to this index")
+                .target()
+                .resource(),
+        },
+        IdrefTarget::Ambiguous(candidates) => ManifestTarget::Ambiguous { candidates },
     }
 }
 
 pub(super) fn collect_package_href_references(
     package: &Package,
     resources: &ResourceIndex,
-    facts: &[ResourceFacts],
+    facts: &[ResourceAnalysis],
     references: &mut Vec<AuthoredReference>,
 ) -> Vec<Option<ReferenceSlot>> {
-    let source = resources.package().key();
+    let source = resources.package().ordinal();
     let link_references = package
         .metadata()
         .link()
@@ -75,7 +67,7 @@ pub(super) fn collect_package_href_references(
                     href,
                     HrefRole::Metadata,
                     resources.package().local_path().expect("package is local"),
-                    ReferenceContext::Package(ElementAttribute::new("link", "href")),
+                    ReferenceContext::Element(ElementAttribute::new("link", "href")),
                 )
             })
         })
@@ -91,7 +83,7 @@ pub(super) fn collect_package_href_references(
                     href,
                     HrefRole::Guide,
                     resources.package().local_path().expect("package is local"),
-                    ReferenceContext::Package(ElementAttribute::new("reference", "href")),
+                    ReferenceContext::Element(ElementAttribute::new("reference", "href")),
                 );
             }
         }
@@ -107,9 +99,9 @@ pub(super) fn collect_package_href_references(
 
 fn collect_collection_links(
     collection: &Collection,
-    source: ResourceKey,
+    source: ResourceOrdinal,
     resources: &ResourceIndex,
-    facts: &[ResourceFacts],
+    facts: &[ResourceAnalysis],
     references: &mut Vec<AuthoredReference>,
 ) {
     let links = collection.link().iter().chain(
@@ -128,7 +120,7 @@ fn collect_collection_links(
                 href,
                 HrefRole::Collection,
                 resources.package().local_path().expect("package is local"),
-                ReferenceContext::Package(ElementAttribute::new("link", "href")),
+                ReferenceContext::Element(ElementAttribute::new("link", "href")),
             );
         }
     }
@@ -136,15 +128,15 @@ fn collect_collection_links(
 
 pub(super) fn collect_xhtml_references(
     resources: &ResourceIndex,
-    facts: &[ResourceFacts],
-    xhtml_sources: &HashSet<ResourceKey>,
+    facts: &[ResourceAnalysis],
+    xhtml_sources: &HashSet<ResourceOrdinal>,
     mut pending_by_resource: HashMap<
-        ResourceKey,
+        ResourceOrdinal,
         (Vec<LinkFact>, Option<AuthoredHref>, XhtmlLinkAssociations),
     >,
     references: &mut Vec<AuthoredReference>,
     coverage: &mut Vec<RelationshipCoverage>,
-) -> HashMap<ResourceKey, XhtmlReferenceIndex> {
+) -> HashMap<ResourceOrdinal, XhtmlReferenceIndex> {
     let mut indexes = HashMap::new();
     for index in 0..facts.len() {
         let resource_key = facts[index].resource();
@@ -153,18 +145,16 @@ pub(super) fn collect_xhtml_references(
         }
         let Some((links, authored_base, associations)) = pending_by_resource.remove(&resource_key)
         else {
-            if let AnalysisOutcome::Unavailable(issue) = facts[index].content() {
-                coverage.push(RelationshipCoverage::new(
-                    RelationshipSource::Xhtml(resource_key),
-                    CoverageState::Unavailable(*issue),
-                ));
-            }
+            push_content_coverage(
+                coverage,
+                RelationshipSource::Xhtml(resource_key),
+                &facts[index],
+            );
             continue;
         };
         let source_path = resources
             .resource(resource_key)
-            .ok()
-            .and_then(ResourceRecord::local_path);
+            .and_then(ResourceRef::local_path);
         let Some(source_path) = source_path else {
             continue;
         };
@@ -201,7 +191,7 @@ pub(super) fn collect_xhtml_references(
                 kind,
                 source_path,
                 authored_base.as_ref(),
-                ReferenceContext::Xhtml(ElementAttribute::new(
+                ReferenceContext::Element(ElementAttribute::new(
                     link.element(),
                     link.attribute().as_str(),
                 )),
@@ -216,15 +206,11 @@ pub(super) fn collect_xhtml_references(
                 scripts: joined_reference_slots(associations.scripts, &link_references),
             },
         );
-        let state = match facts[index].content() {
-            AnalysisOutcome::Partial { issue, .. } => CoverageState::Partial(*issue),
-            AnalysisOutcome::Complete(_) => CoverageState::Complete,
-            AnalysisOutcome::NotApplicable | AnalysisOutcome::Unavailable(_) => unreachable!(),
-        };
-        coverage.push(RelationshipCoverage::new(
+        push_content_coverage(
+            coverage,
             RelationshipSource::Xhtml(resource_key),
-            state,
-        ));
+            &facts[index],
+        );
     }
     indexes
 }
@@ -256,38 +242,25 @@ fn joined_media_reference_slots(
 
 pub(super) fn collect_css_references(
     resources: &ResourceIndex,
-    facts: &mut [ResourceFacts],
-    css_sources: &HashSet<ResourceKey>,
-    outcomes: &HashMap<ResourceKey, AnalysisOutcome<()>>,
+    facts: &[ResourceAnalysis],
+    css_sources: &HashSet<ResourceOrdinal>,
     mut pending_by_resource: HashMap<
-        ResourceKey,
+        ResourceOrdinal,
         Vec<crate::content::extraction::css::CssPendingReference>,
     >,
     references: &mut Vec<AuthoredReference>,
     coverage: &mut Vec<RelationshipCoverage>,
 ) {
-    for index in 0..facts.len() {
-        let resource = facts[index].resource();
+    for resource_facts in facts {
+        let resource = resource_facts.resource();
         if !css_sources.contains(&resource) {
             continue;
         }
-        let Some(pending) = pending_by_resource.remove(&resource) else {
-            if let Some(AnalysisOutcome::Unavailable(issue)) = outcomes.get(&resource) {
-                coverage.push(RelationshipCoverage::new(
-                    RelationshipSource::Css(resource),
-                    CoverageState::Unavailable(*issue),
-                ));
-            }
-            continue;
-        };
-        let Some(source_path) = resources
+        let source_path = resources
             .resource(resource)
-            .ok()
-            .and_then(ResourceRecord::local_path)
-        else {
-            continue;
-        };
-        for pending in pending {
+            .and_then(ResourceRef::local_path)
+            .expect("CSS sources are local");
+        for pending in pending_by_resource.remove(&resource).unwrap_or_default() {
             push_href_reference(
                 resources,
                 facts,
@@ -299,26 +272,25 @@ pub(super) fn collect_css_references(
                 ReferenceContext::Css(CssContext::new(pending.at_rule, pending.property)),
             );
         }
-        let state = match outcomes
-            .get(&resource)
-            .expect("CSS source must retain an extraction outcome")
-        {
-            AnalysisOutcome::Complete(_) => CoverageState::Complete,
-            AnalysisOutcome::Partial { issue, .. } => CoverageState::Partial(*issue),
-            AnalysisOutcome::NotApplicable | AnalysisOutcome::Unavailable(_) => unreachable!(),
-        };
-        coverage.push(RelationshipCoverage::new(
-            RelationshipSource::Css(resource),
-            state,
-        ));
+        push_content_coverage(coverage, RelationshipSource::Css(resource), resource_facts);
+    }
+}
+
+pub(super) fn push_content_coverage(
+    coverage: &mut Vec<RelationshipCoverage>,
+    source: RelationshipSource,
+    facts: &ResourceAnalysis,
+) {
+    if let Some(completeness) = facts.content().completeness() {
+        coverage.push(RelationshipCoverage::new(source, completeness));
     }
 }
 
 pub(super) fn collect_svg_references(
     resources: &ResourceIndex,
-    facts: &[ResourceFacts],
-    svg_sources: &HashSet<ResourceKey>,
-    mut pending_by_resource: HashMap<ResourceKey, Vec<SvgPendingRef>>,
+    facts: &[ResourceAnalysis],
+    svg_sources: &HashSet<ResourceOrdinal>,
+    mut pending_by_resource: HashMap<ResourceOrdinal, Vec<SvgPendingRef>>,
     references: &mut Vec<AuthoredReference>,
     coverage: &mut Vec<RelationshipCoverage>,
 ) {
@@ -328,18 +300,12 @@ pub(super) fn collect_svg_references(
             continue;
         }
         let Some(pending) = pending_by_resource.remove(&resource) else {
-            if let AnalysisOutcome::Unavailable(issue) = resource_facts.content() {
-                coverage.push(RelationshipCoverage::new(
-                    RelationshipSource::Svg(resource),
-                    CoverageState::Unavailable(*issue),
-                ));
-            }
+            push_content_coverage(coverage, RelationshipSource::Svg(resource), resource_facts);
             continue;
         };
         let Some(source_path) = resources
             .resource(resource)
-            .ok()
-            .and_then(ResourceRecord::local_path)
+            .and_then(ResourceRef::local_path)
         else {
             continue;
         };
@@ -353,29 +319,21 @@ pub(super) fn collect_svg_references(
                 pending.bases(),
                 pending.kind(),
                 source_path,
-                ReferenceContext::Svg(ElementAttribute::new(
+                ReferenceContext::Element(ElementAttribute::new(
                     pending.element(),
                     pending.attribute(),
                 )),
             );
         }
-        let state = match resource_facts.content() {
-            AnalysisOutcome::Complete(_) => CoverageState::Complete,
-            AnalysisOutcome::Partial { issue, .. } => CoverageState::Partial(*issue),
-            AnalysisOutcome::NotApplicable | AnalysisOutcome::Unavailable(_) => unreachable!(),
-        };
-        coverage.push(RelationshipCoverage::new(
-            RelationshipSource::Svg(resource),
-            state,
-        ));
+        push_content_coverage(coverage, RelationshipSource::Svg(resource), resource_facts);
     }
 }
 
 pub(crate) fn collect_smil_references(
     resources: &ResourceIndex,
-    facts: &mut [ResourceFacts],
-    smil_sources: &HashSet<ResourceKey>,
-    mut pending_by_resource: HashMap<ResourceKey, Vec<SmilPendingReference>>,
+    facts: &mut [ResourceAnalysis],
+    smil_sources: &HashSet<ResourceOrdinal>,
+    mut pending_by_resource: HashMap<ResourceOrdinal, Vec<SmilPendingReference>>,
     references: &mut Vec<AuthoredReference>,
     coverage: &mut Vec<RelationshipCoverage>,
 ) {
@@ -385,18 +343,12 @@ pub(crate) fn collect_smil_references(
             continue;
         }
         let Some(pending) = pending_by_resource.remove(&resource) else {
-            if let AnalysisOutcome::Unavailable(issue) = facts[index].content() {
-                coverage.push(RelationshipCoverage::new(
-                    RelationshipSource::Smil(resource),
-                    CoverageState::Unavailable(*issue),
-                ));
-            }
+            push_content_coverage(coverage, RelationshipSource::Smil(resource), &facts[index]);
             continue;
         };
         let Some(source_path) = resources
             .resource(resource)
-            .ok()
-            .and_then(ResourceRecord::local_path)
+            .and_then(ResourceRef::local_path)
         else {
             continue;
         };
@@ -410,11 +362,18 @@ pub(crate) fn collect_smil_references(
                 &pending.authored,
                 pending.kind,
                 source_path,
-                ReferenceContext::Smil(ElementAttribute::new(pending.element, pending.attribute)),
+                ReferenceContext::Element(ElementAttribute::new(
+                    pending.element,
+                    pending.attribute,
+                )),
             );
             resolved.push((pending.node, pending.kind, id));
         }
-        if let Some(ContentFacts::Smil(content)) = facts[index].content_mut().value_mut() {
+        if let Some(content) = facts[index]
+            .content_mut()
+            .value_mut()
+            .and_then(ContentFacts::as_smil_mut)
+        {
             for (node, kind, reference) in resolved {
                 match kind {
                     HrefRole::SmilText => content.set_text_reference(node, reference),
@@ -423,14 +382,6 @@ pub(crate) fn collect_smil_references(
                 }
             }
         }
-        let state = match facts[index].content() {
-            AnalysisOutcome::Partial { issue, .. } => CoverageState::Partial(*issue),
-            AnalysisOutcome::Complete(_) => CoverageState::Complete,
-            AnalysisOutcome::NotApplicable | AnalysisOutcome::Unavailable(_) => continue,
-        };
-        coverage.push(RelationshipCoverage::new(
-            RelationshipSource::Smil(resource),
-            state,
-        ));
+        push_content_coverage(coverage, RelationshipSource::Smil(resource), &facts[index]);
     }
 }

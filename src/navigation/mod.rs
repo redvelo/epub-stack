@@ -2,24 +2,49 @@
 //!
 //! Use [`parse::epub_nav`] or [`parse::ncx`] to read a navigation document. Inspect its lists
 //! through [`NavigationDocument`], build points with [`NavigationPoint::builder`], and use
-//! [`Navigation::to_normalized_xhtml`] to generate EPUB navigation XHTML. [`Navigation`] holds
-//! the source selected when an [`crate::Epub`] is opened; it does not merge EPUB NAV with a
-//! fallback or secondary NCX document.
+//! [`NavigationDocument::to_normalized_xhtml`] to generate EPUB navigation XHTML.
+//! [`crate::Epub::navigation`] returns the document selected when a publication is opened.
 //!
-//! Labels and headings use [`EpubString`], so leading and trailing Unicode whitespace is removed.
-//! Point trees are limited to 128 navigation levels. The model retains original hrefs and
-//! semantic tokens, but not arbitrary markup, attributes, comments, or byte layout. Generated
-//! navigation is therefore not a byte-for-byte copy of the source.
+//! Labels and headings are trimmed. Original hrefs and semantic tokens are retained;
+//! arbitrary markup and source formatting are not.
+//!
+//! Read the table of contents, including nested sections.
+//!
+//! ```
+//! use epub_stack::{EpubZip, navigation::NavigationPoint};
+//!
+//! fn print_toc(points: &[NavigationPoint], depth: usize) {
+//!     for point in points {
+//!         if let Some(label) = point.label() {
+//!             println!("{:indent$}{label}", "", indent = depth * 2);
+//!         }
+//!         print_toc(point.children(), depth + 1);
+//!     }
+//! }
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let book = EpubZip::open("fixtures/real/alice-in-wonderland.epub")?.default_rendition()?;
+//!
+//! if let Some(toc) = book.navigation().and_then(|navigation| navigation.toc()) {
+//!     print_toc(toc.points(), 0);
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Use [`NavigationDocument::page_list`] or [`NavigationDocument::landmarks`] for other lists.
 
 pub mod parse;
 
-mod generate;
+pub(crate) mod generate;
 
-pub(crate) use generate::NavigationGenerateError;
+pub use generate::NavigationGenerateError;
+
+pub mod facts;
 
 use crate::{
     resource::{AuthoredHref, EpubHref, EpubPath},
-    semantics::{DpubAriaRole, EpubStructuralSemantic, HeadingLevel},
+    semantics::{EpubStructuralSemantic, HeadingLevel, SemanticToken},
     string::EpubString,
 };
 
@@ -30,23 +55,14 @@ const MAX_NAV_DEPTH: usize = 128;
 #[error("Navigation nesting exceeds the supported depth")]
 pub struct NavigationDepthError;
 
-/// Failure to serialize selected normalized navigation as EPUB navigation XHTML.
-#[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum NavigationXhtmlError {
-    /// No navigation document was selected.
-    #[error("Cannot serialize navigation XHTML without a selected navigation document")]
-    NoDocument,
-    /// The normalized navigation document could not be encoded as XHTML.
-    #[error("Could not serialize navigation XHTML: {message}")]
-    Serialization {
-        /// The underlying XML writer failure rendered for diagnostics.
-        message: String,
-    },
-}
-
 /// A heading associated with a navigation list.
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct Heading {
     level: HeadingLevel,
     text: EpubString,
@@ -75,113 +91,23 @@ impl Heading {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Hash, Default)]
-/// The selected navigation state for a publication.
+/// A book's table of contents, page list and landmarks, whether they came from an EPUB
+/// navigation document or a legacy NCX.
 ///
-/// Ordinary opening retains zero or one document: EPUB NAV when usable, otherwise the
-/// usable NCX fallback. Declared secondary navigation resources remain outside this model.
-pub struct Navigation {
-    document: Option<NavigationDocument>,
-}
-
-impl Navigation {
-    /// Creates navigation containing the selected document.
-    pub fn new(document: NavigationDocument) -> Self {
-        Self {
-            document: Some(document),
-        }
-    }
-
-    /// Creates navigation with no successfully loaded document.
-    pub fn empty() -> Self {
-        Self::default()
-    }
-
-    /// Whether no navigation document was selected.
-    pub fn is_empty(&self) -> bool {
-        self.document.is_none()
-    }
-
-    pub(crate) fn replace_epub_nav(&mut self, document: NavigationDocument) {
-        self.document = Some(document);
-    }
-
-    pub(crate) fn remove_source(&mut self, source: NavigationSource) {
-        if self
-            .document
-            .as_ref()
-            .is_some_and(|document| document.source() == source)
-        {
-            self.document = None;
-        }
-    }
-
-    /// The selected document, if it came from EPUB NAV.
-    pub fn epub_nav(&self) -> Option<&NavigationDocument> {
-        self.document
-            .as_ref()
-            .filter(|document| document.source() == NavigationSource::EpubNav)
-    }
-
-    /// The selected document, if it came from NCX.
-    pub fn ncx(&self) -> Option<&NavigationDocument> {
-        self.document
-            .as_ref()
-            .filter(|document| document.source() == NavigationSource::Ncx)
-    }
-
-    /// The selected navigation document.
-    pub fn document(&self) -> Option<&NavigationDocument> {
-        self.document.as_ref()
-    }
-
-    /// The selected document's first table-of-contents list.
-    pub fn toc(&self) -> Option<&NavigationList> {
-        self.document().and_then(NavigationDocument::toc)
-    }
-
-    /// The selected document's first page list.
-    pub fn page_list(&self) -> Option<&NavigationList> {
-        self.document().and_then(NavigationDocument::page_list)
-    }
-
-    /// The selected document's first landmarks list.
-    pub fn landmarks(&self) -> Option<&NavigationList> {
-        self.document().and_then(NavigationDocument::landmarks)
-    }
-
-    /// Serializes the selected document as normalized EPUB navigation XHTML.
-    ///
-    /// EPUB NAV and NCX sources are projected through the same normalized list and point
-    /// semantics. Href strings retain their authored spelling relative to the selected
-    /// [`NavigationDocument::path`]; this operation does not relocate the document.
-    ///
-    /// This is a lossy semantic projection: publisher markup and source-only evidence not
-    /// represented by the normalized model may be omitted. It does not mutate publication
-    /// state or change ordinary no-op publication export behavior.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`NavigationXhtmlError::NoDocument`] when no document is selected, or
-    /// [`NavigationXhtmlError::Serialization`] when XHTML encoding fails.
-    pub fn to_normalized_xhtml(&self, title: &EpubString) -> Result<String, NavigationXhtmlError> {
-        let document = self.document().ok_or(NavigationXhtmlError::NoDocument)?;
-        document
-            .generate_epub_nav_xhtml(document.path(), title)
-            .map_err(|source| NavigationXhtmlError::Serialization {
-                message: source.to_string(),
-            })
-    }
-}
-
-/// One parsed, normalized EPUB NAV or NCX document.
-///
-/// Hrefs remain relative authored references; resolve them against [`Self::path`] when mapping
-/// navigation points to publication resources.
+/// Hrefs are kept exactly as written. Resolving one means accounting for both [`Self::path`]
+/// and [`Self::authored_base`], so prefer
+/// [`Epub::navigation_targets`](crate::Epub::navigation_targets).
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct NavigationDocument {
     source: NavigationSource,
     path: EpubPath,
+    authored_base: Option<AuthoredHref>,
     lists: Vec<NavigationList>,
 }
 
@@ -196,6 +122,7 @@ impl NavigationDocument {
         Ok(Self {
             source: NavigationSource::EpubNav,
             path,
+            authored_base: None,
             lists,
         })
     }
@@ -208,6 +135,7 @@ impl NavigationDocument {
         Self {
             source,
             path,
+            authored_base: None,
             lists,
         }
     }
@@ -217,9 +145,39 @@ impl NavigationDocument {
         self.source
     }
 
+    /// Reports whether the document was parsed from an EPUB navigation document.
+    pub fn is_epub_nav(&self) -> bool {
+        self.source == NavigationSource::EpubNav
+    }
+
+    /// Reports whether the document was parsed from an NCX document.
+    pub fn is_ncx(&self) -> bool {
+        self.source == NavigationSource::Ncx
+    }
+
+    /// Serializes this document as normalized EPUB navigation XHTML.
+    ///
+    /// Accepts EPUB NAV or NCX input. Hrefs retain their authored spelling and base location;
+    /// unmodeled markup is omitted. The publication is unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NavigationGenerateError`] when generation or XHTML encoding fails.
+    pub fn to_normalized_xhtml(
+        &self,
+        title: &EpubString,
+    ) -> Result<String, NavigationGenerateError> {
+        self.generate_epub_nav_xhtml(self.path(), title)
+    }
+
     /// The document's canonical publication path.
     pub fn path(&self) -> &EpubPath {
         &self.path
+    }
+
+    /// Returns the first authored XHTML head base href, including unusable source text.
+    pub fn authored_base(&self) -> Option<&AuthoredHref> {
+        self.authored_base.as_ref()
     }
 
     /// All navigation lists in document order.
@@ -258,6 +216,12 @@ impl NavigationDocument {
 
 /// The syntax of a selected navigation document.
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "kebab-case")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub enum NavigationSource {
     /// EPUB 3 navigation XHTML.
     EpubNav,
@@ -266,13 +230,19 @@ pub enum NavigationSource {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
-/// A normalized navigation list with separately retained authored semantics.
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+/// One navigation list: a table of contents, a page list, a set of landmarks.
 pub struct NavigationList {
     semantic: Option<EpubStructuralSemantic>,
     heading: Option<Heading>,
     hidden: bool,
     points: Vec<NavigationPoint>,
-    authored_semantic_tokens: Vec<NavigationSemanticToken>,
+    authored_semantic_tokens: Vec<SemanticToken>,
 }
 
 #[bon::bon]
@@ -295,7 +265,7 @@ impl NavigationList {
     }
 
     pub(crate) fn from_semantics(
-        authored_semantic_tokens: Vec<NavigationSemanticToken>,
+        authored_semantic_tokens: Vec<SemanticToken>,
         heading: Option<Heading>,
         hidden: bool,
         points: Vec<NavigationPoint>,
@@ -310,7 +280,7 @@ impl NavigationList {
         heading: Option<Heading>,
         hidden: bool,
         points: Vec<NavigationPoint>,
-        authored_semantic_tokens: Vec<NavigationSemanticToken>,
+        authored_semantic_tokens: Vec<SemanticToken>,
     ) -> Self {
         Self {
             semantic,
@@ -345,7 +315,7 @@ impl NavigationList {
     }
 
     /// Retained authored `epub:type`, class, and role evidence.
-    pub fn authored_semantic_tokens(&self) -> &[NavigationSemanticToken] {
+    pub fn authored_semantic_tokens(&self) -> &[SemanticToken] {
         self.authored_semantic_tokens.as_slice()
     }
 
@@ -365,99 +335,14 @@ fn is_principal_list_semantic(semantic: Option<EpubStructuralSemantic>) -> bool 
     )
 }
 
-/// The authored attribute that supplied navigation semantic evidence.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
-pub enum NavigationSemanticSource {
-    /// An EPUB `type` attribute token.
-    EpubType,
-    /// An NCX `class` attribute value.
-    Class,
-    /// An ARIA `role` attribute token.
-    Role,
+pub(crate) fn first_semantics(tokens: &[SemanticToken]) -> Option<EpubStructuralSemantic> {
+    tokens.iter().find_map(SemanticToken::epub_semantic)
 }
 
-/// One retained authored navigation semantic token and its recognized meaning.
-#[derive(Debug, PartialEq, Eq, Clone, Hash)]
-pub struct NavigationSemanticToken {
-    source: NavigationSemanticSource,
-    raw: String,
-    epub_semantic: Option<EpubStructuralSemantic>,
-    dpub_role: Option<DpubAriaRole>,
-}
-
-impl NavigationSemanticToken {
-    pub(crate) fn epub_type(
-        raw: impl Into<String>,
-        semantic: Option<EpubStructuralSemantic>,
-    ) -> Self {
-        Self {
-            source: NavigationSemanticSource::EpubType,
-            raw: raw.into(),
-            epub_semantic: semantic,
-            dpub_role: None,
-        }
-    }
-
-    pub(crate) fn ncx_class(raw: impl Into<String>) -> Self {
-        Self {
-            source: NavigationSemanticSource::Class,
-            raw: raw.into(),
-            epub_semantic: None,
-            dpub_role: None,
-        }
-    }
-
-    pub(crate) fn role(raw: impl Into<String>, role: Option<DpubAriaRole>) -> Self {
-        Self {
-            source: NavigationSemanticSource::Role,
-            raw: raw.into(),
-            epub_semantic: None,
-            dpub_role: role,
-        }
-    }
-
-    /// The attribute family that supplied the token.
-    pub fn source(&self) -> NavigationSemanticSource {
-        self.source
-    }
-
-    /// The authored spelling.
-    pub fn raw(&self) -> &str {
-        &self.raw
-    }
-
-    /// A recognized meaning asserted by an EPUB `type` token.
-    pub fn epub_semantic(&self) -> Option<EpubStructuralSemantic> {
-        self.epub_semantic
-    }
-
-    /// A recognized DPUB meaning asserted by an ARIA role token.
-    pub fn dpub_role(&self) -> Option<DpubAriaRole> {
-        self.dpub_role
-    }
-
-    /// Direct EPUB meaning, or the EPUB meaning related to a DPUB role.
-    pub fn related_epub_semantic(&self) -> Option<EpubStructuralSemantic> {
-        self.epub_semantic
-            .or_else(|| self.dpub_role.and_then(DpubAriaRole::related_epub_semantic))
-    }
-}
-
-pub(crate) fn first_semantics(
-    tokens: &[NavigationSemanticToken],
-) -> Option<EpubStructuralSemantic> {
+fn first_navigation_list_semantic(tokens: &[SemanticToken]) -> Option<EpubStructuralSemantic> {
     tokens
         .iter()
-        .filter(|token| token.source() == NavigationSemanticSource::EpubType)
-        .find_map(NavigationSemanticToken::epub_semantic)
-}
-
-fn first_navigation_list_semantic(
-    tokens: &[NavigationSemanticToken],
-) -> Option<EpubStructuralSemantic> {
-    tokens
-        .iter()
-        .filter_map(NavigationSemanticToken::epub_semantic)
+        .filter_map(SemanticToken::epub_semantic)
         .find(|semantic| {
             matches!(
                 semantic,
@@ -469,10 +354,16 @@ fn first_navigation_list_semantic(
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
-/// A navigation point with normalized meaning and source-token evidence.
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+/// One entry in a navigation list, with its label and where it points.
 ///
-/// Typed construction requires a nonempty label. Parsing can still recover authored points
-/// whose labels are missing or empty.
+/// Building one requires a label. Parsing does not: a book with an unlabelled entry still
+/// produces one here.
 ///
 /// ```compile_fail
 /// use epub_stack::navigation::NavigationPoint;
@@ -486,18 +377,16 @@ pub struct NavigationPoint {
     children: Vec<NavigationPoint>,
     hidden: bool,
     semantic: Option<EpubStructuralSemantic>,
-    authored_semantic_tokens: Vec<NavigationSemanticToken>,
+    authored_semantic_tokens: Vec<SemanticToken>,
 }
 
 #[bon::bon]
 impl NavigationPoint {
     /// Builds a navigation point from a label, optional href, children, and semantic meaning.
     ///
-    /// The label is already trimmed because it is an [`EpubString`].
-    ///
     /// # Errors
     ///
-    /// Returns [`NavigationDepthError`] when the resulting tree exceeds 128 levels.
+    /// Returns [`NavigationDepthError`] when the resulting tree exceeds the nesting limit.
     #[builder]
     pub fn new(
         label: EpubString,
@@ -524,7 +413,7 @@ impl NavigationPoint {
         children: Vec<NavigationPoint>,
         hidden: bool,
         semantic: Option<EpubStructuralSemantic>,
-        authored_semantic_tokens: Vec<NavigationSemanticToken>,
+        authored_semantic_tokens: Vec<SemanticToken>,
     ) -> Self {
         Self {
             label,
@@ -571,7 +460,7 @@ impl NavigationPoint {
     }
 
     /// Retained authored semantic evidence.
-    pub fn authored_semantic_tokens(&self) -> &[NavigationSemanticToken] {
+    pub fn authored_semantic_tokens(&self) -> &[SemanticToken] {
         self.authored_semantic_tokens.as_slice()
     }
 }

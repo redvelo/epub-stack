@@ -3,26 +3,32 @@ use super::*;
 impl<'a, R: ResourceProvider> EpubEdit<'a, R> {
     /// Stages migration of an OPF 2.0 package to this library's EPUB 3 form.
     ///
-    /// The operation updates package version and modification metadata, converts known cover
+    /// The operation updates package version, sets `dcterms:modified` to `modified`, converts known cover
     /// and guide semantics, generates EPUB NAV from selected navigation, and removes only the
-    /// resolved `spine toc` NCX resource. It is explicitly lossy with respect to EPUB 2
-    /// compatibility and does not rewrite content documents.
+    /// resolved `spine toc` NCX resource. Content documents are unchanged; EPUB 2 compatibility
+    /// is not preserved.
     ///
     /// # Errors
     ///
     /// Returns [`EditError`] unless every coordinated package, NAV, and NCX step can be staged
     /// and semantically verified.
-    pub fn migrate_opf2_to_epub3(mut self) -> Result<Self> {
+    pub fn migrate_opf2_to_epub3(mut self, modified: time::OffsetDateTime) -> Result<Self> {
+        let modified = crate::package::dcterms_modified(modified)?;
         let staged_package = self.package_override.as_ref().unwrap_or(&self.epub.package);
         if staged_package.version() != Some(EpubVersion::Two) {
-            return Err(EditError::UnsupportedSemanticEdit {
-                message: "migrate_opf2_to_epub3 only supports OPF version 2.0 packages".to_string(),
-            });
+            return Err(EditError::NotOpf2);
         }
 
+        let ncx_index = staged_package.ncx_item().and_then(|selected| {
+            staged_package
+                .manifest()
+                .items()
+                .iter()
+                .position(|item| std::ptr::eq(item, selected))
+        });
         let ncx_item = staged_package.ncx_item().cloned();
         let ncx_path = if let Some(ncx_item) = &ncx_item {
-            let path = structural_manifest_href_path(ncx_item, &self.epub.package_path)
+            let path = structural_manifest_href_path(ncx_item, self.epub.resources.package_path())
                 .ok_or_else(|| invalid_navigation_href_error(ncx_item))?;
             Some(path)
         } else {
@@ -30,61 +36,52 @@ impl<'a, R: ResourceProvider> EpubEdit<'a, R> {
         };
         let ncx_id = ncx_item
             .as_ref()
-            .map(|item| selected_manifest_item_id(item).map(ToString::to_string))
+            .map(|item| {
+                item.id()
+                    .map(ToString::to_string)
+                    .ok_or_else(|| invalid_navigation_href_error(item))
+            })
             .transpose()?;
-        let cover_ids = opf2_cover_meta_ids(staged_package, &self.epub.package_path)?;
+        let cover_ids = opf2_cover_meta_ids(staged_package)?;
         for cover_id in &cover_ids {
             if staged_package.manifest_item_by_id(cover_id).is_none() {
-                return Err(EditError::StructuralXml {
-                    path: self.epub.package_path.clone(),
-                    message: format!(
-                        "OPF2 cover metadata references missing manifest item {cover_id}"
-                    ),
+                return Err(EditError::InvalidOpf2Cover {
+                    id: Some(cover_id.clone()),
                 });
             }
         }
 
         let guide_landmarks = guide_landmark_points(staged_package)?;
-        let modified = current_epub_modified_timestamp()?;
         let (nav_path, nav_item) = if let Some(nav_item) = staged_package.nav_item() {
-            let path = structural_manifest_href_path(nav_item, &self.epub.package_path)
+            let path = structural_manifest_href_path(nav_item, self.epub.resources.package_path())
                 .ok_or_else(|| invalid_navigation_href_error(nav_item))?;
             (path, None)
         } else {
             let href = self.unique_generated_nav_href_for_edit();
             let (path, _) = resolve_local_href_from_source(
                 &AuthoredHref::new(href.clone()),
-                &self.epub.package_path,
+                self.epub.resources.package_path(),
             )
             .expect("generated navigation href is a resolvable local href");
             let id = self.unique_manifest_id_for_edit("nav");
             let item = ManifestItem::builder()
-                .id(
-                    EpubString::try_new(id).map_err(|_| PackageError::EmptyField {
-                        field: "manifest item id",
-                    })?,
+                .id(EpubString::try_new(id).expect("generated manifest ID is non-empty"))
+                .href(EpubHref::try_new(&href).expect("generated navigation href is valid"))
+                .media_type(
+                    MediaType::try_from("application/xhtml+xml")
+                        .expect("static media type is valid"),
                 )
-                .href(
-                    EpubHref::try_new(&href).map_err(|_| PackageError::EmptyField {
-                        field: "manifest item href",
-                    })?,
-                )
-                .media_type(MediaType::try_from("application/xhtml+xml").map_err(|_| {
-                    PackageError::EmptyField {
-                        field: "manifest item media-type",
-                    }
-                })?)
                 .properties(vec![KnownManifestProperty::Nav.into()])
-                .build();
+                .build()?;
             (path, Some(item))
         };
 
-        if let (Some(ncx_id), Some(ncx_path)) = (&ncx_id, &ncx_path) {
+        if let (Some(_), Some(ncx_path)) = (&ncx_id, &ncx_path) {
             reject_shared_manifest_resource_path(
                 staged_package,
-                ncx_id,
+                ncx_index.expect("selected NCX belongs to the staged manifest"),
                 ncx_path,
-                &self.epub.package_path,
+                self.epub.resources.package_path(),
                 ncx_path == &nav_path,
             )?;
         }
@@ -94,19 +91,24 @@ impl<'a, R: ResourceProvider> EpubEdit<'a, R> {
             .as_ref()
             .unwrap_or(&self.epub.navigation);
         let source_navigation = staged_navigation
-            .epub_nav()
-            .or_else(|| staged_navigation.ncx())
-            .ok_or_else(|| EditError::UnsupportedSemanticEdit {
-                message: "migrate_opf2_to_epub3 requires existing EPUB NAV or NCX navigation"
-                    .to_string(),
-            })?;
+            .as_ref()
+            .filter(|document| document.is_epub_nav())
+            .or_else(|| {
+                staged_navigation
+                    .as_ref()
+                    .filter(|document| document.is_ncx())
+            })
+            .ok_or(EditError::MissingSourceNavigation)?;
         let source_nav_path = source_navigation.path().clone();
-        let guide_landmarks =
-            rebase_guide_landmarks(guide_landmarks, &self.epub.package_path, &source_nav_path)?;
+        let guide_landmarks = rebase_guide_landmarks(
+            guide_landmarks,
+            self.epub.resources.package_path(),
+            &source_nav_path,
+        )?;
         let migrated_lists = migrated_navigation_lists(source_navigation, guide_landmarks)?;
         let nav_title = staged_package
             .metadata()
-            .title()
+            .elements(DcElement::Title)
             .iter()
             .find_map(Element::content)
             .cloned()
@@ -122,11 +124,11 @@ impl<'a, R: ResourceProvider> EpubEdit<'a, R> {
         self.edit_changes
             .push(EditChange::RewriteStructuralResource {
                 path: nav_path.clone(),
-                kind: StructuralEditKind::Navigation,
+                kind: StructuralResourceKind::Navigation,
                 size_bytes: nav_size,
             });
 
-        let package_path = self.epub.package_path.clone();
+        let package_path = self.epub.resources.package_path().clone();
         let package_path_for_mutate = package_path.clone();
         let package_path_for_verify = package_path.clone();
         let modified_for_mutate = modified.clone();
@@ -154,14 +156,14 @@ impl<'a, R: ResourceProvider> EpubEdit<'a, R> {
         self.edit_changes
             .push(EditChange::RewriteStructuralResource {
                 path: package_path,
-                kind: StructuralEditKind::Package,
+                kind: StructuralResourceKind::Package,
                 size_bytes: package_size,
             });
 
         if let Some(ncx_path) = ncx_path
             && ncx_path != nav_path
         {
-            self.stage_semantic_resource_removal(ncx_path)?;
+            self.stage_semantic_resource_removal(ncx_path);
         }
 
         Ok(self)
@@ -174,7 +176,11 @@ mod tests {
     use crate::resource::provider::MemoryResourceProvider;
 
     fn memory_provider_epub() -> Epub<MemoryResourceProvider> {
-        Epub::from_provider(memory_provider(), "EPUB/package.opf").unwrap()
+        Epub::from_provider(
+            memory_provider(),
+            EpubPath::new("EPUB/package.opf").unwrap(),
+        )
+        .unwrap()
     }
 
     fn memory_provider() -> MemoryResourceProvider {
@@ -228,10 +234,11 @@ mod tests {
   <guide><reference type="text" title="Start" href="text/chapter.xhtml" /><reference type="cover" title="Cover" href="images/cover.jpg" /><reference type="notes" title="Notes" href="text/chapter.xhtml" /></guide>
 </package>"#,
         );
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
 
         epub.edit()
-            .migrate_opf2_to_epub3()
+            .migrate_opf2_to_epub3(time::OffsetDateTime::UNIX_EPOCH)
             .unwrap()
             .preview()
             .unwrap()
@@ -242,11 +249,20 @@ mod tests {
         assert!(epub.package().ncx_item().is_none());
         assert!(epub.package().spine().toc().is_none());
         assert!(epub.package().guide().is_none());
-        assert!(epub.navigation().epub_nav().is_some());
-        assert!(epub.navigation().ncx().is_none());
         assert!(
             epub.navigation()
-                .epub_nav()
+                .filter(|document| document.is_epub_nav())
+                .is_some()
+        );
+        assert!(
+            epub.navigation()
+                .filter(|document| document.is_ncx())
+                .is_none()
+        );
+        assert!(
+            epub.navigation()
+                .as_ref()
+                .filter(|document| document.is_epub_nav())
                 .unwrap()
                 .lists()
                 .iter()
@@ -264,9 +280,7 @@ mod tests {
         }));
 
         let package_xml = epub
-            .resource(ResourceSelector::path("EPUB/package.opf").unwrap())
-            .unwrap()
-            .utf8_text()
+            .utf8_text(&EpubPath::new("EPUB/package.opf").unwrap())
             .unwrap();
         assert!(package_xml.contains("version=\"3.0\""));
         assert!(package_xml.contains("properties=\"nav\""));
@@ -278,9 +292,7 @@ mod tests {
         assert!(!package_xml.contains("name=\"cover\""));
 
         let nav_xml = epub
-            .resource(ResourceSelector::EpubNav)
-            .unwrap()
-            .utf8_text()
+            .utf8_text(epub.resources().epub_nav().unwrap().local_path().unwrap())
             .unwrap();
         assert!(nav_xml.contains("<title>T</title>"));
         assert!(nav_xml.contains("epub:type=\"toc\""));
@@ -293,8 +305,8 @@ mod tests {
         assert!(nav_xml.contains("cover"));
         assert!(!nav_xml.contains("epub:type=\"footnotes\""));
         assert!(matches!(
-            epub.resource(ResourceSelector::path("EPUB/toc.ncx").unwrap()),
-            Err(crate::resource::ResourceLookupError::NotFound(_))
+            epub.bytes(&EpubPath::new("EPUB/toc.ncx").unwrap()),
+            Err(crate::resource::ResourceReadError::Missing { .. })
         ));
     }
 
@@ -310,19 +322,18 @@ mod tests {
   <spine toc="ncx"><itemref idref="chap" /></spine>
 </package>"#,
         );
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
 
         epub.edit()
-            .migrate_opf2_to_epub3()
+            .migrate_opf2_to_epub3(time::OffsetDateTime::UNIX_EPOCH)
             .unwrap()
             .preview()
             .unwrap()
             .commit();
 
         let package_xml = epub
-            .resource(ResourceSelector::path("EPUB/package.opf").unwrap())
-            .unwrap()
-            .utf8_text()
+            .utf8_text(&EpubPath::new("EPUB/package.opf").unwrap())
             .unwrap();
         assert!(package_xml.contains("id=\"selected\""));
         assert!(package_xml.contains("id=\"duplicate\""));
@@ -350,10 +361,11 @@ mod tests {
   <guide><reference type="text" title="Start" href="text/chapter.xhtml" /></guide>
 </package>"#,
         );
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
 
         epub.edit()
-            .migrate_opf2_to_epub3()
+            .migrate_opf2_to_epub3(time::OffsetDateTime::UNIX_EPOCH)
             .unwrap()
             .preview()
             .unwrap()
@@ -366,9 +378,7 @@ mod tests {
         assert!(epub.package().guide().is_none());
 
         let package_xml = epub
-            .resource(ResourceSelector::path("EPUB/package.opf").unwrap())
-            .unwrap()
-            .utf8_text()
+            .utf8_text(&EpubPath::new("EPUB/package.opf").unwrap())
             .unwrap();
         let mut xot = Xot::new();
         let doc = xot.parse(&package_xml).unwrap();
@@ -389,8 +399,11 @@ mod tests {
     #[test]
     fn migrate_opf2_to_epub3_rejects_non_opf2_package() {
         let mut epub = memory_provider_epub();
-        let error = epub.edit().migrate_opf2_to_epub3().unwrap_err();
-        assert!(matches!(error, EditError::UnsupportedSemanticEdit { .. }));
+        let error = epub
+            .edit()
+            .migrate_opf2_to_epub3(time::OffsetDateTime::UNIX_EPOCH)
+            .unwrap_err();
+        assert!(matches!(error, EditError::NotOpf2));
     }
 
     #[test]
@@ -402,9 +415,13 @@ mod tests {
   <spine toc="ncx"><itemref idref="chap" /></spine>
 </package>"#,
         );
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
-        let error = epub.edit().migrate_opf2_to_epub3().unwrap_err();
-        assert!(matches!(error, EditError::StructuralXml { .. }));
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
+        let error = epub
+            .edit()
+            .migrate_opf2_to_epub3(time::OffsetDateTime::UNIX_EPOCH)
+            .unwrap_err();
+        assert!(matches!(error, EditError::InvalidOpf2Cover { .. }));
     }
 
     #[test]
@@ -416,9 +433,13 @@ mod tests {
   <spine toc="ncx"><itemref idref="chap" /></spine>
 </package>"#,
         );
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
-        let error = epub.edit().migrate_opf2_to_epub3().unwrap_err();
-        assert!(matches!(error, EditError::StructuralXml { .. }));
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
+        let error = epub
+            .edit()
+            .migrate_opf2_to_epub3(time::OffsetDateTime::UNIX_EPOCH)
+            .unwrap_err();
+        assert!(matches!(error, EditError::InvalidOpf2Cover { .. }));
     }
 
     #[test]
@@ -438,8 +459,12 @@ mod tests {
             ),
         ])
         .unwrap();
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
-        let error = epub.edit().migrate_opf2_to_epub3().unwrap_err();
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
+        let error = epub
+            .edit()
+            .migrate_opf2_to_epub3(time::OffsetDateTime::UNIX_EPOCH)
+            .unwrap_err();
         assert!(matches!(error, EditError::InvalidNavigationHref { .. }));
     }
 
@@ -456,28 +481,25 @@ mod tests {
             ("EPUB/archive.ncx", br#"<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/"><navMap /></ncx>"#.to_vec()),
             ("EPUB/text/chapter.xhtml", b"<html><body>Chapter</body></html>".to_vec()),
         ]).unwrap();
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
         epub.edit()
-            .migrate_opf2_to_epub3()
+            .migrate_opf2_to_epub3(time::OffsetDateTime::UNIX_EPOCH)
             .unwrap()
             .preview()
             .unwrap()
             .commit();
         let package_xml = epub
-            .resource(ResourceSelector::path("EPUB/package.opf").unwrap())
-            .unwrap()
-            .utf8_text()
+            .utf8_text(&EpubPath::new("EPUB/package.opf").unwrap())
             .unwrap();
         assert!(!package_xml.contains("href=\"toc.ncx\""));
         assert!(package_xml.contains("href=\"archive.ncx\""));
         assert!(matches!(
-            epub.resource(ResourceSelector::path("EPUB/toc.ncx").unwrap()),
-            Err(crate::resource::ResourceLookupError::NotFound(_))
+            epub.bytes(&EpubPath::new("EPUB/toc.ncx").unwrap()),
+            Err(crate::resource::ResourceReadError::Missing { .. })
         ));
         assert!(
-            epub.resource(ResourceSelector::path("EPUB/archive.ncx").unwrap())
-                .unwrap()
-                .utf8_text()
+            epub.utf8_text(&EpubPath::new("EPUB/archive.ncx").unwrap())
                 .unwrap()
                 .contains("<ncx")
         );
@@ -486,20 +508,38 @@ mod tests {
     #[test]
     fn opf2_guide_types_map_to_epub3_landmark_semantics() {
         use crate::semantics::EpubStructuralSemantic::{Bodymatter, Dedication, Loi, Lot};
-        assert_eq!(guide_semantics(ReferenceType::Dedication), Some(Dedication));
-        assert_eq!(guide_semantics(ReferenceType::Loi), Some(Loi));
-        assert_eq!(guide_semantics(ReferenceType::Lot), Some(Lot));
-        assert_eq!(guide_semantics(ReferenceType::Text), Some(Bodymatter));
-        assert_eq!(guide_semantics(ReferenceType::Notes), None);
+        assert_eq!(
+            guide_semantics(&ReferenceType::Dedication),
+            Some(Dedication)
+        );
+        assert_eq!(guide_semantics(&ReferenceType::Loi), Some(Loi));
+        assert_eq!(guide_semantics(&ReferenceType::Lot), Some(Lot));
+        assert_eq!(guide_semantics(&ReferenceType::Text), Some(Bodymatter));
+        assert_eq!(guide_semantics(&ReferenceType::Notes), None);
     }
 
     #[test]
     fn migrate_opf2_to_epub3_rejects_malformed_guide_hrefs() {
-        for (attribute, expected_reason) in [
-            ("", "href is missing"),
-            (r#" href="""#, "href is empty"),
-            (r#" href="   ""#, "href is whitespace-only"),
-            (r#" href="chapter%ZZ.xhtml""#, "href has invalid syntax"),
+        for (attribute, expected) in [
+            ("", GuideHrefFailure::Missing),
+            (
+                r#" href="""#,
+                GuideHrefFailure::Blank {
+                    href: String::new(),
+                },
+            ),
+            (
+                r#" href="   ""#,
+                GuideHrefFailure::Blank {
+                    href: "   ".to_string(),
+                },
+            ),
+            (
+                r#" href="chapter%ZZ.xhtml""#,
+                GuideHrefFailure::InvalidSyntax {
+                    href: "chapter%ZZ.xhtml".to_string(),
+                },
+            ),
         ] {
             let package = format!(
                 r#"<package xmlns="http://www.idpf.org/2007/opf" xmlns:dc="http://purl.org/dc/elements/1.1/" version="2.0" unique-identifier="uid">
@@ -510,10 +550,14 @@ mod tests {
 </package>"#
             );
             let provider = opf2_migration_provider(&package);
-            let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
-            let error = epub.edit().migrate_opf2_to_epub3().unwrap_err();
+            let mut epub =
+                Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
+            let error = epub
+                .edit()
+                .migrate_opf2_to_epub3(time::OffsetDateTime::UNIX_EPOCH)
+                .unwrap_err();
             assert!(
-                matches!(error, EditError::InvalidGuideHref { reason, .. } if reason == expected_reason)
+                matches!(error, EditError::InvalidGuideHref { failure } if failure == expected)
             );
         }
     }
@@ -533,10 +577,11 @@ mod tests {
 </package>"#
             );
             let provider = opf2_migration_provider(&package);
-            let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+            let mut epub =
+                Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
             let preview = epub
                 .edit()
-                .migrate_opf2_to_epub3()
+                .migrate_opf2_to_epub3(time::OffsetDateTime::UNIX_EPOCH)
                 .unwrap()
                 .preview()
                 .unwrap();
@@ -554,6 +599,41 @@ mod tests {
     }
 
     #[test]
+    fn migrate_opf2_to_epub3_avoids_ambiguous_duplicate_nav_ids() {
+        let provider = opf2_migration_provider(
+            r#"<package xmlns="http://www.idpf.org/2007/opf" xmlns:dc="http://purl.org/dc/elements/1.1/" version="2.0" unique-identifier="uid">
+  <metadata><dc:title>T</dc:title><dc:identifier id="uid">id</dc:identifier><dc:language>en</dc:language></metadata>
+  <manifest>
+    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml" />
+    <item id="nav" href="reserved-a.xhtml" media-type="application/xhtml+xml" />
+    <item id="nav" href="reserved-b.xhtml" media-type="application/xhtml+xml" />
+    <item id="chap" href="text/chapter.xhtml" media-type="application/xhtml+xml" />
+  </manifest>
+  <spine toc="ncx"><itemref idref="chap" /></spine>
+</package>"#,
+        );
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
+
+        let preview = epub
+            .edit()
+            .migrate_opf2_to_epub3(time::OffsetDateTime::UNIX_EPOCH)
+            .unwrap()
+            .preview()
+            .unwrap();
+
+        assert_eq!(preview.package().nav_item().unwrap().id(), Some("nav-1"));
+        assert_eq!(
+            preview
+                .package()
+                .manifest_items_by_id("nav")
+                .unwrap()
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn migrate_opf2_to_epub3_rejects_shared_selected_ncx_transactionally() {
         let package = r#"<package xmlns="http://www.idpf.org/2007/opf" xmlns:dc="http://purl.org/dc/elements/1.1/" version="2.0" unique-identifier="uid">
   <metadata><dc:title>T</dc:title><dc:identifier id="uid">id</dc:identifier><dc:language>en</dc:language></metadata>
@@ -561,16 +641,18 @@ mod tests {
   <spine toc="ncx"><itemref idref="chap" /></spine>
 </package>"#;
         let provider = opf2_migration_provider(package);
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
-        let error = epub.edit().migrate_opf2_to_epub3().unwrap_err();
-        assert!(matches!(error, EditError::UnsupportedSemanticEdit { .. }));
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
+        let error = epub
+            .edit()
+            .migrate_opf2_to_epub3(time::OffsetDateTime::UNIX_EPOCH)
+            .unwrap_err();
+        assert!(matches!(error, EditError::SharedResourcePath { .. }));
         assert_eq!(epub.package().version(), Some(EpubVersion::Two));
         assert!(epub.package().manifest_item_by_id("ncx").is_some());
         assert!(epub.package().manifest_item_by_id("shared").is_some());
         assert!(
-            epub.resource(ResourceSelector::path("EPUB/toc.ncx").unwrap())
-                .unwrap()
-                .utf8_text()
+            epub.utf8_text(&EpubPath::new("EPUB/toc.ncx").unwrap())
                 .unwrap()
                 .contains("<ncx")
         );
@@ -585,15 +667,17 @@ mod tests {
   <spine toc="ncx"><itemref idref="chap" /></spine>
 </package>"#,
         );
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
         let nav_item = ManifestItem::builder()
             .id(EpubString::try_new("nav").unwrap())
             .href(EpubHref::try_new("./toc.ncx").unwrap())
             .media_type(MediaType::try_from("application/xhtml+xml").unwrap())
             .properties(vec![KnownManifestProperty::Nav.into()])
-            .build();
+            .build()
+            .unwrap();
         let mut edit = epub.edit();
-        let package_path = edit.epub.package_path.clone();
+        let package_path = edit.epub.resources.package_path().clone();
         let package_path_for_mutate = package_path.clone();
         let nav_item_for_mutate = nav_item.clone();
         edit.stage_package_edit(
@@ -611,7 +695,11 @@ mod tests {
             },
         )
         .unwrap();
-        let preview = edit.migrate_opf2_to_epub3().unwrap().preview().unwrap();
+        let preview = edit
+            .migrate_opf2_to_epub3(time::OffsetDateTime::UNIX_EPOCH)
+            .unwrap()
+            .preview()
+            .unwrap();
         assert!(!preview.changes().iter().any(|change| matches!(change, EditChange::RemoveResource { path } if path.as_str() == "EPUB/toc.ncx")));
         preview.commit();
         assert!(epub.package().manifest_item_by_id("ncx").is_none());
@@ -625,9 +713,7 @@ mod tests {
             "./toc.ncx"
         );
         assert!(
-            epub.resource(ResourceSelector::EpubNav)
-                .unwrap()
-                .utf8_text()
+            epub.utf8_text(epub.resources().epub_nav().unwrap().local_path().unwrap())
                 .unwrap()
                 .contains("<html")
         );

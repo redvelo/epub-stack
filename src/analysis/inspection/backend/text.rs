@@ -1,4 +1,4 @@
-use super::{AnalysisIssue, InspectionKind};
+use super::{AnalysisIssue, InspectionData};
 use crate::analysis::inspection::{Text, TextEncoding, WebVtt};
 
 pub(super) fn inspect(bytes: &[u8], complete: bool) -> Text {
@@ -23,19 +23,18 @@ pub(super) fn inspect(bytes: &[u8], complete: bool) -> Text {
 pub(super) fn inspect_webvtt(
     bytes: &[u8],
     complete: bool,
-) -> (InspectionKind, Option<AnalysisIssue>) {
+) -> (Option<InspectionData>, Option<AnalysisIssue>) {
     if !complete {
-        return (InspectionKind::WebVtt(WebVtt::new(None, None)), None);
+        return (None, None);
     }
-    let text = match decode_text(bytes) {
-        Some(text) => text,
-        None => return (InspectionKind::WebVtt(WebVtt::new(Some(false), None)), None),
+    let Some(text) = decode_text(bytes) else {
+        return (None, Some(AnalysisIssue::Malformed));
     };
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
     let (valid, cue_count) = scan_webvtt(text);
     (
-        InspectionKind::WebVtt(WebVtt::new(Some(valid), Some(cue_count))),
-        None,
+        Some(InspectionData::WebVtt(WebVtt::new(cue_count))),
+        (!valid).then_some(AnalysisIssue::Malformed),
     )
 }
 
@@ -175,7 +174,9 @@ fn decode_text(bytes: &[u8]) -> Option<String> {
             return None;
         }
         let units = content
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect::<Vec<_>>();
         String::from_utf16(&units).ok()
@@ -184,7 +185,9 @@ fn decode_text(bytes: &[u8]) -> Option<String> {
             return None;
         }
         let units = content
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
             .collect::<Vec<_>>();
         String::from_utf16(&units).ok()
@@ -204,36 +207,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn invalid_webvtt_is_a_completed_semantic_result() {
-        let (kind, issue) = inspect_webvtt(b"not vtt", true);
-        let InspectionKind::WebVtt(vtt) = kind else {
+    fn invalid_webvtt_is_a_malformed_partial_result() {
+        let (data, issue) = inspect_webvtt(b"not vtt", true);
+        let Some(InspectionData::WebVtt(vtt)) = data else {
             panic!()
         };
-        assert_eq!(vtt.valid(), Some(false));
-        assert_eq!(issue, None);
+        assert_eq!(vtt.cue_count(), 0);
+        assert_eq!(issue, Some(AnalysisIssue::Malformed));
     }
 
     #[test]
     fn webvtt_validates_cue_timestamps_and_ordering() {
-        let (kind, _) = inspect_webvtt(
+        let (data, issue) = inspect_webvtt(
             b"WEBVTT\n\ncue\n00:01.000 --> 00:02.000 align:start\nText\n",
             true,
         );
-        let InspectionKind::WebVtt(vtt) = kind else {
+        let Some(InspectionData::WebVtt(vtt)) = data else {
             panic!()
         };
-        assert_eq!((vtt.valid(), vtt.cue_count()), (Some(true), Some(1)));
+        assert_eq!((issue, vtt.cue_count()), (None, 1));
 
         for bytes in [
             b"WEBVTT\n\n00:60.000 --> 01:00.000\nText\n".as_slice(),
             b"WEBVTT\n\n00:02.000 --> 00:01.000\nText\n".as_slice(),
             b"WEBVTT\n\ngarbage\n".as_slice(),
         ] {
-            let (kind, _) = inspect_webvtt(bytes, true);
-            let InspectionKind::WebVtt(vtt) = kind else {
-                panic!()
-            };
-            assert_eq!(vtt.valid(), Some(false));
+            let (_, issue) = inspect_webvtt(bytes, true);
+            assert_eq!(issue, Some(AnalysisIssue::Malformed));
         }
     }
 
@@ -243,11 +243,7 @@ mod tests {
         assert_eq!(text.encoding(), None);
         assert!(!text.has_byte_order_mark());
 
-        let (kind, _) = inspect_webvtt(b"WEBVTT\n\n00:00.000 --> 00:01.000\nCue\n", false);
-        let InspectionKind::WebVtt(vtt) = kind else {
-            panic!()
-        };
-        assert_eq!(vtt.valid(), None);
-        assert_eq!(vtt.cue_count(), None);
+        let (data, _) = inspect_webvtt(b"WEBVTT\n\n00:00.000 --> 00:01.000\nCue\n", false);
+        assert!(data.is_none());
     }
 }

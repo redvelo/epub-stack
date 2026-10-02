@@ -10,21 +10,24 @@ use crate::resource::{AuthoredHref, ParsedHref, parse_href};
 use super::{Annotation, AnnotationError, AnnotationModelError, AnnotationSet};
 
 pub(super) const ANNOTATIONS_JSON: &str = "annotations.json";
-pub(crate) const MAX_ARCHIVE_ENTRIES: usize = 4_096;
-pub(crate) const MAX_ANNOTATIONS_JSON_BYTES: u64 = 8 * 1024 * 1024;
-pub(crate) const MAX_ARCHIVE_RESOURCE_BYTES: u64 = 64 * 1024 * 1024;
-pub(crate) const MAX_ARCHIVE_UNCOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const MAX_ARCHIVE_ENTRIES: usize = 65_536;
+pub(crate) const MAX_ANNOTATIONS_JSON_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_ARCHIVE_RESOURCE_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const MAX_ARCHIVE_UNCOMPRESSED_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Reports why an annotation ZIP bundle could not be read, built, changed, or written.
-///
-/// Bundle operations enforce 4,096 non-directory entries, 8 MiB for `annotations.json`, 64 MiB
-/// per detached resource, and 256 MiB total uncompressed data. Limits apply to declared sizes and
-/// bounded actual reads, protecting against misleading ZIP metadata.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum AnnotationBundleError {
     /// The archive did not contain `annotations.json`.
     #[error("missing annotations.json in annotation archive")]
     MissingAnnotationsJson,
+    /// Annotation JSON bytes were not valid UTF-8.
+    #[error("annotation JSON is not valid UTF-8: {source}")]
+    InvalidUtf8 {
+        /// The UTF-8 decoding error.
+        source: std::str::Utf8Error,
+    },
     /// An archive or resource path was unsafe or non-canonical.
     #[error("invalid annotation bundle path: {path}")]
     InvalidPath {
@@ -146,7 +149,7 @@ impl AnnotationResource {
     }
 }
 
-/// Exchanges an annotation set with exactly the audiovisual resources it references.
+/// An annotation set together with the audio and image files its annotations point at.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AnnotationBundle {
     pub(super) set: AnnotationSet,
@@ -159,7 +162,7 @@ impl AnnotationBundle {
         set: AnnotationSet,
         resources: Vec<AnnotationResource>,
     ) -> Result<Self, AnnotationBundleError> {
-        validate_bundle(&set, &resources)?;
+        validate_bundle(&set, resources.iter())?;
         Ok(Self { set, resources })
     }
 
@@ -184,11 +187,7 @@ impl AnnotationBundle {
         annotation: Annotation,
         resources: Vec<AnnotationResource>,
     ) -> Result<(), AnnotationBundleError> {
-        let mut set = self.set.clone();
-        set.add_annotation(annotation)?;
-        let resources = resources_for_set(&set, self.resources.clone(), resources)?;
-        *self = Self::new(set, resources)?;
-        Ok(())
+        self.change(resources, |set| set.add_annotation(annotation))
     }
 
     /// Replaces an annotation and updates its resources as one atomic change.
@@ -197,23 +196,65 @@ impl AnnotationBundle {
         annotation: Annotation,
         resources: Vec<AnnotationResource>,
     ) -> Result<Annotation, AnnotationBundleError> {
-        let mut set = self.set.clone();
-        let replaced = set.replace_annotation(annotation)?;
-        let resources = resources_for_set(&set, self.resources.clone(), resources)?;
-        *self = Self::new(set, resources)?;
-        Ok(replaced)
+        self.change(resources, |set| set.replace_annotation(annotation))
     }
 
     /// Removes an annotation and now-unreferenced resources as one atomic change.
     pub fn remove_annotation(&mut self, id: &str) -> Result<Annotation, AnnotationBundleError> {
-        let mut set = self.set.clone();
-        let removed = set.remove_annotation(id)?;
-        let resources = resources_for_set(&set, self.resources.clone(), Vec::new())?;
-        *self = Self::new(set, resources)?;
-        Ok(removed)
+        self.change(Vec::new(), |set| set.remove_annotation(id))
     }
 
-    /// Imports a ZIP bundle while enforcing path, entry-count, and uncompressed-size limits.
+    /// Validates a prospective change, then applies it without copying retained resource bytes.
+    fn change<T>(
+        &mut self,
+        supplied: Vec<AnnotationResource>,
+        change: impl FnOnce(&mut AnnotationSet) -> Result<T, AnnotationModelError>,
+    ) -> Result<T, AnnotationBundleError> {
+        let mut set = self.set.clone();
+        let outcome = change(&mut set)?;
+
+        let referenced = set
+            .audiovisual_body_resource_paths()
+            .collect::<HashSet<_>>();
+        let mut supplied_paths = HashSet::new();
+        for resource in &supplied {
+            if !supplied_paths.insert(resource.path()) {
+                return Err(AnnotationBundleError::DuplicatePath {
+                    path: resource.path().to_string(),
+                });
+            }
+            if !referenced.contains(resource.path()) {
+                return Err(AnnotationBundleError::UnreferencedResource {
+                    path: resource.path().to_string(),
+                });
+            }
+        }
+        let prospective = self
+            .resources
+            .iter()
+            .filter(|resource| {
+                referenced.contains(resource.path()) && !supplied_paths.contains(resource.path())
+            })
+            .chain(supplied.iter());
+        validate_bundle(&set, prospective)?;
+
+        self.resources
+            .retain(|resource| referenced.contains(resource.path()));
+        for resource in supplied {
+            match self
+                .resources
+                .iter()
+                .position(|item| item.path() == resource.path())
+            {
+                Some(index) => self.resources[index] = resource,
+                None => self.resources.push(resource),
+            }
+        }
+        self.set = set;
+        Ok(outcome)
+    }
+
+    /// Imports an annotation ZIP bundle.
     pub fn read_archive<R: Read + Seek>(reader: R) -> Result<Self, AnnotationBundleError> {
         let mut zip = ZipArchive::new(reader)?;
         let mut entry_count = 0;
@@ -266,7 +307,7 @@ impl AnnotationBundle {
 
             if path == ANNOTATIONS_JSON {
                 let content = std::str::from_utf8(&bytes)
-                    .map_err(|source| AnnotationError::Utf8 { source })?
+                    .map_err(|source| AnnotationBundleError::InvalidUtf8 { source })?
                     .to_string();
                 annotations_json = Some(content);
             } else {
@@ -282,7 +323,7 @@ impl AnnotationBundle {
 
     /// Exports a revalidated bundle as a normalized, deflated ZIP archive.
     pub fn write_archive<W: Write + Seek>(&self, writer: W) -> Result<W, AnnotationBundleError> {
-        validate_bundle(&self.set, &self.resources)?;
+        validate_bundle(&self.set, self.resources.iter())?;
         let mut zip = ZipWriter::new(writer);
         let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
         zip.start_file(ANNOTATIONS_JSON, options)?;
@@ -295,38 +336,11 @@ impl AnnotationBundle {
     }
 }
 
-fn resources_for_set(
+fn validate_bundle<'a>(
     set: &AnnotationSet,
-    mut existing: Vec<AnnotationResource>,
-    supplied: Vec<AnnotationResource>,
-) -> Result<Vec<AnnotationResource>, AnnotationBundleError> {
-    let referenced = set
-        .audiovisual_body_resource_paths()
-        .collect::<HashSet<_>>();
-    existing.retain(|resource| referenced.contains(resource.path()));
-
-    let mut supplied_paths = HashSet::new();
-    for resource in supplied {
-        let path = resource.path().to_string();
-        if !supplied_paths.insert(path.clone()) {
-            return Err(AnnotationBundleError::DuplicatePath { path });
-        }
-        if !referenced.contains(&path) {
-            return Err(AnnotationBundleError::UnreferencedResource { path });
-        }
-        if let Some(index) = existing.iter().position(|item| item.path() == path) {
-            existing[index] = resource;
-        } else {
-            existing.push(resource);
-        }
-    }
-    Ok(existing)
-}
-
-fn validate_bundle(
-    set: &AnnotationSet,
-    resources: &[AnnotationResource],
+    resources: impl Iterator<Item = &'a AnnotationResource>,
 ) -> Result<(), AnnotationBundleError> {
+    let resources = resources.collect::<Vec<_>>();
     let entry_count = resources.len().saturating_add(1);
     if entry_count > MAX_ARCHIVE_ENTRIES {
         return Err(AnnotationBundleError::EntryCountExceeded {
@@ -701,9 +715,7 @@ mod tests {
         });
         assert!(matches!(
             AnnotationBundle::read_archive(Cursor::new(bytes)),
-            Err(AnnotationBundleError::Annotation {
-                source: AnnotationError::Utf8 { .. }
-            })
+            Err(AnnotationBundleError::InvalidUtf8 { .. })
         ));
 
         let bytes = archive_with(|zip| {

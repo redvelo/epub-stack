@@ -5,7 +5,7 @@ use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 use super::ExportError;
 use crate::resource::{
     EpubPath,
-    provider::{ResourceProvider, ResourceProviderIndex},
+    provider::{ProviderIndex, ResourceProvider},
 };
 
 const MIMETYPE: &str = "mimetype";
@@ -16,7 +16,7 @@ pub(crate) trait ExportOverlay {
 
 pub(crate) fn export_provider<R: ResourceProvider, O: ExportOverlay, W: Write + Seek>(
     provider: &R,
-    index: &ResourceProviderIndex,
+    index: &ProviderIndex,
     changes: &O,
     writer: W,
 ) -> std::result::Result<W, ExportError> {
@@ -30,7 +30,7 @@ pub(crate) fn export_provider<R: ResourceProvider, O: ExportOverlay, W: Write + 
 
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     for entry in index.entries() {
-        let path = entry.path();
+        let path = &entry.path;
         if path.as_str() == MIMETYPE {
             continue;
         }

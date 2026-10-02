@@ -1,15 +1,16 @@
-use epub_stack::accessibility::{AccessibilityFact, AccessibilityObservationRef};
-use epub_stack::analysis::coverage::{CoverageState, RelationshipSource};
-use epub_stack::analysis::inspection::InspectionKind;
+use epub_stack::accessibility::{AccessibilityObservation, AccessibilityObservationRef};
+use epub_stack::analysis::AnalysisLimits;
+use epub_stack::analysis::coverage::{Completeness, RelationshipSource};
+use epub_stack::analysis::inspection::InspectionData;
 use epub_stack::analysis::reference::{
     AuthoredReference, HrefReference, HrefRole, HrefTarget, ReferenceContext,
 };
-use epub_stack::analysis::{ResourceClassification, SemanticFormat};
-use epub_stack::content::text::TextChunkKind;
+use epub_stack::content::text::TextRole;
 use epub_stack::content::{
-    ContentFacts, FormFact, MediaFact, ScriptFact, StructureFact, XhtmlFacts,
+    ContentFacts, FormFact, FragmentFact, MediaFact, ScriptFact, StructureFact, StructureRole,
+    XhtmlFacts,
 };
-use epub_stack::{AnalysisLimits, EpubZip, PublicationAnalysis};
+use epub_stack::{EpubZip, PublicationAnalysis};
 
 const MAX_FACTS_PER_CATEGORY: usize = 8;
 
@@ -21,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let book = zip.default_rendition()?;
     let analysis = book.analyze_with_limits(AnalysisLimits::default());
 
-    println!("Resources: {}", analysis.resources().len());
+    println!("Resources: {}", analysis.resources().resources().len());
     print_broken_references(&analysis);
     print_xhtml_resources(&analysis)?;
     print_stylesheets(&analysis)?;
@@ -34,13 +35,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn print_xhtml_resources(analysis: &PublicationAnalysis) -> Result<(), Box<dyn std::error::Error>> {
     println!("\nXHTML resources");
     let mut found = false;
-    for resource_facts in analysis.resource_facts() {
-        let Some(ContentFacts::Xhtml(facts)) = resource_facts.content().value() else {
+    for resource_facts in analysis.analyzed_resources() {
+        let Some(facts) = resource_facts
+            .content()
+            .value()
+            .and_then(ContentFacts::as_xhtml)
+        else {
             continue;
         };
         found = true;
-        let key = resource_facts.resource();
-        let resource = analysis.resources().resource(key)?;
+        let key = resource_facts.resource().ordinal();
+        let resource = resource_facts.resource();
         let state = relationship_state(analysis, RelationshipSource::Xhtml(key));
         println!(
             "  {} [{}]",
@@ -55,19 +60,21 @@ fn print_xhtml_resources(analysis: &PublicationAnalysis) -> Result<(), Box<dyn s
                 matches!(
                     observation,
                     AccessibilityObservationRef::Content { resource, .. }
-                        if resource.key() == key
+                        if resource.ordinal() == key
                 )
             })
             .count();
         println!("    accessibility observations: {accessibility_count}");
 
         let references = analysis
-            .references_from_resource(key)?
-            .filter(|reference| matches!(reference.context(), ReferenceContext::Xhtml(_)))
+            .resource(key)
+            .expect("resource belongs to this analysis")
+            .references()
+            .filter(|reference| matches!(reference.context(), ReferenceContext::Element(_)))
             .collect::<Vec<_>>();
         if references.is_empty() {
             match state {
-                Some(CoverageState::Complete) => println!("    references: none"),
+                Some(Completeness::Complete) => println!("    references: none"),
                 Some(_) => println!("    references: none recovered (coverage incomplete)"),
                 None => println!("    references: not analyzed"),
             }
@@ -92,9 +99,9 @@ fn print_xhtml_resources(analysis: &PublicationAnalysis) -> Result<(), Box<dyn s
 
 fn print_xhtml_facts(facts: &XhtmlFacts, indent: &str) {
     println!(
-        "{indent}summary: text={} code points / {} chunks, fragments={}, viewports={}, structure={}, media={}, forms={}, scripts={}",
+        "{indent}summary: text={} code points / {} spans, fragments={}, viewports={}, structure={}, media={}, forms={}, scripts={}",
         facts.text_stream().code_point_len(),
-        facts.text().len(),
+        facts.text_stream().spans().len(),
         facts.fragments().len(),
         facts.viewports().len(),
         facts.structure().len(),
@@ -125,31 +132,25 @@ fn print_xhtml_facts(facts: &XhtmlFacts, indent: &str) {
         );
     }
 
-    if !facts.text().is_empty() {
-        println!("{indent}text chunks:");
-        for chunk in facts.text().iter().take(MAX_FACTS_PER_CATEGORY) {
-            let text = chunk
-                .text(facts.text_stream())
-                .map(compact_text)
-                .unwrap_or_else(|_| "<range unavailable>".to_string());
-            let range = chunk
-                .stream_range()
-                .map(|range| format!("{}..{}", range.start(), range.end()))
-                .unwrap_or_else(|| "owned".to_string());
+    if !facts.text_stream().text().is_empty() {
+        println!("{indent}text spans:");
+        for chunk in facts.text_stream().spans().take(MAX_FACTS_PER_CATEGORY) {
+            let text = compact_text(chunk.text());
+            let range = format!("{}..{}", chunk.range().start(), chunk.range().end());
             println!(
                 "{indent}  {} {range} fragment={:?} lang={:?} dir={:?}: {:?}",
-                text_kind_label(chunk.kind()),
-                chunk.fragment(),
-                chunk.lang(),
-                chunk.dir(),
+                text_role_label(chunk.role()),
+                chunk.origin().fragment().map(FragmentFact::id),
+                chunk.origin().lang(),
+                chunk.origin().dir(),
                 text,
             );
         }
         print_remaining(
-            facts.text().len(),
+            facts.text_stream().spans().len(),
             MAX_FACTS_PER_CATEGORY,
             indent,
-            "text chunks",
+            "text spans",
         );
     }
 
@@ -159,13 +160,13 @@ fn print_xhtml_facts(facts: &XhtmlFacts, indent: &str) {
             let semantics = fact
                 .semantics()
                 .iter()
-                .map(|token| token.raw())
+                .map(|token| token.as_str())
                 .collect::<Vec<_>>()
                 .join(" ");
             println!(
                 "{indent}  {} fragment={:?} label={:?} semantics=[{}]",
                 structure_label(fact),
-                fact.fragment(),
+                fact.fragment().map(FragmentFact::id),
                 fact.label().map(compact_text),
                 semantics,
             );
@@ -239,37 +240,37 @@ fn print_xhtml_facts(facts: &XhtmlFacts, indent: &str) {
 fn relationship_state(
     analysis: &PublicationAnalysis,
     source: RelationshipSource,
-) -> Option<&CoverageState> {
+) -> Option<Completeness> {
     analysis
         .coverage()
         .relationships()
         .iter()
-        .find(|coverage| *coverage.source() == source)
-        .map(|coverage| coverage.state())
+        .find(|coverage| coverage.source == source)
+        .map(|coverage| coverage.completeness)
 }
 
-fn text_kind_label(kind: TextChunkKind) -> String {
-    match kind {
-        TextChunkKind::Body => "body".to_string(),
-        TextChunkKind::Heading { level } => format!("heading h{}", level.get()),
-        TextChunkKind::PagebreakLabel => "page-break label".to_string(),
-        TextChunkKind::FigureCaption => "figure caption".to_string(),
-        TextChunkKind::TableCaption => "table caption".to_string(),
-        TextChunkKind::AltText => "alternative text".to_string(),
+fn text_role_label(role: TextRole) -> String {
+    match role {
+        TextRole::Element => "element".to_string(),
+        TextRole::Body => "body".to_string(),
+        TextRole::Heading { level } => format!("heading h{}", level.get()),
+        TextRole::Pagebreak => "page break".to_string(),
+        TextRole::FigureCaption => "figure caption".to_string(),
+        TextRole::TableCaption => "table caption".to_string(),
     }
 }
 
 fn structure_label(fact: &StructureFact) -> String {
-    match fact {
-        StructureFact::Heading { level, .. } => format!("heading h{}", level.get()),
-        StructureFact::Pagebreak { .. } => "page break".to_string(),
-        StructureFact::Figure { .. } => "figure".to_string(),
-        StructureFact::Table { .. } => "table".to_string(),
-        StructureFact::Footnote { .. } => "footnote".to_string(),
-        StructureFact::Endnote { .. } => "endnote".to_string(),
-        StructureFact::Note { .. } => "note".to_string(),
-        StructureFact::NavigationList { .. } => "navigation list".to_string(),
-        StructureFact::PublicationSection { .. } => "publication section".to_string(),
+    match fact.role() {
+        StructureRole::Heading(level) => format!("heading h{}", level.get()),
+        StructureRole::Pagebreak => "page break".to_string(),
+        StructureRole::Figure => "figure".to_string(),
+        StructureRole::Table => "table".to_string(),
+        StructureRole::Footnote => "footnote".to_string(),
+        StructureRole::Endnote => "endnote".to_string(),
+        StructureRole::Note => "note".to_string(),
+        StructureRole::NavigationList => "navigation list".to_string(),
+        StructureRole::PublicationSection => "publication section".to_string(),
     }
 }
 
@@ -371,28 +372,28 @@ fn print_broken_references(analysis: &PublicationAnalysis) {
 fn print_stylesheets(analysis: &PublicationAnalysis) -> Result<(), Box<dyn std::error::Error>> {
     println!("\nStylesheets");
     let mut found = false;
-    for facts in analysis.resource_facts() {
-        if !matches!(
-            facts.classification().value(),
-            Some(ResourceClassification::Identified(SemanticFormat::Css))
-        ) {
+    for facts in analysis.analyzed_resources() {
+        if !matches!(facts.content().value(), Some(ContentFacts::Css)) {
             continue;
         }
         found = true;
-        let resource = analysis.resources().resource(facts.resource())?;
-        let state = relationship_state(analysis, RelationshipSource::Css(facts.resource()));
+        let resource = facts.resource();
+        let state = relationship_state(
+            analysis,
+            RelationshipSource::Css(facts.resource().ordinal()),
+        );
         println!(
             "  {} [{}]",
             resource.address().display_value(),
             state.map_or("not analyzed".to_string(), coverage_label)
         );
-        let references = analysis
-            .references_from_resource(facts.resource())?
+        let references = facts
+            .references()
             .filter(|reference| matches!(reference.context(), ReferenceContext::Css(_)))
             .collect::<Vec<_>>();
         if references.is_empty() {
             match state {
-                Some(CoverageState::Complete) => println!("    dependencies: none"),
+                Some(Completeness::Complete) => println!("    dependencies: none"),
                 Some(_) => println!("    dependencies: none recovered (coverage incomplete)"),
                 None => println!("    dependencies: not analyzed"),
             }
@@ -411,17 +412,25 @@ fn print_stylesheets(analysis: &PublicationAnalysis) -> Result<(), Box<dyn std::
 fn print_svg_resources(analysis: &PublicationAnalysis) -> Result<(), Box<dyn std::error::Error>> {
     println!("\nSVG resources");
     let mut found = false;
-    for resource_facts in analysis.resource_facts() {
-        let Some(ContentFacts::Svg(facts)) = resource_facts.content().value() else {
+    for resource_facts in analysis.analyzed_resources() {
+        let Some(facts) = resource_facts
+            .content()
+            .value()
+            .and_then(ContentFacts::as_svg)
+        else {
             continue;
         };
         found = true;
-        let key = resource_facts.resource();
-        let resource = analysis.resources().resource(key)?;
+        let key = resource_facts.resource().ordinal();
+        let resource = resource_facts.resource();
         println!("  {}", resource.address().display_value());
 
-        if let Some(inspection) = analysis.inspection_for(key)?.value()
-            && let InspectionKind::SvgImage(svg) = inspection.kind()
+        if let Some(inspection) = analysis
+            .resource(key)
+            .expect("resource belongs to this analysis")
+            .inspection()
+            .value()
+            && let InspectionData::Svg(svg) = inspection.data()
         {
             println!(
                 "    root: width={}, height={}, viewBox={}",
@@ -457,9 +466,9 @@ fn print_svg_resources(analysis: &PublicationAnalysis) -> Result<(), Box<dyn std
             for script in facts.scripts() {
                 println!(
                     "      element=<{}>, executable={}, fragment={:?}, attribute={:?}",
-                    script.element().unwrap_or("unknown"),
+                    script.element(),
                     script.is_executable(),
-                    script.fragment(),
+                    script.fragment().map(FragmentFact::id),
                     script.attribute()
                 );
             }
@@ -473,8 +482,10 @@ fn print_svg_resources(analysis: &PublicationAnalysis) -> Result<(), Box<dyn std
         }
 
         let references = analysis
-            .references_from_resource(key)?
-            .filter(|reference| matches!(reference.context(), ReferenceContext::Svg(_)))
+            .resource(key)
+            .expect("resource belongs to this analysis")
+            .references()
+            .filter(|reference| matches!(reference.context(), ReferenceContext::Element(_)))
             .collect::<Vec<_>>();
         if !references.is_empty() {
             println!("    dependencies:");
@@ -491,22 +502,24 @@ fn print_svg_resources(analysis: &PublicationAnalysis) -> Result<(), Box<dyn std
             else {
                 continue;
             };
-            if source.key() != key {
+            if source.ordinal() != key {
                 continue;
             }
-            match fact {
-                AccessibilityFact::SvgTitle(fact) if fact.subject_element() != "svg" => println!(
-                    "    nested title for <{}>#{:?}: {:?}",
-                    fact.subject_element(),
-                    fact.subject_fragment(),
-                    fact.value()
-                ),
-                AccessibilityFact::SvgDescription(fact) if fact.subject_element() != "svg" => {
+            match fact.observation() {
+                AccessibilityObservation::SvgTitle { value, .. } if fact.element() != "svg" => {
                     println!(
-                        "    nested description for <{}>#{:?}: {:?}",
-                        fact.subject_element(),
-                        fact.subject_fragment(),
-                        fact.value()
+                        "    nested title for <{}>#{:?}: {value:?}",
+                        fact.element(),
+                        fact.fragment().map(FragmentFact::id),
+                    );
+                }
+                AccessibilityObservation::SvgDescription { value, .. }
+                    if fact.element() != "svg" =>
+                {
+                    println!(
+                        "    nested description for <{}>#{:?}: {value:?}",
+                        fact.element(),
+                        fact.fragment().map(FragmentFact::id),
                     );
                 }
                 _ => {}
@@ -571,13 +584,9 @@ fn context_label(context: &ReferenceContext) -> String {
             (None, Some(property)) => property.to_string(),
             (None, None) => "CSS".to_string(),
         },
-        ReferenceContext::Svg(context) => {
+        ReferenceContext::Element(context) => {
             format!("<{}>[{}]", context.element(), context.attribute())
         }
-        ReferenceContext::Xhtml(context) => {
-            format!("<{}>[{}]", context.element(), context.attribute())
-        }
-        _ => format!("{context:?}"),
     }
 }
 
@@ -623,11 +632,11 @@ fn target_label(analysis: &PublicationAnalysis, target: &HrefTarget) -> String {
     }
 }
 
-fn coverage_label(state: &CoverageState) -> String {
+fn coverage_label(state: Completeness) -> String {
     match state {
-        CoverageState::Complete => "complete".to_string(),
-        CoverageState::Partial(issue) => format!("partial: {issue:?}"),
-        CoverageState::Unavailable(issue) => format!("unavailable: {issue:?}"),
+        Completeness::Complete => "complete".to_string(),
+        Completeness::Partial(issue) => format!("partial: {issue:?}"),
+        Completeness::Unavailable(issue) => format!("unavailable: {issue:?}"),
     }
 }
 
@@ -636,10 +645,9 @@ fn print_coverage(analysis: &PublicationAnalysis) {
     let relationships_complete = coverage
         .relationships()
         .iter()
-        .all(|entry| matches!(entry.state(), CoverageState::Complete));
+        .all(|entry| entry.completeness.is_complete());
     println!(
-        "\nCoverage complete: relationships={relationships_complete}, classification={}, fragments={}, content={}, inspection={}, fingerprints={}",
-        coverage.classification().is_complete(),
+        "\nCoverage complete: relationships={relationships_complete}, fragments={}, content={}, inspection={}, fingerprints={}",
         coverage.fragments().is_complete(),
         coverage.content().is_complete(),
         coverage.inspection().is_complete(),

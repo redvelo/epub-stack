@@ -1,7 +1,7 @@
 use crate::analysis::AnalysisIssue;
 use crate::analysis::reference::HrefRole;
 use crate::resource::AuthoredHref;
-use cssparser::{Parser, ParserInput, Token};
+use cssparser::{Parser, Token};
 
 const MAX_NESTING_DEPTH: usize = 256;
 
@@ -28,8 +28,9 @@ struct ScanContext {
 
 pub(crate) fn extract(bytes: &[u8]) -> Result<CssExtraction, AnalysisIssue> {
     let text = decode_css(bytes).ok_or(AnalysisIssue::Malformed)?;
-    let mut input = ParserInput::new(&text);
-    let mut parser = Parser::new(&mut input);
+    let mut parser = Parser::new(&text);
+    // Defer to MAX_NESTING_DEPTH so depth limiting stays reportable rather than malformed.
+    parser.set_nested_block_limit(0);
     let mut references = Vec::new();
     let mut malformed = false;
     let mut nesting_limited = false;
@@ -52,7 +53,7 @@ pub(crate) fn extract(bytes: &[u8]) -> Result<CssExtraction, AnalysisIssue> {
 }
 
 fn scan(
-    parser: &mut Parser<'_, '_>,
+    parser: &mut Parser<'_>,
     mut context: ScanContext,
     references: &mut Vec<CssPendingReference>,
     malformed: &mut bool,
@@ -116,7 +117,7 @@ fn scan(
                                 _ => {}
                             }
                         }
-                        Ok::<_, cssparser::ParseError<'_, ()>>(())
+                        Ok::<_, cssparser::ParseError<()>>(())
                     })
                     .is_err()
                 {
@@ -157,7 +158,7 @@ fn scan(
                             nesting_limited,
                             depth + 1,
                         );
-                        Ok::<_, cssparser::ParseError<'_, ()>>(())
+                        Ok::<_, cssparser::ParseError<()>>(())
                     })
                     .is_err()
                 {
@@ -205,7 +206,9 @@ fn decode_css(bytes: &[u8]) -> Option<String> {
             return None;
         }
         let units = content
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect::<Vec<_>>();
         String::from_utf16(&units).ok()
@@ -214,7 +217,9 @@ fn decode_css(bytes: &[u8]) -> Option<String> {
             return None;
         }
         let units = content
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
             .collect::<Vec<_>>();
         String::from_utf16(&units).ok()

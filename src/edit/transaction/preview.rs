@@ -1,75 +1,106 @@
 use super::*;
 
 impl<'a, R: ResourceProvider> EpubEdit<'a, R> {
-    /// Validates staged edits and returns a snapshot for inspection or commit.
+    /// Checks the staged changes and shows you the book they would produce.
     ///
-    /// The live publication remains unchanged. The preview includes the effective resource
-    /// inventory and loads embedded annotations when this transaction touched them.
+    /// The open publication is untouched until you commit.
     ///
     /// # Errors
     ///
-    /// Returns [`EditError`] when staged resources or structural models cannot form a consistent
-    /// publication snapshot.
+    /// [`EditError`] when the staged changes would not make a coherent publication.
     pub fn preview(self) -> Result<EpubEditPreview<'a, R>> {
-        self.validate_structural_coherence()?;
-        let combined_changes = merged_resource_changes(&self.epub.resource_changes, &self.changes)?;
-        let provider_index = combined_changes
-            .apply_to_index(
-                &self.epub.provider_index,
-                self.epub.open_limits.provider_index_limits(),
-            )
-            .map_err(EditError::from)?;
-        let staged_package = self
+        let mut resource_changes = self.epub.resource_changes.clone();
+        let mut changes = std::collections::BTreeMap::new();
+        for change in self.edit_changes {
+            changes.insert(change.path().clone(), change);
+        }
+        for (path, change) in self.changes.entries() {
+            match change {
+                ResourceChange::Upsert(bytes) => {
+                    resource_changes.upsert(path.clone(), bytes.clone())
+                }
+                ResourceChange::Remove if self.epub.committed_resource_exists(path) => {
+                    resource_changes.remove(path.clone());
+                }
+                ResourceChange::Remove => {
+                    changes.remove(path);
+                }
+            }
+        }
+        let provider_index =
+            resource_changes.apply_to_index(&self.epub.provider_index, &self.epub.open_limits)?;
+        let package = self
             .package_override
-            .as_ref()
-            .cloned()
             .unwrap_or_else(|| self.epub.package.clone());
-        let staged_navigation = self
+        let navigation = self
             .navigation_override
-            .clone()
             .unwrap_or_else(|| self.epub.navigation.clone());
-        let resources =
-            ResourceIndex::new(&staged_package, &self.epub.package_path, &provider_index);
-        let annotations_path = annotation_epub_path("META-INF/annotations.json")?;
-        let annotations_json_upserted = matches!(
-            self.changes.entry(annotations_path.as_path()),
-            Some(Some(_))
-        );
-        let annotations = if annotations_json_upserted {
-            Some(
-                self.epub
-                    .embedded_annotations_with_changes(&combined_changes, &provider_index)
-                    .map_err(|source| EditError::EmbeddedAnnotations { source })?
-                    .ok_or_else(|| EditError::UnsupportedSemanticEdit {
-                        message: "staged embedded annotations are missing".to_string(),
-                    })?,
-            )
-        } else if self.annotations_touched {
-            self.epub
-                .embedded_annotations_with_changes(&combined_changes, &provider_index)
-                .map_err(|source| EditError::EmbeddedAnnotations { source })?
-        } else {
-            None
-        };
-        let changes = coalesced_edit_changes(self.edit_changes);
+        let resources = ResourceIndex::new(
+            &package,
+            self.epub.resources.package_path(),
+            &provider_index,
+        )?;
         Ok(EpubEditPreview {
             epub: self.epub,
-            resource_changes: combined_changes,
-            changes,
-            package: staged_package,
-            navigation: staged_navigation,
-            annotations,
+            resource_changes,
+            provider_index,
+            changes: changes.into_values().collect(),
+            package,
+            navigation,
             resources,
         })
     }
 
-    pub(super) fn selected_local_path(&self, selector: ResourceSelector) -> Result<EpubPath> {
-        let value = format!("{selector:?}");
-        let record = self.epub.resources.select(&selector)?;
-        record
-            .local_path()
-            .cloned()
-            .ok_or(EditError::NonLocalResource { selector: value })
+    pub(super) fn staged_resource_exists(&self, path: &EpubPath) -> bool {
+        match self.changes.entry(path) {
+            Some(change) => change.is_some(),
+            None => self.epub.committed_resource_exists(path),
+        }
+    }
+
+    pub(super) fn staged_bytes(&self, path: &EpubPath) -> Result<Vec<u8>> {
+        match self.changes.entry(path) {
+            Some(Some(bytes)) => Ok(bytes.to_vec()),
+            Some(None) => Err(ResourceReadError::Missing { path: path.clone() }.into()),
+            None => Ok(committed_bytes(
+                &self.epub.container,
+                &self.epub.resource_changes,
+                path,
+            )?),
+        }
+    }
+
+    pub(super) fn staged_bytes_bounded(&self, path: &EpubPath, limit: u64) -> Result<Vec<u8>> {
+        match self.changes.entry(path) {
+            Some(Some(bytes)) => {
+                let mut staged = ResourceChanges::new();
+                staged.upsert(path.clone(), bytes.to_vec());
+                provider_bytes_with_changes_bounded(&self.epub.container, &staged, path, limit)
+            }
+            Some(None) => Err(ResourceReadError::Missing { path: path.clone() }.into()),
+            None => provider_bytes_with_changes_bounded(
+                &self.epub.container,
+                &self.epub.resource_changes,
+                path,
+                limit,
+            ),
+        }
+    }
+
+    /// Rejects raw edits of the package document and of loaded or staged navigation documents.
+    pub(super) fn reject_structural_path(&self, path: &EpubPath) -> Result<()> {
+        let kind = self.epub.structural_resource_kind(path).or_else(|| {
+            self.semantic_structural_paths
+                .contains(path)
+                .then_some(StructuralResourceKind::Navigation)
+        });
+        match kind {
+            Some(kind) => Err(EditError::StructuralResourceEdit {
+                path: path.clone(),
+                kind,
+            }),
+            None => Ok(()),
+        }
     }
 
     pub(super) fn stage_package_edit(
@@ -77,24 +108,18 @@ impl<'a, R: ResourceProvider> EpubEdit<'a, R> {
         mutate: impl FnOnce(&mut Xot, Node) -> Result<()>,
         verify: impl FnOnce(&Package) -> Result<()>,
     ) -> Result<usize> {
-        self.reject_dirty_package_base_for_semantic_edit()?;
-        let package_path = self.epub.package_path.clone();
-        let combined_changes = merged_resource_changes(&self.epub.resource_changes, &self.changes)?;
-        let package_bytes = resource_bytes_from_parts(
-            &self.epub.container,
-            &combined_changes,
-            &ResourceAddress::Local(package_path.clone()),
-        )?;
+        let package_path = self.epub.resources.package_path().clone();
+        let package_bytes = self.staged_bytes(&package_path)?;
         let package_xml = decode_structural_xml(&package_bytes, &package_path)?;
 
         let mut xot = Xot::new();
         let doc = xot
             .parse(package_xml.as_ref())
-            .map_err(|source| structural_xml_operation(package_path.clone(), source))?;
+            .map_err(|source| EditError::structural_xml(&package_path, source))?;
         mutate(&mut xot, doc)?;
         let package_xml = xot
             .to_string(doc)
-            .map_err(|source| structural_xml_operation(package_path.clone(), source))?;
+            .map_err(|source| EditError::structural_xml(&package_path, source))?;
 
         let parsed_package = Package::parse(&package_xml)?;
         verify(&parsed_package)?;
@@ -102,8 +127,7 @@ impl<'a, R: ResourceProvider> EpubEdit<'a, R> {
         let package_bytes = package_xml.into_bytes();
         let size_bytes = package_bytes.len();
         self.changes.upsert(package_path.clone(), package_bytes);
-        self.structural_edits
-            .insert(package_path, StructuralEdit::Upsert);
+        self.semantic_structural_paths.insert(package_path);
         self.package_override = Some(parsed_package);
         Ok(size_bytes)
     }
@@ -111,47 +135,38 @@ impl<'a, R: ResourceProvider> EpubEdit<'a, R> {
     pub(super) fn stage_navigation_edit(
         &mut self,
         mutate: impl FnOnce(&mut Xot, Node) -> Result<()>,
-        verify: impl FnOnce(&Navigation) -> Result<()>,
+        verify: impl FnOnce(&Option<NavigationDocument>) -> Result<()>,
     ) -> Result<usize> {
         let staged_navigation = self
             .navigation_override
             .as_ref()
             .unwrap_or(&self.epub.navigation);
-        let nav_document =
-            staged_navigation
-                .epub_nav()
-                .ok_or_else(|| EditError::UnsupportedSemanticEdit {
-                    message: "NAV semantic edits require an EPUB navigation document".to_string(),
-                })?;
-        let nav_path = nav_document.path().clone();
-        self.reject_dirty_structural_base_for_semantic_edit(&nav_path)?;
-        let combined_changes = merged_resource_changes(&self.epub.resource_changes, &self.changes)?;
-        let nav_bytes = resource_bytes_from_parts(
-            &self.epub.container,
-            &combined_changes,
-            &ResourceAddress::Local(nav_path.clone()),
-        )?;
+        let nav_path = staged_navigation
+            .as_ref()
+            .filter(|document| document.is_epub_nav())
+            .ok_or(EditError::MissingEpubNavigation)?
+            .path()
+            .clone();
+        let nav_bytes = self.staged_bytes(&nav_path)?;
         let nav_xml = decode_structural_xml(&nav_bytes, &nav_path)?;
 
         let mut xot = Xot::new();
         let doc = xot
             .parse(nav_xml.as_ref())
-            .map_err(|source| structural_xml_operation(nav_path.clone(), source))?;
+            .map_err(|source| EditError::structural_xml(&nav_path, source))?;
         mutate(&mut xot, doc)?;
         let nav_xml = xot
             .to_string(doc)
-            .map_err(|source| structural_xml_operation(nav_path.clone(), source))?;
+            .map_err(|source| EditError::structural_xml(&nav_path, source))?;
 
         let parsed_nav = parse::epub_nav(nav_path.clone(), &nav_xml)?;
-        let mut parsed_navigation = staged_navigation.clone();
-        parsed_navigation.replace_epub_nav(parsed_nav);
+        let parsed_navigation = Some(parsed_nav);
         verify(&parsed_navigation)?;
 
         let nav_bytes = nav_xml.into_bytes();
         let size_bytes = nav_bytes.len();
         self.changes.upsert(nav_path.clone(), nav_bytes);
-        self.structural_edits
-            .insert(nav_path, StructuralEdit::Upsert);
+        self.semantic_structural_paths.insert(nav_path);
         self.navigation_override = Some(parsed_navigation);
         Ok(size_bytes)
     }
@@ -163,47 +178,43 @@ impl<'a, R: ResourceProvider> EpubEdit<'a, R> {
         lists: Vec<NavigationList>,
         title: &EpubString,
     ) -> Result<usize> {
-        self.reject_dirty_structural_base_for_semantic_edit(&nav_path)?;
         let source_document = NavigationDocument::builder()
             .path(source_path)
             .lists(lists)
             .build()?;
-        let nav_xml = source_document.generate_epub_nav_xhtml(&nav_path, title)?;
-        let parsed_nav = parse::epub_nav(nav_path.clone(), &nav_xml)?;
-        let mut parsed_navigation = self
-            .navigation_override
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| self.epub.navigation.clone());
-        parsed_navigation.remove_source(NavigationSource::Ncx);
-        parsed_navigation.replace_epub_nav(parsed_nav);
+        let nav_xml = source_document
+            .generate_epub_nav_xhtml(&nav_path, title)
+            .map_err(|error| navigation_generate_error(&nav_path, error))?;
+        let parsed_navigation = Some(parse::epub_nav(nav_path.clone(), &nav_xml)?);
 
         let nav_bytes = nav_xml.into_bytes();
         let size_bytes = nav_bytes.len();
         self.changes.upsert(nav_path.clone(), nav_bytes);
-        self.structural_edits
-            .insert(nav_path, StructuralEdit::Upsert);
+        self.semantic_structural_paths.insert(nav_path);
         self.navigation_override = Some(parsed_navigation);
         Ok(size_bytes)
     }
 
-    pub(super) fn stage_semantic_resource_removal(&mut self, path: EpubPath) -> Result<()> {
-        self.reject_dirty_structural_base_for_semantic_edit(&path)?;
+    pub(super) fn stage_semantic_resource_removal(&mut self, path: EpubPath) {
         self.changes.remove(path.clone());
-        self.structural_edits
-            .insert(path.clone(), StructuralEdit::Remove);
+        self.semantic_structural_paths.insert(path.clone());
         self.edit_changes.push(EditChange::RemoveResource { path });
-        Ok(())
     }
 
     pub(super) fn unique_manifest_id_for_edit(&self, base: &str) -> String {
         let staged_package = self.package_override.as_ref().unwrap_or(&self.epub.package);
-        if staged_package.manifest_item_by_id(base).is_none() {
+        let occupied = |candidate: &str| {
+            staged_package.manifest().items().iter().any(|item| {
+                item.id()
+                    .is_some_and(|id| manifest_ids_equal(id, candidate))
+            })
+        };
+        if !occupied(base) {
             return base.to_string();
         }
         (1usize..)
             .map(|idx| format!("{base}-{idx}"))
-            .find(|id| staged_package.manifest_item_by_id(id).is_none())
+            .find(|id| !occupied(id))
             .expect("unbounded id generator")
     }
 
@@ -220,92 +231,18 @@ impl<'a, R: ResourceProvider> EpubEdit<'a, R> {
             .expect("unbounded href generator")
     }
 
-    pub(super) fn nav_href_in_use_for_edit(&self, href: &str) -> bool {
+    fn nav_href_in_use_for_edit(&self, href: &str) -> bool {
         let Some((path, _)) = resolve_local_href_from_source(
             &AuthoredHref::new(href.to_string()),
-            &self.epub.package_path,
+            self.epub.resources.package_path(),
         ) else {
             return true;
         };
         let staged_package = self.package_override.as_ref().unwrap_or(&self.epub.package);
-        if staged_package.manifest().items().iter().any(|item| {
-            manifest_item_local_resource_path(item, &self.epub.package_path)
+        staged_package.manifest().items().iter().any(|item| {
+            manifest_item_local_resource_path(item, self.epub.resources.package_path())
                 .is_some_and(|item_path| item_path == path)
-        }) {
-            return true;
-        }
-        if let Some(change) = self.changes.entry(&path) {
-            return change.is_some();
-        }
-        if let Some(change) = self.epub.resource_changes.entry(&path) {
-            return change.is_some();
-        }
-        self.epub.provider_index.get(&path).is_some()
-    }
-
-    pub(super) fn reject_dirty_package_base_for_semantic_edit(&self) -> Result<()> {
-        self.reject_dirty_structural_base_for_semantic_edit(&self.epub.package_path)
-    }
-
-    pub(super) fn reject_dirty_structural_base_for_semantic_edit(
-        &self,
-        path: &EpubPath,
-    ) -> Result<()> {
-        let Some(staged_bytes) = self.changes.entry(path.as_path()) else {
-            return Ok(());
-        };
-        let coherent = matches!(
-            (self.structural_edits.get(path), staged_bytes),
-            (Some(StructuralEdit::Upsert), Some(_)) | (Some(StructuralEdit::Remove), None)
-        );
-        if coherent {
-            return Ok(());
-        }
-        Err(self.structural_resource_edit_error(path))
-    }
-
-    pub(super) fn mark_raw_structural_overwrite(&mut self, path: &EpubPath) {
-        if self.structural_edits.contains_key(path) {
-            self.structural_edits
-                .insert(path.clone(), StructuralEdit::Overwritten);
-        }
-    }
-
-    fn validate_structural_coherence(&self) -> Result<()> {
-        if self.structural_edits.is_empty() {
-            return self
-                .epub
-                .reject_structural_resource_edits(&self.changes, &BTreeMap::new());
-        }
-        for path in self.changes.entries().keys() {
-            let structural = self.epub.structural_resource_kind(path).is_some()
-                || self.structural_edits.contains_key(path);
-            if !structural {
-                continue;
-            }
-            let coherent = matches!(
-                (
-                    self.structural_edits.get(path),
-                    self.changes.entry(path.as_path())
-                ),
-                (Some(StructuralEdit::Upsert), Some(Some(_)))
-                    | (Some(StructuralEdit::Remove), Some(None))
-            );
-            if !coherent {
-                return Err(self.structural_resource_edit_error(path));
-            }
-        }
-        Ok(())
-    }
-
-    fn structural_resource_edit_error(&self, path: &EpubPath) -> EditError {
-        EditError::StructuralResourceEdit {
-            path: path.clone(),
-            kind: self
-                .epub
-                .structural_resource_kind(path)
-                .unwrap_or(StructuralResourceKind::Navigation),
-        }
+        }) || self.staged_resource_exists(&path)
     }
 }
 
@@ -313,8 +250,7 @@ impl<'a, R: ResourceProvider> EpubEdit<'a, R> {
 mod tests {
     use super::*;
     use crate::resource::provider::{
-        MemoryResourceProvider, ResourceProviderIndex, ResourceProviderIndexError,
-        ResourceProviderIndexLimits,
+        MemoryResourceProvider, ProviderIndexError, ProviderReadError,
     };
     use std::cell::Cell;
     use std::io::Read;
@@ -344,26 +280,17 @@ mod tests {
     struct FailingIndexProvider {
         inner: MemoryResourceProvider,
         index_calls: Cell<usize>,
-        read_calls: Cell<usize>,
         entry_reader_calls: Cell<usize>,
         annotation_reads: Cell<usize>,
         fail_on_index_call: usize,
     }
 
     impl ResourceProvider for FailingIndexProvider {
-        fn read(&self, path: &EpubPath) -> crate::resource::provider::ReadResult<Vec<u8>> {
-            self.read_calls.set(self.read_calls.get() + 1);
-            if path.as_str() == "META-INF/annotations.json" {
-                self.annotation_reads.set(self.annotation_reads.get() + 1);
-            }
-            self.inner.read(path)
-        }
-
         fn read_with<T>(
             &self,
             path: &EpubPath,
             read: impl FnOnce(&mut dyn Read) -> T,
-        ) -> crate::resource::provider::ReadResult<T> {
+        ) -> std::result::Result<T, ProviderReadError> {
             self.entry_reader_calls
                 .set(self.entry_reader_calls.get() + 1);
             if path.as_str() == "META-INF/annotations.json" {
@@ -372,18 +299,18 @@ mod tests {
             self.inner.read_with(path, read)
         }
 
-        fn index(
+        fn entries(
             &self,
-            limits: &ResourceProviderIndexLimits,
-        ) -> std::result::Result<ResourceProviderIndex, ResourceProviderIndexError> {
+        ) -> std::result::Result<impl Iterator<Item = (EpubPath, Option<u64>)>, ProviderIndexError>
+        {
             let calls = self.index_calls.get() + 1;
             self.index_calls.set(calls);
             if calls == self.fail_on_index_call {
-                return Err(ResourceProviderIndexError::enumeration(
-                    std::io::Error::other("index failed"),
-                ));
+                return Err(ProviderIndexError::backend(std::io::Error::other(
+                    "index failed",
+                )));
             }
-            self.inner.index(limits)
+            self.inner.entries()
         }
     }
 
@@ -392,41 +319,42 @@ mod tests {
         let provider = FailingIndexProvider {
             inner: memory_provider(),
             index_calls: Cell::new(0),
-            read_calls: Cell::new(0),
             entry_reader_calls: Cell::new(0),
             annotation_reads: Cell::new(0),
             fail_on_index_call: 2,
         };
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
         let preview = epub
             .edit()
-            .upsert_resource("EPUB/extra.xhtml", b"extra".to_vec())
+            .upsert_resource(
+                EpubPath::new("EPUB/extra.xhtml").unwrap(),
+                b"extra".to_vec(),
+            )
             .unwrap()
             .preview()
             .unwrap();
-        let key = preview
+        let ordinal = preview
             .resources()
-            .select(&ResourceSelector::path("EPUB/extra.xhtml").unwrap())
+            .resource_by_path(&EpubPath::new("EPUB/extra.xhtml").unwrap())
             .unwrap()
-            .key();
+            .ordinal();
         let calls_before_commit = (
             preview.epub.container.index_calls.get(),
-            preview.epub.container.read_calls.get(),
             preview.epub.container.entry_reader_calls.get(),
         );
 
         preview.commit();
 
-        assert!(epub.resources().resource(key).is_ok());
+        assert!(epub.resources().resource(ordinal).is_some());
         assert!(
-            epub.resource(ResourceSelector::path("EPUB/extra.xhtml").unwrap())
+            epub.bytes(&EpubPath::new("EPUB/extra.xhtml").unwrap())
                 .is_ok()
         );
         assert_eq!(epub.container.index_calls.get(), 1);
         assert_eq!(
             (
                 epub.container.index_calls.get(),
-                epub.container.read_calls.get(),
                 epub.container.entry_reader_calls.get(),
             ),
             calls_before_commit
