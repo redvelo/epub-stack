@@ -1,13 +1,11 @@
 //! Private committed-session resource overlay.
 
+use crate::publication::EpubOpenLimits;
 use crate::resource::{
     EpubPath,
-    provider::{
-        ResourceProviderEntry, ResourceProviderIndex, ResourceProviderIndexError,
-        ResourceProviderIndexLimits,
-    },
+    provider::{ProviderIndex, ProviderIndexError},
 };
-use std::{collections::BTreeMap, path::Path};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct ResourceChanges {
@@ -37,9 +35,8 @@ impl ResourceChanges {
         &self.entries
     }
 
-    pub(crate) fn entry(&self, path: impl AsRef<Path>) -> Option<Option<&[u8]>> {
-        let path = EpubPath::new(path).ok()?;
-        match self.entries.get(&path) {
+    pub(crate) fn entry(&self, path: &EpubPath) -> Option<Option<&[u8]>> {
+        match self.entries.get(path) {
             Some(ResourceChange::Upsert(data)) => Some(Some(data.as_slice())),
             Some(ResourceChange::Remove) => Some(None),
             None => None,
@@ -48,41 +45,37 @@ impl ResourceChanges {
 
     pub(crate) fn apply_to_index(
         &self,
-        base: &ResourceProviderIndex,
-        limits: &ResourceProviderIndexLimits,
-    ) -> Result<ResourceProviderIndex, ResourceProviderIndexError> {
-        let mut entries = base.entries().to_vec();
+        base: &ProviderIndex,
+        limits: &EpubOpenLimits,
+    ) -> Result<ProviderIndex, ProviderIndexError> {
+        let mut entries = base
+            .entries()
+            .iter()
+            .map(|entry| (entry.path.clone(), entry.size_bytes))
+            .collect::<BTreeMap<_, _>>();
         for (path, change) in &self.entries {
-            let existing = entries.iter().position(|entry| entry.path() == path);
             match change {
                 ResourceChange::Upsert(data) => {
-                    let entry = ResourceProviderEntry::new(path.clone(), Some(data.len() as u64));
-                    if let Some(index) = existing {
-                        entries[index] = entry;
-                    } else {
-                        entries.push(entry);
-                    }
+                    entries.insert(path.clone(), Some(data.len() as u64));
                 }
                 ResourceChange::Remove => {
-                    if let Some(index) = existing {
-                        entries.remove(index);
-                    }
+                    entries.remove(path);
                 }
             }
         }
-        ResourceProviderIndex::try_from_entries(entries, limits)
+        ProviderIndex::build(entries, limits)
     }
 }
 
 impl crate::container::ExportOverlay for ResourceChanges {
     fn entry(&self, path: &EpubPath) -> Option<Option<&[u8]>> {
-        self.entry(path.as_path())
+        self.entry(path)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{Epub, container::EpubZip, resource::ResourceSelector};
+    use crate::{Epub, container::EpubZip, resource::EpubPath};
     use std::io::{Cursor, Read, Write};
     use zip::write::SimpleFileOptions;
     use zip::{ZipArchive, ZipWriter};
@@ -158,15 +151,9 @@ mod tests {
     fn no_op_ncx_only_export_preserves_opf_and_ncx_bytes_without_nav() {
         let epub = ncx_only_edit_epub();
         let package_source = epub
-            .resource(ResourceSelector::path("EPUB/package.opf").unwrap())
-            .unwrap()
-            .bytes()
+            .bytes(&EpubPath::new("EPUB/package.opf").unwrap())
             .unwrap();
-        let ncx_source = epub
-            .resource(ResourceSelector::path("EPUB/toc.ncx").unwrap())
-            .unwrap()
-            .bytes()
-            .unwrap();
+        let ncx_source = epub.bytes(&EpubPath::new("EPUB/toc.ncx").unwrap()).unwrap();
 
         let exported = epub.export(Cursor::new(Vec::new())).unwrap().into_inner();
 

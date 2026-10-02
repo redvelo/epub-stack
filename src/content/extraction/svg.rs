@@ -1,4 +1,4 @@
-use crate::accessibility::{AccessibilityFact, SvgAccessibilityTextFact};
+use crate::accessibility::{AccessibilityFact, AccessibilityObservation};
 use crate::analysis::reference::HrefRole;
 use crate::content::extraction::xhtml::{ElementAttrs, ExtractorState};
 use crate::content::facts::LinkFact;
@@ -16,11 +16,11 @@ thread_local! {
     static SCAN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-const SVG_NS: &[u8] = b"http://www.w3.org/2000/svg";
-const XHTML_NS: &[u8] = b"http://www.w3.org/1999/xhtml";
-const XLINK_NS: &[u8] = b"http://www.w3.org/1999/xlink";
-const XML_NS: &[u8] = b"http://www.w3.org/XML/1998/namespace";
-const EPUB_NS: &[u8] = b"http://www.idpf.org/2007/ops";
+const SVG_NS: &str = "http://www.w3.org/2000/svg";
+const XHTML_NS: &str = "http://www.w3.org/1999/xhtml";
+const XLINK_NS: &str = "http://www.w3.org/1999/xlink";
+const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
+const EPUB_NS: &str = "http://www.idpf.org/2007/ops";
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SvgScan {
@@ -30,11 +30,12 @@ pub(crate) struct SvgScan {
     view_box: Option<String>,
     accessibility_text: Vec<SvgText>,
     source_text: Vec<SvgSourceText>,
-    fragments: Vec<SvgFragment>,
+    fragments: Vec<FragmentFact>,
     scripts: Vec<ScriptFact>,
     foreign_objects: Vec<(usize, SvgForeignObjectFact)>,
     foreign_accessibility: Vec<(usize, AccessibilityFact)>,
     pending_references: Vec<SvgPendingRef>,
+    activity: crate::content::DocumentActivities,
     semantic_issue: Option<crate::analysis::AnalysisIssue>,
     malformed: bool,
     root_closed: bool,
@@ -44,9 +45,9 @@ pub(crate) struct SvgScan {
 struct SvgText {
     kind: SvgTextKind,
     value: String,
-    source_fragment: Option<String>,
+    source_fragment: Option<FragmentFact>,
     subject_element: String,
-    subject_fragment: Option<String>,
+    subject_fragment: Option<FragmentFact>,
     root_child: bool,
     element_ordinal: usize,
 }
@@ -54,21 +55,13 @@ struct SvgText {
 #[derive(Debug, Clone)]
 struct SvgSourceText {
     value: String,
-    fragment: Option<String>,
+    fragment: Option<FragmentFact>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SvgTextKind {
     Title,
     Description,
-}
-
-#[derive(Debug, Clone)]
-struct SvgFragment {
-    id: String,
-    element: String,
-    attribute: FragmentAttribute,
-    element_ordinal: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,32 +142,28 @@ impl SvgScan {
     pub(crate) fn take_analysis(
         &mut self,
     ) -> (SvgFacts, Vec<AccessibilityFact>, Vec<SvgPendingRef>) {
-        let fragments = self
-            .fragments
-            .drain(..)
-            .map(|fragment| {
-                FragmentFact::new(
-                    fragment.id,
-                    fragment.element,
-                    fragment.attribute,
-                    fragment.element_ordinal,
-                )
-            })
-            .collect();
+        let fragments = std::mem::take(&mut self.fragments);
         let mut accessibility = self
             .accessibility_text
             .iter()
             .map(|text| {
-                let fact = SvgAccessibilityTextFact::new(
+                let source_fragment = text.source_fragment.clone();
+                let value = text.value.clone();
+                let observation = match text.kind {
+                    SvgTextKind::Title => AccessibilityObservation::SvgTitle {
+                        source_fragment,
+                        value,
+                    },
+                    SvgTextKind::Description => AccessibilityObservation::SvgDescription {
+                        source_fragment,
+                        value,
+                    },
+                };
+                let fact = AccessibilityFact::new(
                     text.subject_element.clone(),
                     text.subject_fragment.clone(),
-                    text.source_fragment.clone(),
-                    text.value.clone(),
+                    observation,
                 );
-                let fact = match text.kind {
-                    SvgTextKind::Title => AccessibilityFact::SvgTitle(fact),
-                    SvgTextKind::Description => AccessibilityFact::SvgDescription(fact),
-                };
                 (text.element_ordinal, fact)
             })
             .chain(std::mem::take(&mut self.foreign_accessibility))
@@ -198,6 +187,7 @@ impl SvgScan {
                 text,
                 std::mem::take(&mut self.scripts),
                 foreign_objects,
+                self.activity,
             ),
             accessibility,
             std::mem::take(&mut self.pending_references),
@@ -232,7 +222,7 @@ struct SvgStyleCapture {
 struct ForeignObjectCapture {
     depth: usize,
     element_ordinal: usize,
-    fragment: Option<String>,
+    fragment: Option<FragmentFact>,
     projector: ExtractorState,
     projected_elements: Vec<Option<ProjectedForeignElement>>,
     inherited_base_count: usize,
@@ -270,7 +260,6 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
     let mut seen_doctype = false;
     let mut next_element_ordinal = 0usize;
     loop {
-        let decoder = reader.decoder();
         let event = match reader.read_event() {
             Ok(event) => event,
             Err(_) => {
@@ -292,6 +281,10 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                 }
                 let (namespace, local) = reader.resolver().resolve_element(element.name());
                 let in_svg_namespace = namespace_is(&namespace, SVG_NS);
+                if in_svg_namespace && is_active_svg_element(local.as_ref()) {
+                    scan.activity
+                        .insert(crate::content::DocumentActivity::Animation);
+                }
                 if depth > 0
                     && foreign_captures.is_empty()
                     && !in_svg_namespace
@@ -300,7 +293,7 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                     scan.semantic_issue = Some(crate::analysis::AnalysisIssue::Unsupported);
                 }
                 if depth == 0 {
-                    scan.is_svg = in_svg_namespace && local.as_ref() == b"svg";
+                    scan.is_svg = in_svg_namespace && local.as_ref() == "svg";
                     if !scan.is_svg {
                         break;
                     }
@@ -311,7 +304,6 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                     &mut scan,
                     &reader,
                     &element,
-                    decoder,
                     local.as_ref(),
                     element_ordinal,
                     in_svg_namespace,
@@ -328,7 +320,6 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                         foreign,
                         &reader,
                         &element,
-                        decoder,
                         &namespace,
                         local.as_ref(),
                         element_ordinal,
@@ -336,7 +327,7 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                         &base_chain,
                     );
                 }
-                if in_svg_namespace && local.as_ref() == b"foreignObject" {
+                if in_svg_namespace && local.as_ref() == "foreignObject" {
                     foreign_captures.push(ForeignObjectCapture {
                         depth: depth + 1,
                         element_ordinal,
@@ -349,8 +340,8 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                 }
                 if depth > 0 && in_svg_namespace && capture.is_none() {
                     let kind = match local.as_ref() {
-                        b"title" => Some(SvgTextKind::Title),
-                        b"desc" => Some(SvgTextKind::Description),
+                        "title" => Some(SvgTextKind::Title),
+                        "desc" => Some(SvgTextKind::Description),
                         _ => None,
                     };
                     if let Some(kind) = kind {
@@ -375,7 +366,7 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                 }
                 if depth > 0
                     && in_svg_namespace
-                    && local.as_ref() == b"text"
+                    && local.as_ref() == "text"
                     && source_text_capture.is_none()
                 {
                     let index = scan.source_text.len();
@@ -388,26 +379,19 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                         index,
                     });
                 }
-                if in_svg_namespace && local.as_ref() == b"script" {
+                if in_svg_namespace && local.as_ref() == "script" {
                     let index = scan.scripts.len();
-                    if attributes.has_href {
-                        scan.scripts.push(ScriptFact::External {
-                            fragment: nearest_fragment.clone(),
-                            script_type: attributes.script_type,
-                        });
-                    } else {
-                        scan.scripts.push(ScriptFact::Inline {
-                            fragment: nearest_fragment.clone(),
-                            script_type: attributes.script_type,
-                            has_text: false,
-                        });
-                        script_capture = Some(SvgScriptCapture {
-                            depth: depth + 1,
-                            index,
-                        });
-                    }
+                    scan.scripts.push(svg_script_fact(
+                        nearest_fragment.clone(),
+                        attributes.script_type,
+                        attributes.has_href,
+                    ));
+                    script_capture = Some(SvgScriptCapture {
+                        depth: depth + 1,
+                        index,
+                    });
                 }
-                if in_svg_namespace && local.as_ref() == b"style" && style_capture.is_none() {
+                if in_svg_namespace && local.as_ref() == "style" && style_capture.is_none() {
                     style_capture = Some(SvgStyleCapture {
                         depth: depth + 1,
                         value: String::new(),
@@ -416,7 +400,7 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                 }
                 fragment_stack.push(previous_fragment);
                 base_lengths.push(previous_base_len);
-                element_stack.push(String::from_utf8_lossy(local.as_ref()).into_owned());
+                element_stack.push(local.as_ref().to_string());
                 depth += 1;
             }
             Event::Empty(element) => {
@@ -428,6 +412,10 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                 }
                 let (namespace, local) = reader.resolver().resolve_element(element.name());
                 let in_svg_namespace = namespace_is(&namespace, SVG_NS);
+                if in_svg_namespace && is_active_svg_element(local.as_ref()) {
+                    scan.activity
+                        .insert(crate::content::DocumentActivity::Animation);
+                }
                 if depth > 0
                     && foreign_captures.is_empty()
                     && !in_svg_namespace
@@ -436,7 +424,7 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                     scan.semantic_issue = Some(crate::analysis::AnalysisIssue::Unsupported);
                 }
                 if depth == 0 {
-                    scan.is_svg = in_svg_namespace && local.as_ref() == b"svg";
+                    scan.is_svg = in_svg_namespace && local.as_ref() == "svg";
                     if !scan.is_svg {
                         break;
                     }
@@ -446,7 +434,6 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                     &mut scan,
                     &reader,
                     &element,
-                    decoder,
                     local.as_ref(),
                     element_ordinal,
                     in_svg_namespace,
@@ -464,7 +451,6 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                         foreign,
                         &reader,
                         &element,
-                        decoder,
                         &namespace,
                         local.as_ref(),
                         element_ordinal,
@@ -472,7 +458,7 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                         &effective_bases,
                     );
                 }
-                if in_svg_namespace && local.as_ref() == b"foreignObject" {
+                if in_svg_namespace && local.as_ref() == "foreignObject" {
                     finish_foreign_object(
                         &mut scan,
                         ForeignObjectCapture {
@@ -488,8 +474,8 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                 }
                 if depth > 0 && in_svg_namespace && capture.is_none() {
                     let kind = match local.as_ref() {
-                        b"title" => Some(SvgTextKind::Title),
-                        b"desc" => Some(SvgTextKind::Description),
+                        "title" => Some(SvgTextKind::Title),
+                        "desc" => Some(SvgTextKind::Description),
                         _ => None,
                     };
                     if let Some(kind) = kind {
@@ -507,25 +493,18 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                         });
                     }
                 }
-                if depth > 0 && in_svg_namespace && local.as_ref() == b"text" {
+                if depth > 0 && in_svg_namespace && local.as_ref() == "text" {
                     scan.source_text.push(SvgSourceText {
                         value: String::new(),
                         fragment: element_fragment.clone(),
                     });
                 }
-                if in_svg_namespace && local.as_ref() == b"script" {
-                    if attributes.has_href {
-                        scan.scripts.push(ScriptFact::External {
-                            fragment: element_fragment.clone(),
-                            script_type: attributes.script_type,
-                        });
-                    } else {
-                        scan.scripts.push(ScriptFact::Inline {
-                            fragment: element_fragment,
-                            script_type: attributes.script_type,
-                            has_text: false,
-                        });
-                    }
+                if in_svg_namespace && local.as_ref() == "script" {
+                    scan.scripts.push(svg_script_fact(
+                        element_fragment,
+                        attributes.script_type,
+                        attributes.has_href,
+                    ));
                 }
                 if depth == 0 {
                     scan.root_closed = true;
@@ -538,47 +517,36 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                         .last()
                         .is_some_and(Option::is_some)
                 }) {
-                    match text_content(&text) {
-                        Ok(value) => {
-                            for foreign in &mut foreign_captures {
-                                if foreign
-                                    .projected_elements
-                                    .last()
-                                    .is_some_and(Option::is_some)
-                                {
-                                    foreign.projector.push_text(&value);
-                                }
-                            }
+                    let value = text_content(&text);
+                    for foreign in &mut foreign_captures {
+                        if foreign
+                            .projected_elements
+                            .last()
+                            .is_some_and(Option::is_some)
+                        {
+                            foreign.projector.push_text(&value);
                         }
-                        Err(_) => scan.malformed = true,
                     }
                 }
                 if let Some(capture) = capture {
-                    match text_content(&text) {
-                        Ok(value) => captured_text_mut(&mut scan, capture).push_str(&value),
-                        Err(_) => scan.malformed = true,
-                    }
-                } else if depth == 0 && !text.iter().all(u8::is_ascii_whitespace) {
+                    let value = text_content(&text);
+                    captured_text_mut(&mut scan, capture).push_str(&value);
+                } else if depth == 0 && !text.trim_ascii().is_empty() {
                     scan.malformed |= scan.root_closed;
                     break;
                 }
                 if let Some(capture) = source_text_capture {
-                    match text_content(&text) {
-                        Ok(value) => scan.source_text[capture.index].value.push_str(&value),
-                        Err(_) => scan.malformed = true,
-                    }
+                    let value = text_content(&text);
+                    scan.source_text[capture.index].value.push_str(&value);
                 }
                 if let Some(capture) = script_capture
-                    && !text.iter().all(u8::is_ascii_whitespace)
-                    && let ScriptFact::Inline { has_text, .. } = &mut scan.scripts[capture.index]
+                    && !text.trim_ascii().is_empty()
                 {
-                    *has_text = true;
+                    scan.scripts[capture.index].mark_text();
                 }
                 if let Some(capture) = &mut style_capture {
-                    match text_content(&text) {
-                        Ok(value) => capture.value.push_str(&value),
-                        Err(_) => scan.malformed = true,
-                    }
+                    let value = text_content(&text);
+                    capture.value.push_str(&value);
                 }
             }
             Event::CData(text) => {
@@ -588,47 +556,36 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                         .last()
                         .is_some_and(Option::is_some)
                 }) {
-                    match cdata_content(&text) {
-                        Ok(value) => {
-                            for foreign in &mut foreign_captures {
-                                if foreign
-                                    .projected_elements
-                                    .last()
-                                    .is_some_and(Option::is_some)
-                                {
-                                    foreign.projector.push_text(&value);
-                                }
-                            }
+                    let value = cdata_content(&text);
+                    for foreign in &mut foreign_captures {
+                        if foreign
+                            .projected_elements
+                            .last()
+                            .is_some_and(Option::is_some)
+                        {
+                            foreign.projector.push_text(&value);
                         }
-                        Err(_) => scan.malformed = true,
                     }
                 }
                 if let Some(capture) = capture {
-                    match cdata_content(&text) {
-                        Ok(value) => captured_text_mut(&mut scan, capture).push_str(&value),
-                        Err(_) => scan.malformed = true,
-                    }
+                    let value = cdata_content(&text);
+                    captured_text_mut(&mut scan, capture).push_str(&value);
                 } else if depth == 0 {
                     scan.malformed = true;
                     break;
                 }
                 if let Some(capture) = source_text_capture {
-                    match cdata_content(&text) {
-                        Ok(value) => scan.source_text[capture.index].value.push_str(&value),
-                        Err(_) => scan.malformed = true,
-                    }
+                    let value = cdata_content(&text);
+                    scan.source_text[capture.index].value.push_str(&value);
                 }
                 if let Some(capture) = script_capture
-                    && !text.iter().all(u8::is_ascii_whitespace)
-                    && let ScriptFact::Inline { has_text, .. } = &mut scan.scripts[capture.index]
+                    && !text.trim_ascii().is_empty()
                 {
-                    *has_text = true;
+                    scan.scripts[capture.index].mark_text();
                 }
                 if let Some(capture) = &mut style_capture {
-                    match cdata_content(&text) {
-                        Ok(value) => capture.value.push_str(&value),
-                        Err(_) => scan.malformed = true,
-                    }
+                    let value = cdata_content(&text);
+                    capture.value.push_str(&value);
                 }
             }
             Event::GeneralRef(reference) => {
@@ -674,10 +631,8 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                     let mut value = String::new();
                     if matches!(push_general_ref(&mut value, &reference), Ok(false))
                         && !value.chars().all(char::is_whitespace)
-                        && let ScriptFact::Inline { has_text, .. } =
-                            &mut scan.scripts[capture.index]
                     {
-                        *has_text = true;
+                        scan.scripts[capture.index].mark_text();
                     }
                 }
                 if let Some(capture) = &mut style_capture {
@@ -694,7 +649,7 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                 let closing_capture = foreign_captures.iter().rposition(|foreign| {
                     foreign.depth == depth
                         && namespace_is(&namespace, SVG_NS)
-                        && local.as_ref() == b"foreignObject"
+                        && local.as_ref() == "foreignObject"
                 });
                 if let Some(index) = closing_capture {
                     finish_foreign_object(&mut scan, foreign_captures.remove(index));
@@ -742,6 +697,8 @@ pub(crate) fn scan(bytes: &[u8]) -> SvgScan {
                     break;
                 }
                 seen_doctype = true;
+                scan.activity
+                    .insert(crate::content::DocumentActivity::Doctype);
             }
             Event::Eof => break,
             _ => {}
@@ -769,9 +726,9 @@ pub(crate) fn has_svg_root(bytes: &[u8]) -> bool {
         match reader.read_event() {
             Ok(Event::Start(element) | Event::Empty(element)) => {
                 let (namespace, local) = reader.resolver().resolve_element(element.name());
-                return namespace_is(&namespace, SVG_NS) && local.as_ref() == b"svg";
+                return namespace_is(&namespace, SVG_NS) && local.as_ref() == "svg";
             }
-            Ok(Event::Text(text)) if !text.iter().all(u8::is_ascii_whitespace) => return false,
+            Ok(Event::Text(text)) if !text.trim_ascii().is_empty() => return false,
             Ok(Event::Eof) | Err(_) => return false,
             Ok(_) => {}
         }
@@ -784,9 +741,8 @@ fn project_foreign_start(
     foreign: &mut ForeignObjectCapture,
     reader: &NsReader<&[u8]>,
     element: &BytesStart<'_>,
-    decoder: quick_xml::encoding::Decoder,
     namespace: &ResolveResult<'_>,
-    local: &[u8],
+    local: &str,
     element_ordinal: usize,
     has_end: bool,
     bases: &[AuthoredHref],
@@ -808,12 +764,12 @@ fn project_foreign_start(
         return;
     }
     if namespace_is(namespace, XHTML_NS) {
-        let (attrs, malformed) = foreign_element_attrs(reader, element, decoder);
+        let (attrs, malformed) = foreign_element_attrs(reader, element);
         scan.malformed |= malformed;
-        if (local == b"style" || attrs.value("style").is_some()) && scan.semantic_issue.is_none() {
+        if (local == "style" || attrs.value("style").is_some()) && scan.semantic_issue.is_none() {
             scan.semantic_issue = Some(crate::analysis::AnalysisIssue::Unsupported);
         }
-        let element_name = String::from_utf8_lossy(local).into_owned();
+        let element_name = local.to_string();
         let first_link = foreign.projector.links_len();
         foreign
             .projector
@@ -861,7 +817,6 @@ fn project_foreign_start(
 fn foreign_element_attrs(
     reader: &NsReader<&[u8]>,
     element: &BytesStart<'_>,
-    decoder: quick_xml::encoding::Decoder,
 ) -> (ElementAttrs, bool) {
     let mut values = Vec::new();
     let mut malformed = false;
@@ -871,7 +826,7 @@ fn foreign_element_attrs(
             continue;
         };
         let (namespace, local) = reader.resolver().resolve_attribute(attribute.key);
-        let local = String::from_utf8_lossy(local.as_ref());
+        let local = local.as_ref();
         let name = if namespace_is(&namespace, XML_NS) {
             format!("xml:{local}")
         } else if namespace_is(&namespace, XLINK_NS) {
@@ -879,14 +834,39 @@ fn foreign_element_attrs(
         } else if namespace_is(&namespace, EPUB_NS) {
             format!("epub:{local}")
         } else {
-            String::from_utf8_lossy(attribute.key.as_ref()).into_owned()
+            attribute.key.as_ref().to_string()
         };
-        match attribute.decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, decoder) {
+        match attribute.normalized_value(quick_xml::XmlVersion::Implicit1_0) {
             Ok(value) => values.push((name, value.into_owned())),
             Err(_) => malformed = true,
         }
     }
     (ElementAttrs::from_values(values), malformed)
+}
+
+fn svg_script_fact(
+    fragment: Option<FragmentFact>,
+    script_type: Option<String>,
+    has_href: bool,
+) -> ScriptFact {
+    if !super::xhtml::is_executable_script_type(script_type.as_deref()) {
+        ScriptFact::DataBlock {
+            fragment,
+            script_type,
+            has_text: false,
+        }
+    } else if has_href {
+        ScriptFact::External {
+            fragment,
+            script_type,
+        }
+    } else {
+        ScriptFact::Inline {
+            fragment,
+            script_type,
+            has_text: false,
+        }
+    }
 }
 
 fn foreign_link_role(link: &LinkFact) -> HrefRole {
@@ -911,7 +891,7 @@ fn finish_foreign_object(scan: &mut SvgScan, foreign: ForeignObjectCapture) {
     let captured_accessibility = foreign.captured_accessibility;
     let element_ordinal = foreign.element_ordinal;
     let fragment = foreign.fragment;
-    let extraction = foreign.projector.finish();
+    let extraction = foreign.projector.finish(false);
     if let Some(authored_base) = extraction.authored_base {
         for pending in scan
             .pending_references
@@ -961,16 +941,15 @@ fn scan_attributes(
     scan: &mut SvgScan,
     reader: &NsReader<&[u8]>,
     element: &BytesStart<'_>,
-    decoder: quick_xml::encoding::Decoder,
-    local: &[u8],
+    local: &str,
     element_ordinal: usize,
     in_svg_namespace: bool,
     is_root: bool,
-    nearest_fragment: &mut Option<String>,
+    nearest_fragment: &mut Option<FragmentFact>,
     inherited_bases: &[AuthoredHref],
 ) -> ScannedAttributes {
     #[derive(Clone)]
-    enum AttributeKind {
+    enum RecognizedAttribute {
         Id,
         XmlId,
         XmlBase,
@@ -984,7 +963,7 @@ fn scan_attributes(
         FunctionalIri(String),
     }
 
-    let element_name = String::from_utf8_lossy(local).into_owned();
+    let element_name = local.to_string();
     let supports_href = in_svg_namespace && supports_svg_href(local);
     let mut values = Vec::new();
     for attribute in element.attributes() {
@@ -997,28 +976,26 @@ fn scan_attributes(
         let xml = namespace_is(&namespace, XML_NS);
         let xlink = namespace_is(&namespace, XLINK_NS);
         let kind = match (unbound, xml, xlink, attribute_local.as_ref()) {
-            (true, _, _, b"id") => AttributeKind::Id,
-            (_, true, _, b"id") => AttributeKind::XmlId,
-            (_, true, _, b"base") => AttributeKind::XmlBase,
-            (true, _, _, b"width") => AttributeKind::Width,
-            (true, _, _, b"height") => AttributeKind::Height,
-            (true, _, _, b"viewBox") => AttributeKind::ViewBox,
-            (true, _, _, b"href") if supports_href => AttributeKind::Href,
-            (_, _, true, b"href") if supports_href => AttributeKind::XlinkHref,
-            (true, _, _, b"type") if in_svg_namespace && local == b"script" => {
-                AttributeKind::ScriptType
+            (true, _, _, "id") => RecognizedAttribute::Id,
+            (_, true, _, "id") => RecognizedAttribute::XmlId,
+            (_, true, _, "base") => RecognizedAttribute::XmlBase,
+            (true, _, _, "width") => RecognizedAttribute::Width,
+            (true, _, _, "height") => RecognizedAttribute::Height,
+            (true, _, _, "viewBox") => RecognizedAttribute::ViewBox,
+            (true, _, _, "href") if supports_href => RecognizedAttribute::Href,
+            (_, _, true, "href") if supports_href => RecognizedAttribute::XlinkHref,
+            (true, _, _, "type") if in_svg_namespace && local == "script" => {
+                RecognizedAttribute::ScriptType
             }
             (true, _, _, name) if in_svg_namespace && is_svg_event_handler(name) => {
-                AttributeKind::EventHandler(String::from_utf8_lossy(name).into_owned())
+                RecognizedAttribute::EventHandler(name.to_string())
             }
             (true, _, _, name) if in_svg_namespace && is_functional_iri_attribute(name) => {
-                AttributeKind::FunctionalIri(String::from_utf8_lossy(name).into_owned())
+                RecognizedAttribute::FunctionalIri(name.to_string())
             }
             _ => continue,
         };
-        let value = match attribute
-            .decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, decoder)
-        {
+        let value = match attribute.normalized_value(quick_xml::XmlVersion::Implicit1_0) {
             Ok(value) => value.into_owned(),
             Err(_) => {
                 scan.malformed = true;
@@ -1028,7 +1005,7 @@ fn scan_attributes(
         values.push((kind, value));
     }
     let own_base = values.iter().find_map(|(kind, value)| {
-        matches!(kind, AttributeKind::XmlBase).then(|| AuthoredHref::new(value.clone()))
+        matches!(kind, RecognizedAttribute::XmlBase).then(|| AuthoredHref::new(value.clone()))
     });
     let mut effective_bases = inherited_bases.to_vec();
     if let Some(base) = &own_base {
@@ -1036,45 +1013,47 @@ fn scan_attributes(
     }
     for (kind, value) in &values {
         match kind {
-            AttributeKind::Id => {
-                scan.fragments.push(SvgFragment {
-                    id: value.clone(),
-                    element: element_name.clone(),
-                    attribute: FragmentAttribute::Id,
+            RecognizedAttribute::Id => {
+                let fragment = FragmentFact::new(
+                    value.clone(),
+                    element_name.clone(),
+                    FragmentAttribute::Id,
                     element_ordinal,
-                });
-                *nearest_fragment = Some(value.clone());
+                );
+                scan.fragments.push(fragment.clone());
+                *nearest_fragment = Some(fragment);
             }
-            AttributeKind::XmlId => {
-                scan.fragments.push(SvgFragment {
-                    id: value.clone(),
-                    element: element_name.clone(),
-                    attribute: FragmentAttribute::XmlId,
+            RecognizedAttribute::XmlId => {
+                let fragment = FragmentFact::new(
+                    value.clone(),
+                    element_name.clone(),
+                    FragmentAttribute::XmlId,
                     element_ordinal,
-                });
-                *nearest_fragment = Some(value.clone());
+                );
+                scan.fragments.push(fragment.clone());
+                *nearest_fragment = Some(fragment);
             }
-            AttributeKind::Width if is_root => scan.width = Some(value.clone()),
-            AttributeKind::Height if is_root => scan.height = Some(value.clone()),
-            AttributeKind::ViewBox if is_root => scan.view_box = Some(value.clone()),
-            AttributeKind::XmlBase
-            | AttributeKind::Href
-            | AttributeKind::XlinkHref
-            | AttributeKind::ScriptType
-            | AttributeKind::EventHandler(_)
-            | AttributeKind::FunctionalIri(_)
-            | AttributeKind::Width
-            | AttributeKind::Height
-            | AttributeKind::ViewBox => {}
+            RecognizedAttribute::Width if is_root => scan.width = Some(value.clone()),
+            RecognizedAttribute::Height if is_root => scan.height = Some(value.clone()),
+            RecognizedAttribute::ViewBox if is_root => scan.view_box = Some(value.clone()),
+            RecognizedAttribute::XmlBase
+            | RecognizedAttribute::Href
+            | RecognizedAttribute::XlinkHref
+            | RecognizedAttribute::ScriptType
+            | RecognizedAttribute::EventHandler(_)
+            | RecognizedAttribute::FunctionalIri(_)
+            | RecognizedAttribute::Width
+            | RecognizedAttribute::Height
+            | RecognizedAttribute::ViewBox => {}
         }
     }
     let selected_href = values
         .iter()
-        .find(|(kind, _)| matches!(kind, AttributeKind::Href))
+        .find(|(kind, _)| matches!(kind, RecognizedAttribute::Href))
         .or_else(|| {
             values
                 .iter()
-                .find(|(kind, _)| matches!(kind, AttributeKind::XlinkHref))
+                .find(|(kind, _)| matches!(kind, RecognizedAttribute::XlinkHref))
         });
     if let Some((attribute_kind, value)) = selected_href {
         let kind = href_role(local);
@@ -1083,8 +1062,8 @@ fn scan_attributes(
             bases: effective_bases.clone(),
             element: element_name.clone(),
             attribute: match attribute_kind {
-                AttributeKind::Href => "href".to_string(),
-                AttributeKind::XlinkHref => "xlink:href".to_string(),
+                RecognizedAttribute::Href => "href".to_string(),
+                RecognizedAttribute::XlinkHref => "xlink:href".to_string(),
                 _ => unreachable!(),
             },
             kind,
@@ -1093,14 +1072,14 @@ fn scan_attributes(
     }
     for (kind, value) in &values {
         match kind {
-            AttributeKind::EventHandler(attribute) => {
+            RecognizedAttribute::EventHandler(attribute) => {
                 scan.scripts.push(ScriptFact::EventHandler {
                     element: element_name.clone(),
                     fragment: nearest_fragment.clone(),
                     attribute: attribute.clone(),
                 });
             }
-            AttributeKind::FunctionalIri(attribute) => {
+            RecognizedAttribute::FunctionalIri(attribute) => {
                 for href in functional_iris(value) {
                     scan.pending_references.push(SvgPendingRef {
                         declared: AuthoredHref::new(href),
@@ -1123,7 +1102,7 @@ fn scan_attributes(
         base: own_base,
         has_href: selected_href.is_some(),
         script_type: values.iter().find_map(|(kind, value)| {
-            matches!(kind, AttributeKind::ScriptType).then(|| value.clone())
+            matches!(kind, RecognizedAttribute::ScriptType).then(|| value.clone())
         }),
     }
 }
@@ -1134,57 +1113,62 @@ struct ScannedAttributes {
     script_type: Option<String>,
 }
 
-fn supports_svg_href(local: &[u8]) -> bool {
+fn supports_svg_href(local: &str) -> bool {
     matches!(
         local,
-        b"a" | b"animate"
-            | b"animateMotion"
-            | b"animateTransform"
-            | b"discard"
-            | b"feImage"
-            | b"image"
-            | b"linearGradient"
-            | b"mpath"
-            | b"pattern"
-            | b"radialGradient"
-            | b"script"
-            | b"set"
-            | b"textPath"
-            | b"use"
+        "a" | "animate"
+            | "animateMotion"
+            | "animateTransform"
+            | "discard"
+            | "feImage"
+            | "image"
+            | "linearGradient"
+            | "mpath"
+            | "pattern"
+            | "radialGradient"
+            | "script"
+            | "set"
+            | "textPath"
+            | "use"
     )
 }
 
-fn href_role(local: &[u8]) -> HrefRole {
+fn is_active_svg_element(local: &str) -> bool {
+    matches!(
+        local,
+        "animate" | "animateColor" | "animateMotion" | "animateTransform" | "discard" | "set"
+    )
+}
+
+fn href_role(local: &str) -> HrefRole {
     match local {
-        b"a" => HrefRole::Hyperlink,
-        b"image" | b"feImage" => HrefRole::Image,
-        b"script" => HrefRole::Script,
+        "a" => HrefRole::Hyperlink,
+        "image" | "feImage" => HrefRole::Image,
+        "script" => HrefRole::Script,
         _ => HrefRole::Svg,
     }
 }
 
-fn is_functional_iri_attribute(local: &[u8]) -> bool {
+fn is_functional_iri_attribute(local: &str) -> bool {
     matches!(
         local,
-        b"clip-path"
-            | b"cursor"
-            | b"fill"
-            | b"filter"
-            | b"marker"
-            | b"marker-start"
-            | b"marker-mid"
-            | b"marker-end"
-            | b"mask"
-            | b"stroke"
-            | b"style"
+        "clip-path"
+            | "cursor"
+            | "fill"
+            | "filter"
+            | "marker"
+            | "marker-start"
+            | "marker-mid"
+            | "marker-end"
+            | "mask"
+            | "stroke"
+            | "style"
     )
 }
 
-fn is_svg_event_handler(local: &[u8]) -> bool {
-    std::str::from_utf8(local).is_ok_and(|name| {
-        name.bytes().all(|byte| !byte.is_ascii_uppercase())
-            && crate::content::extraction::xhtml::is_event_handler_attr(name)
-    })
+fn is_svg_event_handler(local: &str) -> bool {
+    local.bytes().all(|byte| !byte.is_ascii_uppercase())
+        && crate::content::extraction::xhtml::is_event_handler_attr(local)
 }
 
 fn functional_iris(value: &str) -> Vec<String> {
@@ -1234,7 +1218,7 @@ fn collect_embedded_style(scan: &mut SvgScan, capture: SvgStyleCapture) {
     }
 }
 
-fn namespace_is(namespace: &ResolveResult<'_>, expected: &[u8]) -> bool {
+fn namespace_is(namespace: &ResolveResult<'_>, expected: &str) -> bool {
     matches!(namespace, ResolveResult::Bound(value) if value.as_ref() == expected)
 }
 
@@ -1270,7 +1254,7 @@ mod tests {
         assert_eq!(scan.semantic_issue(), None);
         let (facts, accessibility, references) = scan.take_analysis();
         let foreign = &facts.foreign_objects()[0];
-        assert_eq!(foreign.fragment(), Some("foreign"));
+        assert_eq!(foreign.fragment().map(FragmentFact::id), Some("foreign"));
         assert_eq!(foreign.xhtml().text_stream().text(), "Foreign title\nSend");
         assert_eq!(foreign.xhtml().fragments().len(), 1);
         assert_eq!(foreign.xhtml().fragments()[0].id(), "chapter");
@@ -1282,7 +1266,7 @@ mod tests {
                 .xhtml()
                 .structure()
                 .iter()
-                .any(|fact| matches!(fact, crate::content::StructureFact::Heading { .. }))
+                .any(|fact| matches!(fact.role(), crate::content::StructureRole::Heading(_)))
         );
 
         assert_eq!(references.len(), 3);
@@ -1317,11 +1301,13 @@ mod tests {
                 ),
             ]
         );
-        assert!(
-            accessibility
-                .iter()
-                .any(|fact| matches!(fact, AccessibilityFact::ImageAlt(_)))
-        );
+        assert!(accessibility.iter().any(|fact| matches!(
+            fact,
+            AccessibilityFact {
+                observation: AccessibilityObservation::ImageAlt(_),
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -1343,11 +1329,17 @@ mod tests {
             facts
                 .foreign_objects()
                 .iter()
-                .map(SvgForeignObjectFact::fragment)
+                .map(|foreign| foreign.fragment().map(FragmentFact::id))
                 .collect::<Vec<_>>(),
             [Some("one"), Some("two"), Some("three")]
         );
-        assert!(facts.foreign_objects()[0].xhtml().text().is_empty());
+        assert!(
+            facts.foreign_objects()[0]
+                .xhtml()
+                .text_stream()
+                .text()
+                .is_empty()
+        );
         assert_eq!(
             facts.foreign_objects()[1].xhtml().text_stream().text(),
             "Two"
@@ -1406,14 +1398,16 @@ mod tests {
 
         let (facts, accessibility, _) = scan.take_analysis();
         assert!(matches!(
-            facts.foreign_objects()[0].xhtml().structure()[0],
-            crate::content::StructureFact::Heading { .. }
+            facts.foreign_objects()[0].xhtml().structure()[0].role(),
+            crate::content::StructureRole::Heading(_)
         ));
-        assert!(
-            accessibility
-                .iter()
-                .any(|fact| matches!(fact, AccessibilityFact::EmptyHeading(_)))
-        );
+        assert!(accessibility.iter().any(|fact| matches!(
+            fact,
+            AccessibilityFact {
+                observation: AccessibilityObservation::EmptyHeading,
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -1435,7 +1429,10 @@ mod tests {
             facts.foreign_objects()[0].xhtml().text_stream().text(),
             "Outer"
         );
-        assert_eq!(facts.foreign_objects()[1].fragment(), Some("inner"));
+        assert_eq!(
+            facts.foreign_objects()[1].fragment().map(FragmentFact::id),
+            Some("inner")
+        );
         assert_eq!(
             facts.foreign_objects()[1].xhtml().text_stream().text(),
             "Inner"
@@ -1454,9 +1451,27 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["nested.png", "html.png"]
         );
-        assert!(matches!(accessibility[0], AccessibilityFact::AriaLabel(_)));
-        assert!(matches!(accessibility[1], AccessibilityFact::SvgTitle(_)));
-        assert!(matches!(accessibility[2], AccessibilityFact::ImageAlt(_)));
+        assert!(matches!(
+            accessibility[0],
+            AccessibilityFact {
+                observation: AccessibilityObservation::AriaLabel(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            accessibility[1],
+            AccessibilityFact {
+                observation: AccessibilityObservation::SvgTitle { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            accessibility[2],
+            AccessibilityFact {
+                observation: AccessibilityObservation::ImageAlt(_),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1570,19 +1585,32 @@ mod tests {
         assert_eq!(facts.fragments()[2].element(), "desc");
         assert_eq!(facts.fragments()[2].id(), "desc");
         assert_eq!(accessibility.len(), 3);
-        let AccessibilityFact::SvgTitle(title) = &accessibility[0] else {
+        let title = &accessibility[0];
+        let AccessibilityObservation::SvgTitle {
+            source_fragment,
+            value,
+        } = title.observation()
+        else {
             panic!()
         };
-        assert_eq!(title.value(), "A & nested title");
-        assert_eq!(title.source_fragment(), Some("title"));
-        assert_eq!(title.subject_element(), "svg");
-        assert_eq!(title.subject_fragment(), Some("root"));
-        let AccessibilityFact::SvgDescription(description) = &accessibility[2] else {
+        assert_eq!(value, "A & nested title");
+        assert_eq!(
+            source_fragment.as_ref().map(FragmentFact::id),
+            Some("title")
+        );
+        assert_eq!(title.element(), "svg");
+        assert_eq!(title.fragment().map(FragmentFact::id), Some("root"));
+        let description = &accessibility[2];
+        let AccessibilityObservation::SvgDescription {
+            source_fragment,
+            value,
+        } = description.observation()
+        else {
             panic!()
         };
-        assert_eq!(description.value(), "Useful description");
-        assert_eq!(description.source_fragment(), Some("desc"));
-        assert_eq!(description.subject_element(), "svg");
+        assert_eq!(value, "Useful description");
+        assert_eq!(source_fragment.as_ref().map(FragmentFact::id), Some("desc"));
+        assert_eq!(description.element(), "svg");
     }
 
     #[test]
@@ -1603,7 +1631,10 @@ mod tests {
 
         assert_eq!(facts.text().len(), 1);
         assert_eq!(facts.text()[0].text(), "Hello SVG");
-        assert_eq!(facts.text()[0].fragment(), Some("copy"));
+        assert_eq!(
+            facts.text()[0].fragment().map(FragmentFact::id),
+            Some("copy")
+        );
         assert_eq!(facts.scripts().len(), 3);
         assert!(matches!(
             &facts.scripts()[1],
@@ -1614,12 +1645,19 @@ mod tests {
             } if script_type == "application/ecmascript"
         ));
 
-        let AccessibilityFact::SvgTitle(title) = &accessibility[0] else {
+        let title = &accessibility[0];
+        let AccessibilityObservation::SvgTitle {
+            source_fragment, ..
+        } = title.observation()
+        else {
             panic!()
         };
-        assert_eq!(title.subject_element(), "g");
-        assert_eq!(title.subject_fragment(), Some("shape"));
-        assert_eq!(title.source_fragment(), Some("label"));
+        assert_eq!(title.element(), "g");
+        assert_eq!(title.fragment().map(FragmentFact::id), Some("shape"));
+        assert_eq!(
+            source_fragment.as_ref().map(FragmentFact::id),
+            Some("label")
+        );
 
         assert_eq!(references.len(), 4);
         assert_eq!(references[0].element(), "style");

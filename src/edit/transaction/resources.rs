@@ -1,34 +1,63 @@
 use super::*;
 
 impl<'a, R: ResourceProvider> EpubEdit<'a, R> {
-    /// Stages bytes to add or replace at an explicit canonical provider path.
+    /// Writes bytes to a path, adding the file or replacing what is there.
     ///
-    /// This does not add a manifest declaration or rewrite authored references. Loaded
-    /// structural resources and the canonical `mimetype` entry cannot be edited raw.
-    pub fn upsert_resource(mut self, path: impl AsRef<Path>, bytes: Vec<u8>) -> Result<Self> {
-        let path =
-            EpubPath::new(path.as_ref()).map_err(|source| EditError::InvalidResourcePath {
-                path: path.as_ref().to_path_buf(),
-                source,
-            })?;
+    /// This is the raw operation: nothing declares the file in the manifest and no links are
+    /// rewritten to point at it. The package document, the navigation documents and `mimetype`
+    /// are off limits — edit those through the methods that understand them.
+    pub fn upsert_resource(mut self, path: EpubPath, bytes: Vec<u8>) -> Result<Self> {
         reject_mimetype_edit(&path)?;
+        self.reject_structural_path(&path)?;
         let size_bytes = bytes.len();
         self.changes.upsert(path.clone(), bytes);
-        self.mark_raw_structural_overwrite(&path);
         self.edit_changes
             .push(EditChange::UpsertResource { path, size_bytes });
         Ok(self)
     }
 
+    /// Deletes the file at a path, leaving any links to it dangling.
+    ///
+    /// The file must exist in the staged book, which includes files added earlier in this same
+    /// transaction.
+    pub fn remove_resource(mut self, path: EpubPath) -> Result<Self> {
+        reject_mimetype_edit(&path)?;
+        self.reject_structural_path(&path)?;
+        if !self.staged_resource_exists(&path) {
+            return Err(EditError::MissingResource { path });
+        }
+        self.changes.remove(path.clone());
+        self.edit_changes.push(EditChange::RemoveResource { path });
+        Ok(self)
+    }
+
+    /// Stages removal of a declared resource path whether or not it has staged bytes.
+    ///
+    /// Compound manifest and reading-order removals use this so that a declaration whose href
+    /// has no container entry stays removable.
+    fn remove_declared_resource(mut self, path: EpubPath) -> Result<Self> {
+        reject_mimetype_edit(&path)?;
+        self.reject_structural_path(&path)?;
+        if !self.staged_resource_exists(&path) {
+            return Ok(self);
+        }
+        self.changes.remove(path.clone());
+        self.edit_changes.push(EditChange::RemoveResource { path });
+        Ok(self)
+    }
+
     /// Stages replacement of the embedded annotation set and its referenced body resources.
     ///
-    /// Existing resources not referenced by the replacement are retained as explicit
-    /// transaction-local orphans until removed separately.
-    pub fn set_embedded_annotations(mut self, annotations: AnnotationBundle) -> Result<Self> {
-        let current_resource_paths = self
+    /// `removal` decides whether resources referenced only by the replaced set are removed.
+    pub fn set_embedded_annotations(
+        mut self,
+        annotations: AnnotationBundle,
+        removal: EmbeddedAnnotationResourceRemoval,
+    ) -> Result<Self> {
+        let current_paths = self
             .effective_embedded_annotation_resource_paths()?
             .unwrap_or_default();
-        let new_resource_paths = annotations
+        let new_paths = annotations
             .set()
             .audiovisual_body_resource_paths()
             .collect::<HashSet<_>>();
@@ -39,39 +68,26 @@ impl<'a, R: ResourceProvider> EpubEdit<'a, R> {
                 }
                 .into());
             }
-            if !current_resource_paths.contains(resource.path())
-                && !self
-                    .embedded_annotation_orphan_paths
-                    .contains(resource.path())
-                && self.embedded_annotation_resource_exists(resource.path())?
+            if !current_paths.contains(resource.path())
+                && self.staged_resource_exists(&annotation_resource_path(resource.path())?)
             {
-                return Err(EditError::UnsupportedSemanticEdit {
-                    message: format!(
-                        "embedded annotation resource path already exists: {}",
-                        resource.path()
-                    ),
+                return Err(EditError::AnnotationResourceExists {
+                    path: resource.path().to_string(),
                 });
             }
         }
 
-        let annotations_path = annotation_epub_path("META-INF/annotations.json")?;
         let annotations_bytes = annotations.set().to_json_string()?.into_bytes();
-        self.stage_annotation_resource(annotations_path, annotations_bytes)?;
-
+        self.stage_annotation_resource(annotations_json_path(), annotations_bytes);
         for resource in annotations.resources() {
-            let path = annotation_epub_path(format!("META-INF/{}", resource.path()))?;
-            self.stage_annotation_resource(path, resource.bytes().to_vec())?;
+            let path = annotation_resource_path(resource.path())?;
+            self.stage_annotation_resource(path, resource.bytes().to_vec());
         }
-
-        self.embedded_annotation_orphan_paths.extend(
-            current_resource_paths
-                .difference(&new_resource_paths)
-                .cloned(),
-        );
-        for path in new_resource_paths {
-            self.embedded_annotation_orphan_paths.remove(&path);
+        if removal == EmbeddedAnnotationResourceRemoval::SetAndReferencedResources {
+            for path in current_paths.difference(&new_paths) {
+                self.stage_annotation_removal(annotation_resource_path(path)?);
+            }
         }
-
         Ok(self)
     }
 
@@ -81,92 +97,18 @@ impl<'a, R: ResourceProvider> EpubEdit<'a, R> {
         removal: EmbeddedAnnotationResourceRemoval,
     ) -> Result<Self> {
         let resource_paths = self.effective_embedded_annotation_resource_paths()?;
-
-        let annotations_path = annotation_epub_path("META-INF/annotations.json")?;
-        self.stage_annotation_removal(annotations_path)?;
-
-        if let Some(resource_paths) = resource_paths {
-            if matches!(removal, EmbeddedAnnotationResourceRemoval::SetOnly) {
-                self.embedded_annotation_orphan_paths.extend(resource_paths);
-                return Ok(self);
-            }
-            for resource_path in resource_paths {
+        self.stage_annotation_removal(annotations_json_path());
+        if removal == EmbeddedAnnotationResourceRemoval::SetAndReferencedResources {
+            for resource_path in resource_paths.into_iter().flatten() {
                 if is_protected_embedded_annotation_resource_path(&resource_path) {
                     return Err(AnnotationBundleError::ReservedPath {
                         path: resource_path,
                     }
                     .into());
                 }
-                let path = annotation_epub_path(format!("META-INF/{resource_path}"))?;
-                self.stage_annotation_removal(path)?;
+                self.stage_annotation_removal(annotation_resource_path(&resource_path)?);
             }
         }
-
-        Ok(self)
-    }
-
-    /// Stages removal of one annotation resource orphaned by this transaction.
-    ///
-    /// Referenced, protected, unrelated, and invalid resource paths are rejected.
-    pub fn remove_embedded_annotation_resource(mut self, path: impl AsRef<str>) -> Result<Self> {
-        let authored_path = path.as_ref();
-        let resource_path = normalize_annotation_resource_path(authored_path).ok_or_else(|| {
-            AnnotationBundleError::InvalidPath {
-                path: authored_path.to_string(),
-            }
-        })?;
-        if is_protected_embedded_annotation_resource_path(&resource_path) {
-            return Err(AnnotationBundleError::ReservedPath {
-                path: resource_path,
-            }
-            .into());
-        }
-        if self
-            .effective_embedded_annotation_resource_paths()?
-            .is_some_and(|paths| paths.contains(&resource_path))
-        {
-            return Err(EditError::UnsupportedSemanticEdit {
-                message: format!(
-                    "embedded annotation resource is referenced by the effective annotation set: {resource_path}"
-                ),
-            });
-        }
-        if !self.embedded_annotation_orphan_paths.remove(&resource_path) {
-            return Err(EditError::UnsupportedSemanticEdit {
-                message: format!(
-                    "embedded annotation resource is not an eligible orphan from this edit: {resource_path}"
-                ),
-            });
-        }
-
-        let path = annotation_epub_path(format!("META-INF/{resource_path}"))?;
-        self.stage_annotation_removal(path)?;
-        Ok(self)
-    }
-
-    /// Stages replacement of one uniquely selected local resource without changing the package.
-    pub fn replace_resource(
-        self,
-        selector: impl Into<ResourceSelector>,
-        bytes: Vec<u8>,
-    ) -> Result<Self> {
-        let path = self.selected_local_path(selector.into())?;
-        self.upsert_resource(path.as_path(), bytes)
-    }
-
-    /// Stages removal of one uniquely selected local resource without rewriting references.
-    pub fn remove_resource(mut self, selector: impl Into<ResourceSelector>) -> Result<Self> {
-        let selector = selector.into();
-        match &selector {
-            ResourceSelector::Path(path) => reject_mimetype_edit(path)?,
-            ResourceSelector::Address(ResourceAddress::Local(path)) => reject_mimetype_edit(path)?,
-            _ => {}
-        }
-        let path = self.selected_local_path(selector)?;
-        reject_mimetype_edit(&path)?;
-        self.changes.remove(path.clone());
-        self.mark_raw_structural_overwrite(&path);
-        self.edit_changes.push(EditChange::RemoveResource { path });
         Ok(self)
     }
 
@@ -176,28 +118,18 @@ impl<'a, R: ResourceProvider> EpubEdit<'a, R> {
     /// operation and are rejected here.
     pub fn add_manifest_resource(
         self,
-        path: impl AsRef<Path>,
+        path: EpubPath,
         bytes: Vec<u8>,
         item: ManifestItem,
     ) -> Result<Self> {
-        let item_id = required_manifest_item_id(&item)?.to_string();
-        let path =
-            EpubPath::new(path.as_ref()).map_err(|source| EditError::InvalidResourcePath {
-                path: path.as_ref().to_path_buf(),
-                source,
-            })?;
-        ensure_manifest_item_targets_path(&item, &path, &self.epub.package_path)?;
+        required_manifest_item_id(&item)?;
+        ensure_manifest_item_targets_path(&item, &path, self.epub.resources.package_path())?;
         if item.has_property(KnownManifestProperty::Nav) {
-            return Err(EditError::UnsupportedSemanticEdit {
-                message: format!(
-                    "add_manifest_resource does not support nav manifest item {}",
-                    item_id
-                ),
+            return Err(EditError::NavigationManifestItem {
+                id: item.id().map(ToString::to_string),
             });
         }
-
-        self.upsert_resource(path.as_path(), bytes)?
-            .add_manifest_item(item)
+        self.upsert_resource(path, bytes)?.add_manifest_item(item)
     }
 
     /// Stages removal of one manifest item and its uniquely owned local resource.
@@ -209,38 +141,35 @@ impl<'a, R: ResourceProvider> EpubEdit<'a, R> {
     ) -> Result<Self> {
         let selector = selector.into();
         let staged_package = self.package_override.as_ref().unwrap_or(&self.epub.package);
-        let selected = unique_manifest_item(staged_package, &selector)?;
-        let selected_id = selected_manifest_item_id(selected)?;
-        let resource_path = manifest_item_resource_path(selected, &self.epub.package_path)?;
+        let (selected_index, selected) = unique_manifest_item(staged_package, &selector)?;
+        let resource_path =
+            manifest_item_resource_path(selected, self.epub.resources.package_path())?;
         reject_manifest_resource_structural_removal(&self, selected, &resource_path)?;
         reject_shared_manifest_resource_path(
             staged_package,
-            selected_id.as_str(),
+            selected_index,
             &resource_path,
-            &self.epub.package_path,
+            self.epub.resources.package_path(),
             false,
         )?;
-
         self.remove_manifest_item(selector)?
-            .remove_provider_resource_path(resource_path)
+            .remove_declared_resource(resource_path)
     }
 
-    /// Stages resource bytes, a matching manifest item, and a reading-order itemref together.
+    /// Stages resource bytes, a matching manifest item, and a spine itemref together.
     pub fn add_spine_resource(
         self,
-        path: impl AsRef<Path>,
+        path: EpubPath,
         bytes: Vec<u8>,
         item: ManifestItem,
         itemref: ItemRef,
     ) -> Result<Self> {
-        let item_id = required_manifest_item_id(&item)?;
+        let id = required_manifest_item_id(&item)?;
         let idref = required_spine_itemref_idref(&itemref)?;
-        if item_id != idref {
-            return Err(EditError::UnsupportedSemanticEdit {
-                message: format!(
-                    "spine itemref {} does not target manifest item {}",
-                    idref, item_id
-                ),
+        if !manifest_ids_equal(id, idref) {
+            return Err(EditError::ItemRefTargetMismatch {
+                idref: idref.to_string(),
+                id: id.to_string(),
             });
         }
         self.add_manifest_resource(path, bytes, item)?
@@ -251,96 +180,65 @@ impl<'a, R: ResourceProvider> EpubEdit<'a, R> {
     pub fn remove_spine_resource(self, selector: impl Into<SpineItemRefSelector>) -> Result<Self> {
         let selector = selector.into();
         let staged_package = self.package_override.as_ref().unwrap_or(&self.epub.package);
-        let (index, selected_itemref) = unique_spine_itemref(staged_package, &selector)?;
-        let idref = selected_itemref
-            .idref()
-            .ok_or(SpineItemRefLookupError::MissingIdref(index))?
-            .to_string();
-        let refs = staged_package
+        let (_, _, idref) = unique_spine_itemref(staged_package, &selector)?;
+        let references = staged_package
             .spine()
             .itemrefs()
             .iter()
-            .filter(|itemref| itemref.idref().is_some_and(|value| value.as_str() == idref))
+            .filter(|itemref| {
+                itemref
+                    .idref()
+                    .is_some_and(|value| manifest_ids_equal(value, idref))
+            })
             .count();
-        if refs > 1 {
-            return Err(EditError::UnsupportedSemanticEdit {
-                message: format!("spine resource {idref} is referenced by multiple itemrefs"),
+        if references > 1 {
+            return Err(EditError::SharedSpineItem {
+                idref: idref.to_string(),
             });
         }
-        let item = staged_package
-            .manifest_item_by_id(&idref)
-            .ok_or_else(|| PackageError::ManifestItemMissing { id: idref.clone() })?;
-        let resource_path = manifest_item_resource_path(item, &self.epub.package_path)?;
+        let (item_index, item) = staged_package
+            .manifest()
+            .items()
+            .iter()
+            .enumerate()
+            .find(|(_, item)| item.id().is_some_and(|id| manifest_ids_equal(id, idref)))
+            .ok_or_else(|| PackageError::ManifestItemMissing {
+                id: idref.to_string(),
+            })?;
+        let resource_path = manifest_item_resource_path(item, self.epub.resources.package_path())?;
         reject_manifest_resource_structural_removal(&self, item, &resource_path)?;
-
+        let item = crate::resource::ManifestOrdinal::from_index(item_index);
         self.remove_spine_itemref(selector)?
-            .remove_manifest_resource(ManifestItemSelector::id(
-                EpubString::try_new(idref).map_err(|_| PackageError::EmptyField {
-                    field: "manifest item id",
-                })?,
-            ))
+            .remove_manifest_resource(item)
     }
 
-    fn remove_provider_resource_path(mut self, path: EpubPath) -> Result<Self> {
-        reject_mimetype_edit(&path)?;
-        self.changes.remove(path.clone());
-        self.edit_changes.push(EditChange::RemoveResource { path });
-        Ok(self)
-    }
-
-    fn stage_annotation_resource(&mut self, path: EpubPath, bytes: Vec<u8>) -> Result<()> {
-        self.annotations_touched = true;
+    fn stage_annotation_resource(&mut self, path: EpubPath, bytes: Vec<u8>) {
         let size_bytes = bytes.len();
         self.changes.upsert(path.clone(), bytes);
         self.edit_changes
             .push(EditChange::UpsertResource { path, size_bytes });
-        Ok(())
     }
 
-    fn stage_annotation_removal(&mut self, path: EpubPath) -> Result<()> {
-        self.annotations_touched = true;
+    fn stage_annotation_removal(&mut self, path: EpubPath) {
         self.changes.remove(path.clone());
         self.edit_changes.push(EditChange::RemoveResource { path });
-        Ok(())
-    }
-
-    fn embedded_annotation_resource_exists(&self, path: &str) -> Result<bool> {
-        let path = annotation_epub_path(format!("META-INF/{path}"))?;
-        let changes = merged_resource_changes(&self.epub.resource_changes, &self.changes)?;
-        Ok(changes
-            .apply_to_index(
-                &self.epub.provider_index,
-                self.epub.open_limits.provider_index_limits(),
-            )
-            .map_err(EditError::from)?
-            .get(&path)
-            .is_some())
     }
 
     fn effective_embedded_annotation_resource_paths(&self) -> Result<Option<HashSet<String>>> {
-        let annotations_path = annotation_epub_path("META-INF/annotations.json")?;
-        let changes = merged_resource_changes(&self.epub.resource_changes, &self.changes)?;
-        let provider_index = changes
-            .apply_to_index(
-                &self.epub.provider_index,
-                self.epub.open_limits.provider_index_limits(),
-            )
-            .map_err(EditError::from)?;
-        if provider_index.get(&annotations_path).is_none() {
+        let annotations_path = annotations_json_path();
+        if !self.staged_resource_exists(&annotations_path) {
             return Ok(None);
         }
-
-        let bytes = provider_bytes_with_changes_bounded(
-            &self.epub.container,
-            &changes,
-            &annotations_path,
-            MAX_ANNOTATIONS_JSON_BYTES,
-        )?;
-        let text =
-            std::str::from_utf8(&bytes).map_err(|source| AnnotationError::Utf8 { source })?;
+        let bytes = self.staged_bytes_bounded(&annotations_path, MAX_ANNOTATIONS_JSON_BYTES)?;
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|source| AnnotationBundleError::InvalidUtf8 { source })?;
         let set = AnnotationSet::parse_json(text)?;
         Ok(Some(set.audiovisual_body_resource_paths().collect()))
     }
+}
+
+fn annotation_resource_path(path: &str) -> Result<EpubPath> {
+    annotation_epub_path(format!("META-INF/{path}"))
 }
 
 #[cfg(test)]
@@ -348,15 +246,18 @@ mod tests {
     use super::*;
     use crate::annotation::{AnnotationError, AnnotationResource};
     use crate::resource::provider::{
-        MemoryResourceProvider, ResourceProviderIndex, ResourceProviderIndexError,
-        ResourceProviderIndexLimits,
+        MemoryResourceProvider, ProviderIndexError, ProviderReadError,
     };
     use std::cell::Cell;
     use std::io::{Cursor, Read};
     use zip::ZipArchive;
 
     fn memory_provider_epub() -> Epub<MemoryResourceProvider> {
-        Epub::from_provider(memory_provider(), "EPUB/package.opf").unwrap()
+        Epub::from_provider(
+            memory_provider(),
+            EpubPath::new("EPUB/package.opf").unwrap(),
+        )
+        .unwrap()
     }
 
     fn memory_provider() -> MemoryResourceProvider {
@@ -484,26 +385,17 @@ mod tests {
     struct FailingIndexProvider {
         inner: MemoryResourceProvider,
         index_calls: Cell<usize>,
-        read_calls: Cell<usize>,
         entry_reader_calls: Cell<usize>,
         annotation_reads: Cell<usize>,
         fail_on_index_call: usize,
     }
 
     impl ResourceProvider for FailingIndexProvider {
-        fn read(&self, path: &EpubPath) -> crate::resource::provider::ReadResult<Vec<u8>> {
-            self.read_calls.set(self.read_calls.get() + 1);
-            if path.as_str() == "META-INF/annotations.json" {
-                self.annotation_reads.set(self.annotation_reads.get() + 1);
-            }
-            self.inner.read(path)
-        }
-
         fn read_with<T>(
             &self,
             path: &EpubPath,
             read: impl FnOnce(&mut dyn Read) -> T,
-        ) -> crate::resource::provider::ReadResult<T> {
+        ) -> std::result::Result<T, ProviderReadError> {
             self.entry_reader_calls
                 .set(self.entry_reader_calls.get() + 1);
             if path.as_str() == "META-INF/annotations.json" {
@@ -512,18 +404,18 @@ mod tests {
             self.inner.read_with(path, read)
         }
 
-        fn index(
+        fn entries(
             &self,
-            limits: &ResourceProviderIndexLimits,
-        ) -> std::result::Result<ResourceProviderIndex, ResourceProviderIndexError> {
+        ) -> std::result::Result<impl Iterator<Item = (EpubPath, Option<u64>)>, ProviderIndexError>
+        {
             let calls = self.index_calls.get() + 1;
             self.index_calls.set(calls);
             if calls == self.fail_on_index_call {
-                return Err(ResourceProviderIndexError::enumeration(
-                    std::io::Error::other("index failed"),
-                ));
+                return Err(ProviderIndexError::backend(std::io::Error::other(
+                    "index failed",
+                )));
             }
-            self.inner.index(limits)
+            self.inner.entries()
         }
     }
 
@@ -532,21 +424,22 @@ mod tests {
         let mut epub = memory_provider_epub();
         let preview = epub
             .edit()
-            .upsert_resource("EPUB/extra.xhtml", b"extra".to_vec())
+            .upsert_resource(
+                EpubPath::new("EPUB/extra.xhtml").unwrap(),
+                b"extra".to_vec(),
+            )
             .unwrap()
             .preview()
             .unwrap();
         assert!(preview.changes().iter().any(|change| matches!(change, EditChange::UpsertResource { path, size_bytes } if path.as_str() == "EPUB/extra.xhtml" && *size_bytes == 5)));
         let staged = preview
             .resources()
-            .select(&ResourceSelector::path("EPUB/extra.xhtml").unwrap())
+            .resource_by_path(&EpubPath::new("EPUB/extra.xhtml").unwrap())
             .unwrap();
-        assert!(!staged.is_manifest_resource());
+        assert!(staged.declarations().len() == 0);
         preview.commit();
         assert_eq!(
-            epub.resource(ResourceSelector::path("EPUB/extra.xhtml").unwrap())
-                .unwrap()
-                .bytes()
+            epub.bytes(&EpubPath::new("EPUB/extra.xhtml").unwrap())
                 .unwrap(),
             b"extra"
         );
@@ -557,16 +450,17 @@ mod tests {
         let mut epub = memory_provider_epub();
         let report = epub
             .edit()
-            .upsert_resource("EPUB/extra.xhtml", b"extra".to_vec())
+            .upsert_resource(
+                EpubPath::new("EPUB/extra.xhtml").unwrap(),
+                b"extra".to_vec(),
+            )
             .unwrap()
             .preview()
             .unwrap()
             .commit();
-        assert_eq!(report.changes().len(), 1);
+        assert_eq!(report.len(), 1);
         assert_eq!(
-            epub.resource(ResourceSelector::path("EPUB/extra.xhtml").unwrap())
-                .unwrap()
-                .bytes()
+            epub.bytes(&EpubPath::new("EPUB/extra.xhtml").unwrap())
                 .unwrap(),
             b"extra".to_vec()
         );
@@ -579,18 +473,21 @@ mod tests {
             .id(EpubString::try_new("img").unwrap())
             .href(EpubHref::try_new("images/cover.jpg").unwrap())
             .media_type(EpubString::try_new("image/jpeg").unwrap().into())
-            .build();
+            .build()
+            .unwrap();
         epub.edit()
-            .add_manifest_resource("EPUB/images/cover.jpg", b"jpeg".to_vec(), item)
+            .add_manifest_resource(
+                EpubPath::new("EPUB/images/cover.jpg").unwrap(),
+                b"jpeg".to_vec(),
+                item,
+            )
             .unwrap()
             .preview()
             .unwrap()
             .commit();
         assert!(epub.package().manifest_item_by_id("img").is_some());
         assert_eq!(
-            epub.resource(ResourceSelector::manifest_href("images/cover.jpg").unwrap())
-                .unwrap()
-                .bytes()
+            epub.bytes(&EpubPath::new("EPUB/images/cover.jpg").unwrap())
                 .unwrap(),
             b"jpeg"
         );
@@ -603,23 +500,28 @@ mod tests {
             .id(EpubString::try_new("img").unwrap())
             .href(EpubHref::try_new("images/cover.jpg").unwrap())
             .media_type(EpubString::try_new("image/jpeg").unwrap().into())
-            .build();
+            .build()
+            .unwrap();
         let err = epub
             .edit()
-            .add_manifest_resource("EPUB/images/other.jpg", b"jpeg".to_vec(), item)
+            .add_manifest_resource(
+                EpubPath::new("EPUB/images/other.jpg").unwrap(),
+                b"jpeg".to_vec(),
+                item,
+            )
             .unwrap_err();
-        assert!(matches!(err, EditError::UnsupportedSemanticEdit { .. }));
+        assert!(matches!(err, EditError::ManifestHrefMismatch { .. }));
     }
 
     #[test]
     fn edit_remove_manifest_resource_removes_item_and_provider_bytes() {
         let mut epub = Epub::from_provider(
             memory_provider_with_extra_manifest_item(),
-            "EPUB/package.opf",
+            EpubPath::new("EPUB/package.opf").unwrap(),
         )
         .unwrap();
         epub.edit()
-            .remove_manifest_resource(ManifestItemSelector::id(
+            .remove_manifest_resource(ManifestItemSelector::Id(
                 EpubString::try_new("img").unwrap(),
             ))
             .unwrap()
@@ -628,25 +530,65 @@ mod tests {
             .commit();
         assert!(epub.package().manifest_item_by_id("img").is_none());
         assert!(matches!(
-            epub.resource(ResourceSelector::path("EPUB/images/cover.jpg").unwrap()),
-            Err(crate::resource::ResourceLookupError::NotFound(_))
+            epub.bytes(&EpubPath::new("EPUB/images/cover.jpg").unwrap()),
+            Err(crate::resource::ResourceReadError::Missing { .. })
         ));
+    }
+
+    #[test]
+    fn edit_remove_manifest_resource_accepts_a_declaration_without_provider_bytes() {
+        let mut epub = Epub::from_provider(
+            memory_provider_for(
+                r#"<item id="nav" properties="nav" href="nav.xhtml" media-type="application/xhtml+xml" />
+    <item id="chap" href="text/chapter.xhtml" media-type="application/xhtml+xml" />
+    <item id="img" href="images/cover.jpg" media-type="image/jpeg" />"#,
+                r#"<itemref idref="chap" />"#,
+                [],
+            ),
+            EpubPath::new("EPUB/package.opf").unwrap(),
+        )
+        .unwrap();
+        let changes = epub
+            .edit()
+            .remove_manifest_resource(ManifestItemSelector::Id(
+                EpubString::try_new("img").unwrap(),
+            ))
+            .unwrap()
+            .preview()
+            .unwrap()
+            .commit();
+        assert!(epub.package().manifest_item_by_id("img").is_none());
+        assert!(
+            !changes
+                .iter()
+                .any(|change| matches!(change, EditChange::RemoveResource { .. }))
+        );
+    }
+
+    #[test]
+    fn edit_remove_resource_rejects_a_path_without_staged_bytes() {
+        let mut epub = memory_provider_epub();
+        let err = epub
+            .edit()
+            .remove_resource(EpubPath::new("EPUB/images/absent.jpg").unwrap())
+            .unwrap_err();
+        assert!(matches!(err, EditError::MissingResource { .. }));
     }
 
     #[test]
     fn edit_remove_manifest_resource_rejects_shared_provider_path() {
         let mut epub = Epub::from_provider(
             memory_provider_with_duplicate_manifest_hrefs(),
-            "EPUB/package.opf",
+            EpubPath::new("EPUB/package.opf").unwrap(),
         )
         .unwrap();
         let err = epub
             .edit()
-            .remove_manifest_resource(ManifestItemSelector::id(
+            .remove_manifest_resource(ManifestItemSelector::Id(
                 EpubString::try_new("img-a").unwrap(),
             ))
             .unwrap_err();
-        assert!(matches!(err, EditError::UnsupportedSemanticEdit { .. }));
+        assert!(matches!(err, EditError::SharedResourcePath { .. }));
     }
 
     #[test]
@@ -656,11 +598,16 @@ mod tests {
             .id(EpubString::try_new("img").unwrap())
             .href(EpubHref::try_new("images/cover.jpg").unwrap())
             .media_type(EpubString::try_new("image/jpeg").unwrap().into())
-            .build();
+            .build()
+            .unwrap();
         epub.edit()
-            .add_manifest_resource("EPUB/images/cover.jpg", b"jpeg".to_vec(), item)
+            .add_manifest_resource(
+                EpubPath::new("EPUB/images/cover.jpg").unwrap(),
+                b"jpeg".to_vec(),
+                item,
+            )
             .unwrap()
-            .remove_manifest_resource(ManifestItemSelector::id(
+            .remove_manifest_resource(ManifestItemSelector::Id(
                 EpubString::try_new("img").unwrap(),
             ))
             .unwrap()
@@ -669,8 +616,8 @@ mod tests {
             .commit();
         assert!(epub.package().manifest_item_by_id("img").is_none());
         assert!(matches!(
-            epub.resource(ResourceSelector::path("EPUB/images/cover.jpg").unwrap()),
-            Err(crate::resource::ResourceLookupError::NotFound(_))
+            epub.bytes(&EpubPath::new("EPUB/images/cover.jpg").unwrap()),
+            Err(crate::resource::ResourceReadError::Missing { .. })
         ));
     }
 
@@ -681,10 +628,11 @@ mod tests {
             .id(EpubString::try_new("chap2").unwrap())
             .href(EpubHref::try_new("text/chapter2.xhtml").unwrap())
             .media_type(EpubString::try_new("application/xhtml+xml").unwrap().into())
-            .build();
+            .build()
+            .unwrap();
         epub.edit()
             .add_spine_resource(
-                "EPUB/text/chapter2.xhtml",
+                EpubPath::new("EPUB/text/chapter2.xhtml").unwrap(),
                 b"<html><body>Chapter 2</body></html>".to_vec(),
                 item,
                 ItemRef::new("chap2").unwrap(),
@@ -695,16 +643,9 @@ mod tests {
             .commit();
         assert!(epub.package().manifest_item_by_id("chap2").is_some());
         assert_eq!(epub.package().spine().itemrefs().len(), 2);
-        assert_eq!(
-            epub.package().spine().itemrefs()[1]
-                .idref()
-                .map(EpubString::as_str),
-            Some("chap2")
-        );
+        assert_eq!(epub.package().spine().itemrefs()[1].idref(), Some("chap2"));
         assert!(
-            epub.resource(ResourceSelector::manifest_href("text/chapter2.xhtml").unwrap())
-                .unwrap()
-                .utf8_text()
+            epub.utf8_text(&EpubPath::new("EPUB/text/chapter2.xhtml").unwrap())
                 .unwrap()
                 .contains("Chapter 2")
         );
@@ -712,11 +653,13 @@ mod tests {
 
     #[test]
     fn edit_remove_spine_resource_removes_itemref_manifest_and_provider_bytes() {
-        let mut epub =
-            Epub::from_provider(memory_provider_with_two_spine_items(), "EPUB/package.opf")
-                .unwrap();
+        let mut epub = Epub::from_provider(
+            memory_provider_with_two_spine_items(),
+            EpubPath::new("EPUB/package.opf").unwrap(),
+        )
+        .unwrap();
         epub.edit()
-            .remove_spine_resource(SpineItemRefSelector::idref(
+            .remove_spine_resource(SpineItemRefSelector::Idref(
                 EpubString::try_new("chap2").unwrap(),
             ))
             .unwrap()
@@ -726,8 +669,8 @@ mod tests {
         assert!(epub.package().manifest_item_by_id("chap2").is_none());
         assert_eq!(epub.package().spine().itemrefs().len(), 1);
         assert!(matches!(
-            epub.resource(ResourceSelector::path("EPUB/text/chapter2.xhtml").unwrap()),
-            Err(crate::resource::ResourceLookupError::NotFound(_))
+            epub.bytes(&EpubPath::new("EPUB/text/chapter2.xhtml").unwrap()),
+            Err(crate::resource::ResourceReadError::Missing { .. })
         ));
     }
 
@@ -735,34 +678,66 @@ mod tests {
     fn edit_remove_spine_resource_rejects_shared_itemref() {
         let mut epub = Epub::from_provider(
             memory_provider_with_duplicate_spine_itemrefs(),
-            "EPUB/package.opf",
+            EpubPath::new("EPUB/package.opf").unwrap(),
         )
         .unwrap();
         let err = epub
             .edit()
-            .remove_spine_resource(SpineItemRefSelector::index(0))
+            .remove_spine_resource(SpineItemRefSelector::Ordinal(
+                crate::resource::ReadingOrderOrdinal::from_index(0),
+            ))
             .unwrap_err();
-        assert!(matches!(err, EditError::UnsupportedSemanticEdit { .. }));
+        assert!(matches!(err, EditError::SharedSpineItem { .. }));
     }
 
     #[test]
-    fn edit_replace_resource_by_selector_commits() {
+    fn staged_addition_then_removal_is_not_reported() {
+        let mut epub = memory_provider_epub();
+        let path = EpubPath::new("EPUB/extra.xhtml").unwrap();
+        let preview = epub
+            .edit()
+            .upsert_resource(path.clone(), b"extra".to_vec())
+            .unwrap()
+            .remove_resource(path.clone())
+            .unwrap()
+            .preview()
+            .unwrap();
+        assert!(preview.changes().is_empty());
+        assert!(preview.resources().resource_by_path(&path).is_none());
+    }
+
+    #[test]
+    fn raw_navigation_edit_is_rejected_when_staged() {
+        let mut epub = memory_provider_epub();
+        let error = epub
+            .edit()
+            .upsert_resource(EpubPath::new("EPUB/nav.xhtml").unwrap(), b"nav".to_vec())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            EditError::StructuralResourceEdit {
+                kind: StructuralResourceKind::Navigation,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn edit_replace_resource_commits() {
         let mut epub = memory_provider_epub();
         let report = epub
             .edit()
-            .replace_resource(
-                ResourceSelector::manifest_href("text/chapter.xhtml").unwrap(),
+            .upsert_resource(
+                EpubPath::new("EPUB/text/chapter.xhtml").unwrap(),
                 b"replacement".to_vec(),
             )
             .unwrap()
             .preview()
             .unwrap()
             .commit();
-        assert_eq!(report.changes().len(), 1);
+        assert_eq!(report.len(), 1);
         assert_eq!(
-            epub.resource(ResourceSelector::manifest_href("text/chapter.xhtml").unwrap())
-                .unwrap()
-                .bytes()
+            epub.bytes(&EpubPath::new("EPUB/text/chapter.xhtml").unwrap())
                 .unwrap(),
             b"replacement".to_vec()
         );
@@ -776,10 +751,11 @@ mod tests {
             ("EPUB/package.opf", package.to_vec()),
         ])
         .unwrap();
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
         let error = epub
             .edit()
-            .remove_manifest_resource(ManifestItemSelector::id(
+            .remove_manifest_resource(ManifestItemSelector::Id(
                 EpubString::try_new("mime").unwrap(),
             ))
             .unwrap_err();
@@ -798,7 +774,7 @@ mod tests {
             decode_structural_xml(b"<?xml version='1.0' encoding='UTF-32'?><package/>", &path)
                 .unwrap_err();
         assert!(
-            matches!(error, EditError::StructuralXmlDecode { path: error_path, source: crate::edit::StructuralXmlDecodeError::UnsupportedEncoding { ref encoding } } if error_path == path && encoding == "UTF-32")
+            matches!(error, EditError::StructuralXmlDecode { path: error_path, source: crate::XmlDecodeError::UnsupportedEncoding { ref encoding } } if error_path == path && encoding == "UTF-32")
         );
     }
 
@@ -806,10 +782,10 @@ mod tests {
     fn edit_sets_embedded_annotations_and_resources() {
         let mut epub = memory_provider_epub();
         epub.edit()
-            .set_embedded_annotations(embedded_annotations(
-                "text/chapter.xhtml",
-                &[("audio/note.mp3", b"audio")],
-            ))
+            .set_embedded_annotations(
+                embedded_annotations("text/chapter.xhtml", &[("audio/note.mp3", b"audio")]),
+                EmbeddedAnnotationResourceRemoval::SetOnly,
+            )
             .unwrap()
             .preview()
             .unwrap()
@@ -840,7 +816,7 @@ mod tests {
         assert!(epub.embedded_annotations().unwrap().is_none());
         assert_eq!(
             epub.resource_changes
-                .entry(EpubPath::new("META-INF/audio/kept.mp3").unwrap().as_path())
+                .entry(&EpubPath::new("META-INF/audio/kept.mp3").unwrap())
                 .unwrap()
                 .unwrap(),
             b"audio"
@@ -859,9 +835,9 @@ mod tests {
             &[("shared.mp3", b"new"), ("b.mp3", b"b")],
         );
         epub.edit()
-            .set_embedded_annotations(first)
+            .set_embedded_annotations(first, EmbeddedAnnotationResourceRemoval::SetOnly)
             .unwrap()
-            .set_embedded_annotations(second)
+            .set_embedded_annotations(second, EmbeddedAnnotationResourceRemoval::SetOnly)
             .unwrap()
             .preview()
             .unwrap()
@@ -878,75 +854,18 @@ mod tests {
     }
 
     #[test]
-    fn referenced_embedded_annotation_resource_removal_is_rejected_after_normalization() {
+    fn replacement_can_remove_resources_only_the_replaced_set_referenced() {
         let mut epub = memory_provider_epub();
         epub.edit()
-            .set_embedded_annotations(embedded_annotations(
-                "text/chapter.xhtml",
-                &[("a.mp3", b"a")],
-            ))
+            .set_embedded_annotations(
+                embedded_annotations("text/chapter.xhtml", &[("a.mp3", b"a")]),
+                EmbeddedAnnotationResourceRemoval::SetOnly,
+            )
             .unwrap()
-            .preview()
-            .unwrap()
-            .commit();
-        let error = epub
-            .edit()
-            .remove_embedded_annotation_resource("audio/../a.mp3?download=1#t=1")
-            .unwrap_err();
-        assert!(matches!(error, EditError::UnsupportedSemanticEdit { .. }));
-        assert_eq!(exported_entry(&epub, "META-INF/a.mp3").unwrap(), b"a");
-    }
-
-    #[test]
-    fn protected_embedded_annotation_resource_removal_is_rejected_after_normalization() {
-        let mut epub = memory_provider_epub();
-        let error = epub
-            .edit()
-            .remove_embedded_annotation_resource("audio/../container.xml")
-            .unwrap_err();
-        assert!(
-            matches!(error, EditError::AnnotationBundle { source: AnnotationBundleError::ReservedPath { ref path } } if path == "container.xml")
-        );
-        assert!(exported_entry(&epub, "META-INF/container.xml").is_none());
-    }
-
-    #[test]
-    fn unrelated_meta_inf_resource_removal_is_rejected() {
-        let provider = MemoryResourceProvider::from_entries(
-            memory_provider()
-                .into_entries()
-                .into_iter()
-                .map(|(path, bytes)| (path.as_path().to_path_buf(), bytes))
-                .chain([("META-INF/vendor.dat".into(), b"vendor".to_vec())]),
-        )
-        .unwrap();
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
-        let error = epub
-            .edit()
-            .remove_embedded_annotation_resource("vendor.dat")
-            .unwrap_err();
-        assert!(matches!(error, EditError::UnsupportedSemanticEdit { .. }));
-        assert_eq!(
-            exported_entry(&epub, "META-INF/vendor.dat").unwrap(),
-            b"vendor"
-        );
-    }
-
-    #[test]
-    fn replacement_then_explicit_cleanup_in_same_transaction_works() {
-        let mut epub = memory_provider_epub();
-        epub.edit()
-            .set_embedded_annotations(embedded_annotations(
-                "text/chapter.xhtml",
-                &[("a.mp3", b"a")],
-            ))
-            .unwrap()
-            .set_embedded_annotations(embedded_annotations(
-                "text/chapter.xhtml",
-                &[("b.mp3", b"b")],
-            ))
-            .unwrap()
-            .remove_embedded_annotation_resource("./a.mp3")
+            .set_embedded_annotations(
+                embedded_annotations("text/chapter.xhtml", &[("b.mp3", b"b")]),
+                EmbeddedAnnotationResourceRemoval::SetAndReferencedResources,
+            )
             .unwrap()
             .preview()
             .unwrap()
@@ -959,48 +878,23 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_after_prior_committed_orphan_is_rejected() {
-        let mut epub = memory_provider_epub();
-        epub.edit()
-            .set_embedded_annotations(embedded_annotations(
-                "text/chapter.xhtml",
-                &[("a.mp3", b"old")],
-            ))
-            .unwrap()
-            .set_embedded_annotations(embedded_annotations(
-                "text/chapter.xhtml",
-                &[("b.mp3", b"b")],
-            ))
-            .unwrap()
-            .preview()
-            .unwrap()
-            .commit();
-        let error = epub
-            .edit()
-            .remove_embedded_annotation_resource("a.mp3")
-            .unwrap_err();
-        assert!(matches!(error, EditError::UnsupportedSemanticEdit { .. }));
-        assert_eq!(exported_entry(&epub, "META-INF/a.mp3").unwrap(), b"old");
-    }
-
-    #[test]
     fn embedded_annotation_resource_path_can_be_reused_in_same_transaction() {
         let mut epub = memory_provider_epub();
         epub.edit()
-            .set_embedded_annotations(embedded_annotations(
-                "text/chapter.xhtml",
-                &[("a.mp3", b"old")],
-            ))
+            .set_embedded_annotations(
+                embedded_annotations("text/chapter.xhtml", &[("a.mp3", b"old")]),
+                EmbeddedAnnotationResourceRemoval::SetOnly,
+            )
             .unwrap()
-            .set_embedded_annotations(embedded_annotations(
-                "text/chapter.xhtml",
-                &[("b.mp3", b"b")],
-            ))
+            .set_embedded_annotations(
+                embedded_annotations("text/chapter.xhtml", &[("b.mp3", b"b")]),
+                EmbeddedAnnotationResourceRemoval::SetAndReferencedResources,
+            )
             .unwrap()
-            .set_embedded_annotations(embedded_annotations(
-                "text/chapter.xhtml",
-                &[("a.mp3", b"new")],
-            ))
+            .set_embedded_annotations(
+                embedded_annotations("text/chapter.xhtml", &[("a.mp3", b"new")]),
+                EmbeddedAnnotationResourceRemoval::SetOnly,
+            )
             .unwrap()
             .preview()
             .unwrap()
@@ -1012,24 +906,56 @@ mod tests {
     }
 
     #[test]
-    fn malformed_current_embedded_annotation_set_error_propagates() {
-        let provider = MemoryResourceProvider::from_entries(
-            memory_provider()
-                .into_entries()
-                .into_iter()
-                .map(|(path, bytes)| (path.as_path().to_path_buf(), bytes))
-                .chain([("META-INF/annotations.json".into(), b"{".to_vec())]),
-        )
-        .unwrap();
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+    fn retained_stale_annotation_resource_is_not_overwritten() {
+        let mut epub = memory_provider_epub();
         let error = epub
             .edit()
-            .set_embedded_annotations(embedded_annotations("text/chapter.xhtml", &[]))
+            .set_embedded_annotations(
+                embedded_annotations("text/chapter.xhtml", &[("a.mp3", b"old")]),
+                EmbeddedAnnotationResourceRemoval::SetOnly,
+            )
+            .unwrap()
+            .set_embedded_annotations(
+                embedded_annotations("text/chapter.xhtml", &[("b.mp3", b"b")]),
+                EmbeddedAnnotationResourceRemoval::SetOnly,
+            )
+            .unwrap()
+            .set_embedded_annotations(
+                embedded_annotations("text/chapter.xhtml", &[("a.mp3", b"new")]),
+                EmbeddedAnnotationResourceRemoval::SetOnly,
+            )
             .unwrap_err();
         assert!(matches!(
             error,
-            EditError::Annotation {
-                source: AnnotationError::Json { .. }
+            EditError::AnnotationResourceExists { ref path } if path == "a.mp3"
+        ));
+    }
+
+    #[test]
+    fn malformed_current_embedded_annotation_set_error_propagates() {
+        let provider = MemoryResourceProvider::from_entries(
+            memory_provider()
+                .into_inner()
+                .into_iter()
+                .map(|(path, bytes)| (path.as_str().to_string(), bytes))
+                .chain([("META-INF/annotations.json".into(), b"{".to_vec())]),
+        )
+        .unwrap();
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
+        let error = epub
+            .edit()
+            .set_embedded_annotations(
+                embedded_annotations("text/chapter.xhtml", &[]),
+                EmbeddedAnnotationResourceRemoval::SetOnly,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            EditError::Annotations {
+                source: EmbeddedAnnotationsError::Annotation {
+                    source: AnnotationError::Json { .. }
+                }
             }
         ));
         assert_eq!(
@@ -1042,10 +968,10 @@ mod tests {
     fn staged_embedded_annotations_can_be_removed_with_their_resources() {
         let mut epub = memory_provider_epub();
         epub.edit()
-            .set_embedded_annotations(embedded_annotations(
-                "text/chapter.xhtml",
-                &[("a.mp3", b"a")],
-            ))
+            .set_embedded_annotations(
+                embedded_annotations("text/chapter.xhtml", &[("a.mp3", b"a")]),
+                EmbeddedAnnotationResourceRemoval::SetOnly,
+            )
             .unwrap()
             .remove_embedded_annotations(
                 EmbeddedAnnotationResourceRemoval::SetAndReferencedResources,
@@ -1062,10 +988,10 @@ mod tests {
     fn removed_embedded_annotations_can_be_replaced_in_the_same_transaction() {
         let mut epub = memory_provider_epub();
         epub.edit()
-            .set_embedded_annotations(embedded_annotations(
-                "text/chapter.xhtml",
-                &[("a.mp3", b"old")],
-            ))
+            .set_embedded_annotations(
+                embedded_annotations("text/chapter.xhtml", &[("a.mp3", b"old")]),
+                EmbeddedAnnotationResourceRemoval::SetOnly,
+            )
             .unwrap()
             .preview()
             .unwrap()
@@ -1075,10 +1001,10 @@ mod tests {
                 EmbeddedAnnotationResourceRemoval::SetAndReferencedResources,
             )
             .unwrap()
-            .set_embedded_annotations(embedded_annotations(
-                "text/chapter.xhtml",
-                &[("a.mp3", b"new")],
-            ))
+            .set_embedded_annotations(
+                embedded_annotations("text/chapter.xhtml", &[("a.mp3", b"new")]),
+                EmbeddedAnnotationResourceRemoval::SetOnly,
+            )
             .unwrap()
             .preview()
             .unwrap()
@@ -1094,24 +1020,28 @@ mod tests {
         for set_first in [false, true] {
             let mut provider = memory_provider();
             provider.remove(&EpubPath::new("EPUB/text/chapter.xhtml").unwrap());
-            let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+            let mut epub =
+                Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
             let annotations = embedded_annotations("text/chapter.xhtml", &[]);
             let edit = epub.edit();
             let edit = if set_first {
-                edit.set_embedded_annotations(annotations)
-                    .unwrap()
-                    .upsert_resource(
-                        "EPUB/text/chapter.xhtml",
-                        b"<html><body>Restored</body></html>".to_vec(),
-                    )
-                    .unwrap()
-            } else {
-                edit.upsert_resource(
-                    "EPUB/text/chapter.xhtml",
+                edit.set_embedded_annotations(
+                    annotations,
+                    EmbeddedAnnotationResourceRemoval::SetOnly,
+                )
+                .unwrap()
+                .upsert_resource(
+                    EpubPath::new("EPUB/text/chapter.xhtml").unwrap(),
                     b"<html><body>Restored</body></html>".to_vec(),
                 )
                 .unwrap()
-                .set_embedded_annotations(annotations)
+            } else {
+                edit.upsert_resource(
+                    EpubPath::new("EPUB/text/chapter.xhtml").unwrap(),
+                    b"<html><body>Restored</body></html>".to_vec(),
+                )
+                .unwrap()
+                .set_embedded_annotations(annotations, EmbeddedAnnotationResourceRemoval::SetOnly)
                 .unwrap()
             };
             edit.preview().unwrap();
@@ -1123,18 +1053,26 @@ mod tests {
         let mut epub = memory_provider_epub();
         let preview = epub
             .edit()
-            .set_embedded_annotations(embedded_annotations("text/chapter.xhtml", &[]))
+            .set_embedded_annotations(
+                embedded_annotations("text/chapter.xhtml", &[]),
+                EmbeddedAnnotationResourceRemoval::SetOnly,
+            )
             .unwrap()
-            .remove_resource(ResourceSelector::manifest_href("text/chapter.xhtml").unwrap())
+            .remove_resource(EpubPath::new("EPUB/text/chapter.xhtml").unwrap())
             .unwrap()
             .preview()
             .unwrap();
         assert!(matches!(
-            preview.annotations().unwrap().set().items()[0]
+            preview
+                .embedded_annotations()
+                .unwrap()
+                .unwrap()
+                .set()
+                .items()[0]
                 .target()
                 .unwrap()
-                .source_state(preview.resources()),
-            crate::annotation::AnnotationSourceState::ProviderMissing(_)
+                .resolve_source(preview.resources()),
+            Err(crate::annotation::AnnotationSourceError::ProviderMissing { .. })
         ));
     }
 
@@ -1148,16 +1086,21 @@ mod tests {
             .into_bytes();
         let preview = epub
             .edit()
-            .upsert_resource("META-INF/annotations.json", bytes)
+            .upsert_resource(EpubPath::new("META-INF/annotations.json").unwrap(), bytes)
             .unwrap()
             .preview()
             .unwrap();
         assert!(matches!(
-            preview.annotations().unwrap().set().items()[0]
+            preview
+                .embedded_annotations()
+                .unwrap()
+                .unwrap()
+                .set()
+                .items()[0]
                 .target()
                 .unwrap()
-                .source_state(preview.resources()),
-            crate::annotation::AnnotationSourceState::Missing
+                .resolve_source(preview.resources()),
+            Err(crate::annotation::AnnotationSourceError::Missing)
         ));
     }
 
@@ -1165,10 +1108,10 @@ mod tests {
     fn generic_oversized_annotation_adjacent_resource_is_not_annotation_preview_work() {
         let mut epub = memory_provider_epub();
         epub.edit()
-            .set_embedded_annotations(embedded_annotations(
-                "text/chapter.xhtml",
-                &[("a.mp3", b"audio")],
-            ))
+            .set_embedded_annotations(
+                embedded_annotations("text/chapter.xhtml", &[("a.mp3", b"audio")]),
+                EmbeddedAnnotationResourceRemoval::SetOnly,
+            )
             .unwrap()
             .preview()
             .unwrap()
@@ -1176,13 +1119,12 @@ mod tests {
         let preview = epub
             .edit()
             .upsert_resource(
-                "META-INF/a.mp3",
+                EpubPath::new("META-INF/a.mp3").unwrap(),
                 vec![0; (crate::annotation::MAX_ARCHIVE_RESOURCE_BYTES + 1) as usize],
             )
             .unwrap()
             .preview()
             .unwrap();
-        assert!(preview.annotations().is_none());
         assert!(preview.changes().iter().any(|change| matches!(change, EditChange::UpsertResource { path, .. } if path.as_str() == "META-INF/a.mp3")));
     }
 
@@ -1191,9 +1133,9 @@ mod tests {
         let annotations = embedded_annotations("text/chapter.xhtml", &[("a.mp3", b"audio")]);
         let provider = MemoryResourceProvider::from_entries(
             memory_provider()
-                .into_entries()
+                .into_inner()
                 .into_iter()
-                .map(|(path, bytes)| (path.as_path().to_path_buf(), bytes))
+                .map(|(path, bytes)| (path.as_str().to_string(), bytes))
                 .chain([
                     (
                         "META-INF/annotations.json".into(),
@@ -1206,20 +1148,22 @@ mod tests {
         let provider = FailingIndexProvider {
             inner: provider,
             index_calls: Cell::new(0),
-            read_calls: Cell::new(0),
             entry_reader_calls: Cell::new(0),
             annotation_reads: Cell::new(0),
             fail_on_index_call: usize::MAX,
         };
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
         epub.container.annotation_reads.set(0);
         let preview = epub
             .edit()
-            .upsert_resource("META-INF/a.mp3", b"replacement".to_vec())
+            .upsert_resource(
+                EpubPath::new("META-INF/a.mp3").unwrap(),
+                b"replacement".to_vec(),
+            )
             .unwrap()
             .preview()
             .unwrap();
-        assert!(preview.annotations().is_none());
         assert_eq!(preview.epub.container.annotation_reads.get(), 0);
     }
 
@@ -1228,7 +1172,7 @@ mod tests {
         let mut epub = memory_provider_epub();
         let bytes = br#"{"id":"urn:test:set","type":"AnnotationSet","about":{},"items":[{"id":"urn:test:annotation","type":"Annotation","created":"2026-07-16T12:00:00Z","target":{"source":"https://example.com/chapter.xhtml"}}]}"#.to_vec();
         epub.edit()
-            .upsert_resource("META-INF/annotations.json", bytes)
+            .upsert_resource(EpubPath::new("META-INF/annotations.json").unwrap(), bytes)
             .unwrap()
             .preview()
             .unwrap()
@@ -1238,7 +1182,7 @@ mod tests {
                 .target()
                 .unwrap()
                 .source(),
-            "https://example.com/chapter.xhtml"
+            Some("https://example.com/chapter.xhtml")
         );
     }
 
@@ -1247,7 +1191,10 @@ mod tests {
         let mut epub = memory_provider_epub();
         let set = AnnotationSet::parse_json(r#"{"id":"urn:test:set","type":"AnnotationSet","about":{},"items":[{"id":"urn:test:annotation","type":"Annotation","created":"2026-07-16T12:00:00Z","target":{"source":"https://example.com/chapter.xhtml"}}]}"#).unwrap();
         epub.edit()
-            .set_embedded_annotations(AnnotationBundle::new(set, Vec::new()).unwrap())
+            .set_embedded_annotations(
+                AnnotationBundle::new(set, Vec::new()).unwrap(),
+                EmbeddedAnnotationResourceRemoval::SetOnly,
+            )
             .unwrap()
             .preview()
             .unwrap()
@@ -1257,7 +1204,7 @@ mod tests {
                 .target()
                 .unwrap()
                 .source(),
-            "https://example.com/chapter.xhtml"
+            Some("https://example.com/chapter.xhtml")
         );
     }
 
@@ -1267,6 +1214,7 @@ mod tests {
             .href(EpubHref::try_new("extra.xhtml").unwrap())
             .media_type(EpubString::try_new("application/xhtml+xml").unwrap().into())
             .build()
+            .unwrap()
     }
 
     #[test]
@@ -1276,22 +1224,25 @@ mod tests {
             let annotations = embedded_annotations("extra.xhtml", &[]);
             let edit = epub.edit();
             let edit = if set_first {
-                edit.set_embedded_annotations(annotations)
-                    .unwrap()
-                    .add_manifest_resource(
-                        "EPUB/extra.xhtml",
-                        b"<html><body>Extra</body></html>".to_vec(),
-                        extra_manifest_item(),
-                    )
-                    .unwrap()
-            } else {
-                edit.add_manifest_resource(
-                    "EPUB/extra.xhtml",
+                edit.set_embedded_annotations(
+                    annotations,
+                    EmbeddedAnnotationResourceRemoval::SetOnly,
+                )
+                .unwrap()
+                .add_manifest_resource(
+                    EpubPath::new("EPUB/extra.xhtml").unwrap(),
                     b"<html><body>Extra</body></html>".to_vec(),
                     extra_manifest_item(),
                 )
                 .unwrap()
-                .set_embedded_annotations(annotations)
+            } else {
+                edit.add_manifest_resource(
+                    EpubPath::new("EPUB/extra.xhtml").unwrap(),
+                    b"<html><body>Extra</body></html>".to_vec(),
+                    extra_manifest_item(),
+                )
+                .unwrap()
+                .set_embedded_annotations(annotations, EmbeddedAnnotationResourceRemoval::SetOnly)
                 .unwrap()
             };
             edit.preview().unwrap();
@@ -1303,7 +1254,7 @@ mod tests {
         let mut epub = memory_provider_epub();
         epub.edit()
             .add_manifest_resource(
-                "EPUB/extra.xhtml",
+                EpubPath::new("EPUB/extra.xhtml").unwrap(),
                 b"<html><body>Extra</body></html>".to_vec(),
                 extra_manifest_item(),
             )
@@ -1314,25 +1265,36 @@ mod tests {
         for set_first in [false, true] {
             let annotations = embedded_annotations("extra.xhtml", &[]);
             let edit = epub.edit();
-            let selector = || ManifestItemSelector::authored_href(AuthoredHref::new("extra.xhtml"));
+            let selector = || ManifestItemSelector::AuthoredHref(AuthoredHref::new("extra.xhtml"));
             let edit = if set_first {
-                edit.set_embedded_annotations(annotations)
-                    .unwrap()
-                    .remove_manifest_resource(selector())
-                    .unwrap()
+                edit.set_embedded_annotations(
+                    annotations,
+                    EmbeddedAnnotationResourceRemoval::SetOnly,
+                )
+                .unwrap()
+                .remove_manifest_resource(selector())
+                .unwrap()
             } else {
                 edit.remove_manifest_resource(selector())
                     .unwrap()
-                    .set_embedded_annotations(annotations)
+                    .set_embedded_annotations(
+                        annotations,
+                        EmbeddedAnnotationResourceRemoval::SetOnly,
+                    )
                     .unwrap()
             };
             let preview = edit.preview().unwrap();
             assert!(matches!(
-                preview.annotations().unwrap().set().items()[0]
+                preview
+                    .embedded_annotations()
+                    .unwrap()
+                    .unwrap()
+                    .set()
+                    .items()[0]
                     .target()
                     .unwrap()
-                    .source_state(preview.resources()),
-                crate::annotation::AnnotationSourceState::Missing
+                    .resolve_source(preview.resources()),
+                Err(crate::annotation::AnnotationSourceError::Missing)
             ));
         }
     }
@@ -1341,26 +1303,35 @@ mod tests {
     fn embedded_annotations_expose_non_manifest_targets() {
         let provider = MemoryResourceProvider::from_entries(
             memory_provider()
-                .into_entries()
+                .into_inner()
                 .into_iter()
-                .map(|(path, bytes)| (path.as_path().to_path_buf(), bytes))
+                .map(|(path, bytes)| (path.as_str().to_string(), bytes))
                 .chain([("EPUB/orphan.xhtml".into(), b"orphan".to_vec())]),
         )
         .unwrap();
-        let mut epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        let mut epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
         for target in ["package.opf", "orphan.xhtml"] {
             let preview = epub
                 .edit()
-                .set_embedded_annotations(embedded_annotations(target, &[]))
+                .set_embedded_annotations(
+                    embedded_annotations(target, &[]),
+                    EmbeddedAnnotationResourceRemoval::SetOnly,
+                )
                 .unwrap()
                 .preview()
                 .unwrap();
             assert!(matches!(
-                preview.annotations().unwrap().set().items()[0]
+                preview
+                    .embedded_annotations()
+                    .unwrap()
+                    .unwrap()
+                    .set()
+                    .items()[0]
                     .target()
                     .unwrap()
-                    .source_state(preview.resources()),
-                crate::annotation::AnnotationSourceState::Missing
+                    .resolve_source(preview.resources()),
+                Err(crate::annotation::AnnotationSourceError::Missing)
             ));
         }
     }

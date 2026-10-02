@@ -5,27 +5,24 @@
 //! its authored target. Missing and ambiguous overlay relationships remain visible through
 //! [`MediaOverlayAssociationRef::reference`].
 //!
-//! Standalone [`SmilDocument`] values are normalized models; serialization does not promise
-//! byte-for-byte output or preservation of unknown XML. Default parsing limits are 100,000 nodes
-//! and 256 nested elements. Analyzed facts and associations belong to one publication-analysis
-//! snapshot and continue to describe that version after the publication is edited.
+//! [`SmilDocument`] serializes normalized XML; unknown markup is not preserved.
 
 mod facts;
 pub(crate) mod smil;
 
-use crate::analysis::ResourceFacts;
+use crate::analysis::ResourceAnalysisRef;
 use crate::analysis::reference::{
     AuthoredReference, HrefReference, HrefRole, ManifestReference, ReferenceSlot,
 };
 use crate::package::{Package, metadata::Meta};
 use crate::resource::{
-    ManifestDeclaration, ManifestKey, ReadingOrderEntry, ResourceIndex, ResourceKey, ResourceRecord,
+    ManifestDeclarationRef, ManifestOrdinal, ReadingOrderOccurrenceRef, ResourceIndex,
+    ResourceOrdinal, ResourceRef,
 };
 
-pub(crate) use facts::parse_media_time;
 pub use facts::{MediaTime, SmilFacts, SmilNodeFact, SmilNodeId, SmilTime};
 pub use smil::{
-    SmilAudio, SmilBody, SmilDocument, SmilError, SmilHead, SmilMeta, SmilPar, SmilParallelChild,
+    SmilAudio, SmilBody, SmilDocument, SmilError, SmilHead, SmilMeta, SmilPar, SmilParOrder,
     SmilSeq, SmilSequenceChild, SmilText,
 };
 
@@ -39,7 +36,7 @@ pub struct MediaOverlayFacts {
 impl MediaOverlayFacts {
     pub(crate) fn build(package: &Package, resources: &ResourceIndex) -> Self {
         Self {
-            present: resources.declarations().iter().any(|declaration| {
+            present: resources.declarations().any(|declaration| {
                 declaration.media_overlay().is_some()
                     || declaration
                         .media_type()
@@ -63,8 +60,7 @@ impl MediaOverlayFacts {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 /// Authored durations, playback classes, and narrators from package metadata.
 pub struct MediaOverlayMetadata {
-    total_durations: Vec<MediaOverlayDurationMeta>,
-    item_durations: Vec<MediaOverlayDurationMeta>,
+    durations: Vec<MediaOverlayDurationMeta>,
     active_classes: Vec<String>,
     playback_active_classes: Vec<String>,
     narrators: Vec<String>,
@@ -77,26 +73,36 @@ impl MediaOverlayMetadata {
             .meta()
             .iter()
             .filter(|meta| is_property(meta, "duration"))
-            .map(|meta| duration_meta(meta, resources));
-        let (item_durations, total_durations) =
-            durations.partition(|duration| duration.refines.is_some());
+            .map(|meta| duration_meta(meta, resources))
+            .collect();
         Self {
-            total_durations,
-            item_durations,
+            durations,
             active_classes: collect_meta_values(package, "active-class"),
             playback_active_classes: collect_meta_values(package, "playback-active-class"),
             narrators: collect_meta_values(package, "narrator"),
         }
     }
 
-    /// Returns unrefined total-duration values in authored order.
-    pub fn total_durations(&self) -> &[MediaOverlayDurationMeta] {
-        &self.total_durations
+    /// Returns authored duration values in authored order.
+    ///
+    /// A value with no [`MediaOverlayDurationMeta::refines`] is a publication total; the rest
+    /// refine manifest declarations.
+    pub fn durations(&self) -> &[MediaOverlayDurationMeta] {
+        &self.durations
     }
 
-    /// Returns duration values that refine manifest declarations.
-    pub fn item_durations(&self) -> &[MediaOverlayDurationMeta] {
-        &self.item_durations
+    /// Returns authored publication totals, the durations that refine nothing.
+    pub fn total_durations(&self) -> impl Iterator<Item = &MediaOverlayDurationMeta> {
+        self.durations
+            .iter()
+            .filter(|duration| duration.refines().is_none())
+    }
+
+    /// Returns authored durations that refine a manifest declaration.
+    pub fn item_durations(&self) -> impl Iterator<Item = &MediaOverlayDurationMeta> {
+        self.durations
+            .iter()
+            .filter(|duration| duration.refines().is_some())
     }
 
     /// Returns authored active-class values.
@@ -118,21 +124,15 @@ impl MediaOverlayMetadata {
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// One authored media-overlay duration and its optional parsed time and refinement targets.
 pub struct MediaOverlayDurationMeta {
-    authored: String,
-    parsed: Option<MediaTime>,
+    duration: SmilTime,
     refines: Option<String>,
-    targets: Vec<ManifestKey>,
+    targets: Vec<ManifestOrdinal>,
 }
 
 impl MediaOverlayDurationMeta {
-    /// Returns the exact authored duration text.
-    pub fn authored(&self) -> &str {
-        &self.authored
-    }
-
-    /// Returns the parsed millisecond value when recognized.
-    pub fn parsed(&self) -> Option<MediaTime> {
-        self.parsed
+    /// Returns the authored duration and its recognized millisecond value.
+    pub fn duration(&self) -> &SmilTime {
+        &self.duration
     }
 
     /// Returns the authored `refines` value.
@@ -141,65 +141,53 @@ impl MediaOverlayDurationMeta {
     }
 
     /// Returns every declaration in this analysis matching the refinement ID.
-    pub fn targets(&self) -> &[ManifestKey] {
+    pub fn targets(&self) -> &[ManifestOrdinal] {
         &self.targets
     }
 }
 
 /// A reading-order entry with its content resource, overlay relationship, and SMIL facts.
 ///
-/// The manifest relationship retains missing and ambiguous targets. Overlay declarations,
-/// resources, and SMIL facts are present only when the relationship resolves far enough to
-/// identify them. All references belong to one [`crate::PublicationAnalysis`] snapshot.
+/// Missing or ambiguous targets remain available through [`Self::reference`].
 #[derive(Debug, Clone, Copy)]
 pub struct MediaOverlayAssociationRef<'a> {
-    reading_order: &'a ReadingOrderEntry,
-    content_declaration: &'a ManifestDeclaration,
-    content_resource: Option<&'a ResourceRecord>,
+    reading_order: ReadingOrderOccurrenceRef<'a>,
+    content_declaration: ManifestDeclarationRef<'a>,
     reference: &'a ManifestReference,
-    overlay_declaration: Option<&'a ManifestDeclaration>,
-    overlay_resource: Option<&'a ResourceRecord>,
-    overlay_resource_facts: Option<&'a ResourceFacts>,
-    references: &'a [AuthoredReference],
+    overlay_declaration: Option<ManifestDeclarationRef<'a>>,
+    overlay_resource: Option<ResourceAnalysisRef<'a>>,
 }
 
 impl<'a> MediaOverlayAssociationRef<'a> {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        reading_order: &'a ReadingOrderEntry,
-        content_declaration: &'a ManifestDeclaration,
-        content_resource: Option<&'a ResourceRecord>,
+        reading_order: ReadingOrderOccurrenceRef<'a>,
+        content_declaration: ManifestDeclarationRef<'a>,
         reference: &'a ManifestReference,
-        overlay_declaration: Option<&'a ManifestDeclaration>,
-        overlay_resource: Option<&'a ResourceRecord>,
-        overlay_resource_facts: Option<&'a ResourceFacts>,
-        references: &'a [AuthoredReference],
+        overlay_declaration: Option<ManifestDeclarationRef<'a>>,
+        overlay_resource: Option<ResourceAnalysisRef<'a>>,
     ) -> Self {
         Self {
             reading_order,
             content_declaration,
-            content_resource,
             reference,
             overlay_declaration,
             overlay_resource,
-            overlay_resource_facts,
-            references,
         }
     }
 
     /// Returns the exact reading-order occurrence carrying this association.
-    pub fn reading_order(self) -> &'a ReadingOrderEntry {
+    pub fn reading_order(self) -> ReadingOrderOccurrenceRef<'a> {
         self.reading_order
     }
 
     /// Returns the content declaration that authored `media-overlay`.
-    pub fn content_declaration(self) -> &'a ManifestDeclaration {
+    pub fn content_declaration(self) -> ManifestDeclarationRef<'a> {
         self.content_declaration
     }
 
     /// Returns the content resource when the reading-order declaration resolves to one.
-    pub fn content_resource(self) -> Option<&'a ResourceRecord> {
-        self.content_resource
+    pub fn content_resource(self) -> Option<ResourceRef<'a>> {
+        self.content_declaration.resource()
     }
 
     /// Returns the authored manifest relationship, including its target state.
@@ -208,41 +196,32 @@ impl<'a> MediaOverlayAssociationRef<'a> {
     }
 
     /// Returns the uniquely resolved overlay declaration.
-    pub fn overlay_declaration(self) -> Option<&'a ManifestDeclaration> {
+    pub fn overlay_declaration(self) -> Option<ManifestDeclarationRef<'a>> {
         self.overlay_declaration
     }
 
-    /// Returns the overlay resource when the target declaration resolves to one.
-    pub fn overlay_resource(self) -> Option<&'a ResourceRecord> {
+    /// Returns the analysis of the overlay resource when the target declaration resolves to one.
+    pub fn overlay_resource(self) -> Option<ResourceAnalysisRef<'a>> {
         self.overlay_resource
-    }
-
-    /// Returns all analysis outcomes for the resolved overlay resource.
-    pub fn overlay_resource_facts(self) -> Option<&'a ResourceFacts> {
-        self.overlay_resource_facts
     }
 
     /// Returns complete or partial SMIL facts for the resolved overlay resource.
     pub fn smil_facts(self) -> Option<&'a SmilFacts> {
-        self.overlay_resource_facts?.content().value()?.as_smil()
+        self.overlay_resource?.content().value()?.as_smil()
     }
 
     /// Iterates root playback nodes with their text and audio references.
-    pub fn roots(self) -> impl Iterator<Item = SmilNodeRef<'a>> {
-        let resource = self.overlay_resource.map(ResourceRecord::key);
-        self.smil_facts().into_iter().flat_map(move |facts| {
-            facts
-                .roots()
-                .iter()
-                .filter_map(move |node| SmilNodeRef::new(resource?, *node, facts, self.references))
-        })
+    pub fn roots(self) -> impl Iterator<Item = SmilNodeRef<'a>> + 'a {
+        self.overlay_resource
+            .into_iter()
+            .flat_map(ResourceAnalysisRef::smil_roots)
     }
 }
 
 /// A SMIL playback node with access to its children and authored text or audio link.
 #[derive(Clone, Copy)]
 pub struct SmilNodeRef<'a> {
-    resource: ResourceKey,
+    resource: ResourceOrdinal,
     node: SmilNodeId,
     facts: &'a SmilFacts,
     references: &'a [AuthoredReference],
@@ -261,7 +240,7 @@ impl std::fmt::Debug for SmilNodeRef<'_> {
 
 impl<'a> SmilNodeRef<'a> {
     pub(crate) fn new(
-        resource: ResourceKey,
+        resource: ResourceOrdinal,
         node: SmilNodeId,
         facts: &'a SmilFacts,
         references: &'a [AuthoredReference],
@@ -325,12 +304,12 @@ fn duration_meta(meta: &Meta, resources: &ResourceIndex) -> MediaOverlayDuration
         .as_deref()
         .and_then(refinement_id)
         .into_iter()
-        .flat_map(|id| resources.declarations_with_id(id))
-        .map(crate::resource::ManifestDeclaration::key)
+        .flat_map(|id| resources.declarations_with_id(id).ok())
+        .flatten()
+        .map(crate::resource::ManifestDeclarationRef::ordinal)
         .collect();
     MediaOverlayDurationMeta {
-        parsed: parse_media_time(&authored),
-        authored,
+        duration: SmilTime::new(authored),
         refines,
         targets,
     }

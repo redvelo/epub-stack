@@ -1,25 +1,18 @@
+use epub_stack::EpubString;
 use epub_stack::container::{ExportError, Rootfile};
 use epub_stack::edit::{
-    EditChange, StructuralEditKind,
-    navigation::{PointMatch, PointSelector},
-    package::SpineItemRefSelector,
+    EditChange, StructuralResourceKind,
+    select::{ListSelector, PointMatch, PointSelector, SpineItemRefSelector},
 };
 use epub_stack::package::{
     EpubVersion, RenditionLayout,
     manifest::ManifestItem,
     spine::{ItemRef, KnownSpineProperty},
 };
-use epub_stack::resource::provider::{
-    ProviderReadError, ReadResult, ResourceProvider, ResourceProviderIndex,
-    ResourceProviderIndexError, ResourceProviderIndexLimits,
-};
-use epub_stack::resource::{
-    EpubHref, MediaType, ProviderPresence, ReadingOrderTarget, ResourceLookupError,
-};
-use epub_stack::semantics::EpubString;
+use epub_stack::resource::provider::{ProviderIndexError, ProviderReadError, ResourceProvider};
+use epub_stack::resource::{EpubHref, MediaType, ProviderPresence, ResourceReadError};
 use epub_stack::{
     Epub, EpubOpenFailure, EpubOpenLimits, EpubPath, EpubZip, MemoryResourceProvider,
-    ResourceSelector,
 };
 use std::cell::Cell;
 use std::io::{Cursor, Read, Seek, Write};
@@ -117,7 +110,6 @@ fn snapshot<R: ResourceProvider>(book: &Epub<R>) -> PublicationSnapshot {
     let resources = book
         .resources()
         .resources()
-        .iter()
         .map(|resource| {
             (
                 resource.address().display_value().to_string(),
@@ -126,45 +118,58 @@ fn snapshot<R: ResourceProvider>(book: &Epub<R>) -> PublicationSnapshot {
         })
         .collect();
     let reading_order = book
+        .resources()
         .reading_order()
-        .map(|entry| match entry.target() {
-            ReadingOrderTarget::Declaration {
-                resource: Some(key),
-                ..
-            } => book
-                .resources()
-                .resource(*key)
-                .unwrap()
-                .address()
-                .display_value()
-                .to_string(),
-            target => format!("{target:?}"),
+        .map(|entry| match entry.resource() {
+            Some(resource) => resource.address().display_value().to_string(),
+            None => format!("{:?}", entry.target()),
         })
         .collect();
     PublicationSnapshot {
-        package_path: book.package_path().as_str().to_string(),
+        package_path: book.resources().package_path().as_str().to_string(),
         version: book.package().version(),
         resources,
         reading_order,
-        has_epub_nav: book.navigation().epub_nav().is_some(),
+        has_epub_nav: book
+            .navigation()
+            .filter(|document| document.is_epub_nav())
+            .is_some(),
     }
 }
 
 fn assert_opf2_migration_state<R: ResourceProvider>(book: &Epub<R>) {
-    assert_eq!(book.package_path().as_str(), "OPS/package.opf");
+    assert_eq!(book.resources().package_path().as_str(), "OPS/package.opf");
     assert_eq!(book.package().version(), Some(EpubVersion::Three));
     assert!(book.package().guide().is_none());
     assert!(book.package().spine().toc().is_none());
-    assert!(book.package().manifest_item_by_id("ncx").is_none());
+    assert!(
+        book.package()
+            .manifest_items_by_id("ncx")
+            .unwrap()
+            .next()
+            .is_none()
+    );
 
-    let nav_item = book.package().nav_item().unwrap();
-    assert_eq!(nav_item.id().unwrap().as_str(), "nav");
+    let nav_item = book
+        .package()
+        .manifest_items_by_id("nav")
+        .unwrap()
+        .next()
+        .unwrap();
+    assert_eq!(nav_item.id().unwrap(), "nav");
     assert_eq!(nav_item.authored_href().unwrap().as_str(), "nav.xhtml");
-    assert!(book.package().ncx_item().is_none());
+    assert!(book.resources().ncx().is_none());
 
-    let nav = book.navigation().epub_nav().unwrap();
+    let nav = book
+        .navigation()
+        .filter(|document| document.is_epub_nav())
+        .unwrap();
     assert_eq!(nav.path().as_str(), "OPS/nav.xhtml");
-    assert!(book.navigation().ncx().is_none());
+    assert!(
+        book.navigation()
+            .filter(|document| document.is_ncx())
+            .is_none()
+    );
     let toc = nav.toc().unwrap();
     assert_eq!(toc.points().len(), 1);
     assert_eq!(toc.points()[0].label().unwrap().as_str(), "Chapter");
@@ -203,19 +208,13 @@ fn assert_opf2_migration_state<R: ResourceProvider>(book: &Epub<R>) {
     );
 
     assert_eq!(
-        book.reading_order()
-            .map(|entry| match entry.target() {
-                ReadingOrderTarget::Declaration {
-                    resource: Some(key),
-                    ..
-                } => book
-                    .resources()
-                    .resource(*key)
-                    .unwrap()
-                    .address()
-                    .display_value(),
-                target => panic!("unexpected reading-order target: {target:?}"),
-            })
+        book.resources()
+            .reading_order()
+            .map(|entry| entry
+                .resource()
+                .expect("reading-order entry resolves")
+                .address()
+                .display_value())
             .collect::<Vec<_>>(),
         ["OPS/text/chapter.xhtml", "OPS/text/afterword.xhtml"]
     );
@@ -234,20 +233,19 @@ fn assert_opf2_migration_state<R: ResourceProvider>(book: &Epub<R>) {
             "OPS/text/chapter.xhtml",
         ]
     );
-    assert!(book.resource(ResourceSelector::EpubNav).is_ok());
+    assert!(book.resources().epub_nav().is_some());
     assert!(matches!(
-        book.resource(ResourceSelector::path("OPS/navigation/toc.ncx").unwrap()),
-        Err(ResourceLookupError::NotFound(_))
+        book.bytes(&EpubPath::new("OPS/navigation/toc.ncx").unwrap()),
+        Err(ResourceReadError::Missing { .. })
     ));
 }
 
 fn assert_provider_conformance<R: ResourceProvider>(provider: &R) {
-    let limits = ResourceProviderIndexLimits::default();
-    let index = provider.index(&limits).unwrap();
-    let paths = index
-        .entries()
+    let mut entries = provider.entries().unwrap().collect::<Vec<_>>();
+    entries.sort();
+    let paths = entries
         .iter()
-        .map(|entry| entry.path().as_str())
+        .map(|(path, _)| path.as_str())
         .collect::<Vec<_>>();
     assert_eq!(
         paths,
@@ -262,9 +260,16 @@ fn assert_provider_conformance<R: ResourceProvider>(provider: &R) {
     );
 
     let chapter = EpubPath::new("EPUB/chapter.xhtml").unwrap();
-    assert_eq!(provider.read(&chapter).unwrap(), CHAPTER.as_bytes());
+    let bytes = provider
+        .read_with(&chapter, |reader| {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).map(|_| bytes)
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(bytes, CHAPTER.as_bytes());
     assert_eq!(
-        index.get(&chapter).unwrap().size_bytes(),
+        entries.iter().find(|(path, _)| path == &chapter).unwrap().1,
         Some(CHAPTER.len() as u64)
     );
 
@@ -280,23 +285,9 @@ fn assert_provider_conformance<R: ResourceProvider>(provider: &R) {
     let missing = EpubPath::new("EPUB/missing.xhtml").unwrap();
     assert!(matches!(
         provider.read_with(&missing, |_| calls.set(calls.get() + 1)),
-        Err(ProviderReadError::MissingResource { path }) if path == missing
+        Err(ProviderReadError::Missing { path }) if path == missing
     ));
     assert_eq!(calls.get(), 1);
-
-    let total_path_bytes = index
-        .entries()
-        .iter()
-        .map(|entry| entry.path().as_str().len())
-        .sum();
-    let exact = ResourceProviderIndexLimits::new(index.entries().len(), total_path_bytes).unwrap();
-    assert!(provider.index(&exact).is_ok());
-    let count_limit =
-        ResourceProviderIndexLimits::new(index.entries().len() - 1, total_path_bytes).unwrap();
-    assert!(matches!(
-        provider.index(&count_limit),
-        Err(ResourceProviderIndexError::EntryCountLimitExceeded { .. })
-    ));
 }
 
 #[test]
@@ -311,7 +302,11 @@ fn epub_zip_conforms_to_resource_provider_contract() {
 
 #[test]
 fn failed_provider_open_can_be_repaired_and_retried() {
-    let error = Epub::from_provider(provider(b"<broken"), "EPUB/package.opf").unwrap_err();
+    let error = Epub::from_provider(
+        provider(b"<broken"),
+        EpubPath::new("EPUB/package.opf").unwrap(),
+    )
+    .unwrap_err();
     let (failure, mut provider) = error.into_parts();
     assert!(
         matches!(failure, EpubOpenFailure::PackageParse { ref path, .. } if path.as_str() == "EPUB/package.opf")
@@ -323,12 +318,11 @@ fn failed_provider_open_can_be_repaired_and_retried() {
         )
         .unwrap();
 
-    let repaired = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+    let repaired =
+        Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
     assert_eq!(
         repaired
-            .resource(ResourceSelector::path("EPUB/chapter.xhtml").unwrap())
-            .unwrap()
-            .utf8_text()
+            .utf8_text(&EpubPath::new("EPUB/chapter.xhtml").unwrap())
             .unwrap(),
         CHAPTER
     );
@@ -336,12 +330,14 @@ fn failed_provider_open_can_be_repaired_and_retried() {
 
 #[test]
 fn no_op_export_reopen_preserves_normalized_publication_snapshot() {
-    let book = Epub::from_provider(provider(PACKAGE.as_bytes()), "EPUB/package.opf").unwrap();
+    let book = Epub::from_provider(
+        provider(PACKAGE.as_bytes()),
+        EpubPath::new("EPUB/package.opf").unwrap(),
+    )
+    .unwrap();
     let before = snapshot(&book);
     let chapter_before = book
-        .resource(ResourceSelector::path("EPUB/chapter.xhtml").unwrap())
-        .unwrap()
-        .bytes()
+        .bytes(&EpubPath::new("EPUB/chapter.xhtml").unwrap())
         .unwrap();
     let output = book.export(Cursor::new(Vec::new())).unwrap().into_inner();
 
@@ -362,9 +358,7 @@ fn no_op_export_reopen_preserves_normalized_publication_snapshot() {
     assert_eq!(snapshot(&reopened), before);
     assert_eq!(
         reopened
-            .resource(ResourceSelector::path("EPUB/chapter.xhtml").unwrap())
-            .unwrap()
-            .bytes()
+            .bytes(&EpubPath::new("EPUB/chapter.xhtml").unwrap())
             .unwrap(),
         chapter_before
     );
@@ -372,48 +366,51 @@ fn no_op_export_reopen_preserves_normalized_publication_snapshot() {
 
 #[test]
 fn edit_preview_commit_export_reopen_preserves_effective_state() {
-    let mut book = Epub::from_provider(provider(PACKAGE.as_bytes()), "EPUB/package.opf").unwrap();
-    let selector = ResourceSelector::path("EPUB/chapter.xhtml").unwrap();
+    let mut book = Epub::from_provider(
+        provider(PACKAGE.as_bytes()),
+        EpubPath::new("EPUB/package.opf").unwrap(),
+    )
+    .unwrap();
+    let selector = EpubPath::new("EPUB/chapter.xhtml").unwrap();
     let replacement = b"<html><body>Edited chapter</body></html>".to_vec();
 
     let preview = book
         .edit()
-        .replace_resource(selector.clone(), replacement.clone())
+        .upsert_resource(selector.clone(), replacement.clone())
         .unwrap()
         .preview()
         .unwrap();
     assert_eq!(preview.changes().len(), 1);
     let preview_package = preview.package().clone();
-    let preview_navigation = preview.navigation().clone();
+    let preview_navigation = preview.navigation().cloned();
     let preview_resources = preview.resources().clone();
     let preview_changes = preview.changes().to_vec();
     let report = preview.commit();
-    assert_eq!(report.changes(), preview_changes);
+    assert_eq!(report, preview_changes);
     assert_eq!(book.package(), &preview_package);
-    assert_eq!(book.navigation(), &preview_navigation);
+    assert_eq!(book.navigation(), preview_navigation.as_ref());
     assert_eq!(book.resources(), &preview_resources);
-    assert_eq!(
-        book.resource(selector.clone()).unwrap().bytes().unwrap(),
-        replacement
-    );
+    assert_eq!(book.bytes(&selector).unwrap(), replacement);
 
     let output = book.export(Cursor::new(Vec::new())).unwrap().into_inner();
     let reopened = EpubZip::from_reader(Cursor::new(output))
         .unwrap()
         .default_rendition()
         .unwrap();
-    assert_eq!(
-        reopened.resource(selector).unwrap().bytes().unwrap(),
-        replacement
+    assert_eq!(reopened.bytes(&selector).unwrap(), replacement);
+    assert!(
+        reopened
+            .navigation()
+            .filter(|document| document.is_epub_nav())
+            .is_some()
     );
-    assert!(reopened.navigation().epub_nav().is_some());
 }
 
 #[test]
 fn reading_order_presentation_tracks_preview_commit_and_detached_analysis() {
     let mut book = Epub::from_provider(
         provider(PRESENTATION_PACKAGE.as_bytes()),
-        "EPUB/package.opf",
+        EpubPath::new("EPUB/package.opf").unwrap(),
     )
     .unwrap();
     let analysis_before = book.analyze();
@@ -432,9 +429,10 @@ fn reading_order_presentation_tracks_preview_commit_and_detached_analysis() {
     let replacement = ItemRef::new("chapter")
         .unwrap()
         .with_property(KnownSpineProperty::RenditionLayoutPrePaginated);
+    let first = book.resources().reading_order().next().unwrap().ordinal();
     let preview = book
         .edit()
-        .replace_spine_itemref(SpineItemRefSelector::index(0), replacement)
+        .replace_spine_itemref(SpineItemRefSelector::Ordinal(first), replacement)
         .unwrap()
         .preview()
         .unwrap();
@@ -452,7 +450,8 @@ fn reading_order_presentation_tracks_preview_commit_and_detached_analysis() {
 
     preview.commit();
     assert_eq!(
-        book.reading_order()
+        book.resources()
+            .reading_order()
             .next()
             .unwrap()
             .presentation()
@@ -475,15 +474,19 @@ fn reading_order_presentation_tracks_preview_commit_and_detached_analysis() {
 
 #[test]
 fn edit_changes_are_coalesced_by_path_in_canonical_order() {
-    let mut book = Epub::from_provider(provider(PACKAGE.as_bytes()), "EPUB/package.opf").unwrap();
+    let mut book = Epub::from_provider(
+        provider(PACKAGE.as_bytes()),
+        EpubPath::new("EPUB/package.opf").unwrap(),
+    )
+    .unwrap();
 
     let preview = book
         .edit()
-        .upsert_resource("EPUB/z.txt", b"old".to_vec())
+        .upsert_resource(EpubPath::new("EPUB/z.txt").unwrap(), b"old".to_vec())
         .unwrap()
-        .upsert_resource("EPUB/a.txt", b"a".to_vec())
+        .upsert_resource(EpubPath::new("EPUB/a.txt").unwrap(), b"a".to_vec())
         .unwrap()
-        .upsert_resource("EPUB/z.txt", b"final".to_vec())
+        .upsert_resource(EpubPath::new("EPUB/z.txt").unwrap(), b"final".to_vec())
         .unwrap()
         .preview()
         .unwrap();
@@ -502,22 +505,28 @@ fn edit_changes_are_coalesced_by_path_in_canonical_order() {
         ]
     );
     let expected = preview.changes().to_vec();
-    assert_eq!(preview.commit().changes(), expected);
+    assert_eq!(preview.commit(), expected);
 }
 
 #[test]
 fn repeated_package_edits_report_one_final_structural_rewrite() {
-    let mut book = Epub::from_provider(provider(PACKAGE.as_bytes()), "EPUB/package.opf").unwrap();
+    let mut book = Epub::from_provider(
+        provider(PACKAGE.as_bytes()),
+        EpubPath::new("EPUB/package.opf").unwrap(),
+    )
+    .unwrap();
     let first = ManifestItem::builder()
         .id(EpubString::try_new("first").unwrap())
         .href(EpubHref::try_new("first.bin").unwrap())
         .media_type(MediaType::try_from("application/octet-stream").unwrap())
-        .build();
+        .build()
+        .unwrap();
     let second = ManifestItem::builder()
         .id(EpubString::try_new("second").unwrap())
         .href(EpubHref::try_new("second.bin").unwrap())
         .media_type(MediaType::try_from("application/octet-stream").unwrap())
-        .build();
+        .build()
+        .unwrap();
 
     let preview = book
         .edit()
@@ -532,7 +541,7 @@ fn repeated_package_edits_report_one_final_structural_rewrite() {
         preview.changes(),
         [EditChange::RewriteStructuralResource {
             path,
-            kind: StructuralEditKind::Package,
+            kind: StructuralResourceKind::Package,
             ..
         }] if path.as_str() == "EPUB/package.opf"
     ));
@@ -540,20 +549,24 @@ fn repeated_package_edits_report_one_final_structural_rewrite() {
 
 #[test]
 fn export_includes_pending_changes_accumulated_across_commits() {
-    let mut book = Epub::from_provider(provider(PACKAGE.as_bytes()), "EPUB/package.opf").unwrap();
+    let mut book = Epub::from_provider(
+        provider(PACKAGE.as_bytes()),
+        EpubPath::new("EPUB/package.opf").unwrap(),
+    )
+    .unwrap();
     book.edit()
-        .upsert_resource("EPUB/added.bin", b"added".to_vec())
+        .upsert_resource(EpubPath::new("EPUB/added.bin").unwrap(), b"added".to_vec())
         .unwrap()
         .preview()
         .unwrap()
         .commit();
     book.edit()
-        .replace_resource(
-            ResourceSelector::path("EPUB/chapter.xhtml").unwrap(),
+        .upsert_resource(
+            EpubPath::new("EPUB/chapter.xhtml").unwrap(),
             b"replaced".to_vec(),
         )
         .unwrap()
-        .remove_resource(ResourceSelector::path("EPUB/style.css").unwrap())
+        .remove_resource(EpubPath::new("EPUB/style.css").unwrap())
         .unwrap()
         .preview()
         .unwrap()
@@ -571,17 +584,13 @@ fn export_includes_pending_changes_accumulated_across_commits() {
         .unwrap();
     assert_eq!(
         reopened
-            .resource(ResourceSelector::path("EPUB/added.bin").unwrap())
-            .unwrap()
-            .bytes()
+            .bytes(&EpubPath::new("EPUB/added.bin").unwrap())
             .unwrap(),
         b"added"
     );
     assert_eq!(
         reopened
-            .resource(ResourceSelector::path("EPUB/chapter.xhtml").unwrap())
-            .unwrap()
-            .bytes()
+            .bytes(&EpubPath::new("EPUB/chapter.xhtml").unwrap())
             .unwrap(),
         b"replaced"
     );
@@ -589,17 +598,23 @@ fn export_includes_pending_changes_accumulated_across_commits() {
 
 #[test]
 fn consecutive_semantic_commits_read_prior_structural_overlay_bytes() {
-    let mut book = Epub::from_provider(provider(PACKAGE.as_bytes()), "EPUB/package.opf").unwrap();
+    let mut book = Epub::from_provider(
+        provider(PACKAGE.as_bytes()),
+        EpubPath::new("EPUB/package.opf").unwrap(),
+    )
+    .unwrap();
     let first = ManifestItem::builder()
         .id(EpubString::try_new("first").unwrap())
         .href(EpubHref::try_new("first.bin").unwrap())
         .media_type(MediaType::try_from("application/octet-stream").unwrap())
-        .build();
+        .build()
+        .unwrap();
     let second = ManifestItem::builder()
         .id(EpubString::try_new("second").unwrap())
         .href(EpubHref::try_new("second.bin").unwrap())
         .media_type(MediaType::try_from("application/octet-stream").unwrap())
-        .build();
+        .build()
+        .unwrap();
 
     book.edit()
         .add_manifest_item(first)
@@ -614,8 +629,11 @@ fn consecutive_semantic_commits_read_prior_structural_overlay_bytes() {
         .unwrap()
         .commit();
     book.edit()
-        .set_nav_point_label(
-            PointSelector::toc(PointMatch::path(vec![0])),
+        .set_navigation_point_label(
+            PointSelector {
+                list: ListSelector::Toc,
+                point: PointMatch::Path(vec![0]),
+            },
             EpubString::try_new("Renamed").unwrap(),
         )
         .unwrap()
@@ -623,8 +641,11 @@ fn consecutive_semantic_commits_read_prior_structural_overlay_bytes() {
         .unwrap()
         .commit();
     book.edit()
-        .set_nav_point_href(
-            PointSelector::toc(PointMatch::path(vec![0])),
+        .set_navigation_point_href(
+            PointSelector {
+                list: ListSelector::Toc,
+                point: PointMatch::Path(vec![0]),
+            },
             EpubHref::try_new("chapter.xhtml#updated").unwrap(),
         )
         .unwrap()
@@ -637,11 +658,25 @@ fn consecutive_semantic_commits_read_prior_structural_overlay_bytes() {
         .unwrap()
         .default_rendition()
         .unwrap();
-    assert!(reopened.package().manifest_item_by_id("first").is_some());
-    assert!(reopened.package().manifest_item_by_id("second").is_some());
+    assert!(
+        reopened
+            .package()
+            .manifest_items_by_id("first")
+            .unwrap()
+            .next()
+            .is_some()
+    );
+    assert!(
+        reopened
+            .package()
+            .manifest_items_by_id("second")
+            .unwrap()
+            .next()
+            .is_some()
+    );
     let point = &reopened
         .navigation()
-        .epub_nav()
+        .filter(|document| document.is_epub_nav())
         .unwrap()
         .toc()
         .unwrap()
@@ -655,17 +690,20 @@ fn consecutive_semantic_commits_read_prior_structural_overlay_bytes() {
 
 #[test]
 fn successful_preview_is_isolated_until_commit() {
-    let mut book = Epub::from_provider(provider(PACKAGE.as_bytes()), "EPUB/package.opf").unwrap();
+    let mut book = Epub::from_provider(
+        provider(PACKAGE.as_bytes()),
+        EpubPath::new("EPUB/package.opf").unwrap(),
+    )
+    .unwrap();
     let package_before = book.package().clone();
-    let navigation_before = book.navigation().clone();
+    let navigation_before = book.navigation().cloned();
     let resources_before = book.resources().clone();
     let replacement = b"<html><body>Preview only</body></html>".to_vec();
     let bytes_before = resources_before
         .resources()
-        .iter()
         .map(|resource| {
             let path = resource.address().local_path().unwrap().clone();
-            let bytes = book.resource(path.clone()).unwrap().bytes().unwrap();
+            let bytes = book.bytes(&path).unwrap();
             (path, bytes)
         })
         .collect::<Vec<_>>();
@@ -673,8 +711,8 @@ fn successful_preview_is_isolated_until_commit() {
     {
         let preview = book
             .edit()
-            .replace_resource(
-                ResourceSelector::path("EPUB/chapter.xhtml").unwrap(),
+            .upsert_resource(
+                EpubPath::new("EPUB/chapter.xhtml").unwrap(),
                 replacement.clone(),
             )
             .unwrap()
@@ -682,49 +720,64 @@ fn successful_preview_is_isolated_until_commit() {
             .unwrap();
         assert_eq!(preview.changes().len(), 1);
         assert_eq!(preview.package(), &package_before);
-        assert_eq!(preview.navigation(), &navigation_before);
+        assert_eq!(preview.navigation(), navigation_before.as_ref());
         assert_eq!(
             preview
                 .resources()
-                .select(&ResourceSelector::path("EPUB/chapter.xhtml").unwrap())
+                .resource_by_path(&EpubPath::new("EPUB/chapter.xhtml").unwrap())
                 .unwrap()
-                .metadata()
+                .presence()
                 .size_bytes(),
             Some(replacement.len() as u64)
         );
     }
 
     assert_eq!(book.package(), &package_before);
-    assert_eq!(book.navigation(), &navigation_before);
+    assert_eq!(book.navigation(), navigation_before.as_ref());
     assert_eq!(book.resources(), &resources_before);
     for (path, bytes) in bytes_before {
-        assert_eq!(
-            book.resource(ResourceSelector::path(path).unwrap())
-                .unwrap()
-                .bytes()
-                .unwrap(),
-            bytes
-        );
+        assert_eq!(book.bytes(&path).unwrap(), bytes);
     }
 }
 
 #[test]
 fn opf2_migration_preview_commit_export_reopen_preserves_semantics() {
-    let mut book = Epub::from_provider(opf2_migration_provider(), "OPS/package.opf").unwrap();
+    let mut book = Epub::from_provider(
+        opf2_migration_provider(),
+        EpubPath::new("OPS/package.opf").unwrap(),
+    )
+    .unwrap();
 
     let preview = book
         .edit()
-        .migrate_opf2_to_epub3()
+        .migrate_opf2_to_epub3(time::OffsetDateTime::UNIX_EPOCH)
         .unwrap()
         .preview()
         .unwrap();
     assert_eq!(preview.package().version(), Some(EpubVersion::Three));
     assert_eq!(
-        preview.navigation().epub_nav().unwrap().path().as_str(),
+        preview
+            .navigation()
+            .filter(|document| document.is_epub_nav())
+            .unwrap()
+            .path()
+            .as_str(),
         "OPS/nav.xhtml"
     );
-    assert!(preview.navigation().ncx().is_none());
-    assert!(preview.package().manifest_item_by_id("ncx").is_none());
+    assert!(
+        preview
+            .navigation()
+            .filter(|document| document.is_ncx())
+            .is_none()
+    );
+    assert!(
+        preview
+            .package()
+            .manifest_items_by_id("ncx")
+            .unwrap()
+            .next()
+            .is_none()
+    );
     assert!(
         preview
             .resources()
@@ -733,13 +786,13 @@ fn opf2_migration_preview_commit_export_reopen_preserves_semantics() {
     );
 
     let preview_package = preview.package().clone();
-    let preview_navigation = preview.navigation().clone();
+    let preview_navigation = preview.navigation().cloned();
     let preview_resources = preview.resources().clone();
     let preview_changes = preview.changes().to_vec();
     let report = preview.commit();
-    assert_eq!(report.changes(), preview_changes);
+    assert_eq!(report, preview_changes);
     assert_eq!(book.package(), &preview_package);
-    assert_eq!(book.navigation(), &preview_navigation);
+    assert_eq!(book.navigation(), preview_navigation.as_ref());
     assert_eq!(book.resources(), &preview_resources);
     assert_opf2_migration_state(&book);
 
@@ -754,25 +807,27 @@ fn opf2_migration_preview_commit_export_reopen_preserves_semantics() {
 #[test]
 fn failed_preview_does_not_mutate_live_publication() {
     let base = provider(PACKAGE.as_bytes());
-    let limits = EpubOpenLimits::default().with_provider_index_limits(
-        ResourceProviderIndexLimits::new(base.entries().count(), usize::MAX).unwrap(),
-    );
-    let mut book = Epub::from_provider_with_limits(base, "EPUB/package.opf", limits).unwrap();
+    let mut limits = EpubOpenLimits::default();
+    limits.max_provider_entries = std::num::NonZeroUsize::new(base.iter().count()).unwrap();
+    let mut book =
+        Epub::from_provider_with_limits(base, EpubPath::new("EPUB/package.opf").unwrap(), limits)
+            .unwrap();
     assert!(
         book.edit()
-            .upsert_resource("EPUB/extra.xhtml", b"extra".to_vec())
+            .upsert_resource(
+                EpubPath::new("EPUB/extra.xhtml").unwrap(),
+                b"extra".to_vec()
+            )
             .unwrap()
             .preview()
             .is_err()
     );
     assert!(matches!(
-        book.resource(ResourceSelector::path("EPUB/extra.xhtml").unwrap()),
-        Err(ResourceLookupError::NotFound(_))
+        book.bytes(&EpubPath::new("EPUB/extra.xhtml").unwrap()),
+        Err(ResourceReadError::Missing { .. })
     ));
     assert_eq!(
-        book.resource(ResourceSelector::path("EPUB/chapter.xhtml").unwrap())
-            .unwrap()
-            .utf8_text()
+        book.utf8_text(&EpubPath::new("EPUB/chapter.xhtml").unwrap())
             .unwrap(),
         CHAPTER
     );
@@ -780,23 +835,24 @@ fn failed_preview_does_not_mutate_live_publication() {
 
 #[test]
 fn into_base_provider_explicitly_discards_committed_overlay() {
-    let mut book = Epub::from_provider(provider(PACKAGE.as_bytes()), "EPUB/package.opf").unwrap();
-    let selector = ResourceSelector::path("EPUB/chapter.xhtml").unwrap();
+    let mut book = Epub::from_provider(
+        provider(PACKAGE.as_bytes()),
+        EpubPath::new("EPUB/package.opf").unwrap(),
+    )
+    .unwrap();
+    let selector = EpubPath::new("EPUB/chapter.xhtml").unwrap();
     book.edit()
-        .replace_resource(selector.clone(), b"replacement".to_vec())
+        .upsert_resource(selector.clone(), b"replacement".to_vec())
         .unwrap()
         .preview()
         .unwrap()
         .commit();
-    assert_eq!(
-        book.resource(selector).unwrap().bytes().unwrap(),
-        b"replacement"
-    );
+    assert_eq!(book.bytes(&selector).unwrap(), b"replacement");
 
     let provider = book.into_base_provider();
     assert_eq!(
         provider
-            .read(&EpubPath::new("EPUB/chapter.xhtml").unwrap())
+            .get(&EpubPath::new("EPUB/chapter.xhtml").unwrap())
             .unwrap(),
         CHAPTER.as_bytes()
     );
@@ -835,23 +891,21 @@ fn generated_container_supersedes_removal_and_limits_use_the_logical_view() {
     let mut provider = EpubZip::from_reader(archive(PACKAGE.as_bytes())).unwrap();
     provider.remove_entry(EpubPath::new("META-INF/container.xml").unwrap());
     provider.clear_rootfiles();
-    provider.add_rootfile(Rootfile::new("EPUB/package.opf").unwrap());
+    provider.add_rootfile(Rootfile::new(EpubPath::new("EPUB/package.opf").unwrap()));
     provider.remove_entry(EpubPath::new("EPUB/style.css").unwrap());
 
-    let limits = ResourceProviderIndexLimits::new(5, usize::MAX).unwrap();
-    let index = provider.index(&limits).unwrap();
-    assert!(
-        index
-            .get(&EpubPath::new("META-INF/container.xml").unwrap())
-            .is_some()
-    );
-    assert!(
-        index
-            .get(&EpubPath::new("EPUB/style.css").unwrap())
-            .is_none()
-    );
+    let paths = provider
+        .entries()
+        .unwrap()
+        .map(|(path, _)| path)
+        .collect::<Vec<_>>();
+    assert_eq!(paths.len(), 5);
+    assert!(paths.contains(&EpubPath::new("META-INF/container.xml").unwrap()));
+    assert!(!paths.contains(&EpubPath::new("EPUB/style.css").unwrap()));
 
-    let book = provider.default_rendition().unwrap();
+    let mut limits = EpubOpenLimits::default();
+    limits.max_provider_entries = std::num::NonZeroUsize::new(5).unwrap();
+    let book = provider.default_rendition_with_limits(limits).unwrap();
     let output = book.export(Cursor::new(Vec::new())).unwrap().into_inner();
     assert!(
         EpubZip::from_reader(Cursor::new(output))
@@ -876,18 +930,15 @@ impl ResourceProvider for StreamingFailureProvider {
         &self,
         path: &EpubPath,
         read: impl FnOnce(&mut dyn Read) -> T,
-    ) -> ReadResult<T> {
+    ) -> Result<T, ProviderReadError> {
         if path.as_str() == "EPUB/chapter.xhtml" {
             return Ok(read(&mut FailingResourceReader));
         }
         self.0.read_with(path, read)
     }
 
-    fn index(
-        &self,
-        limits: &ResourceProviderIndexLimits,
-    ) -> Result<ResourceProviderIndex, ResourceProviderIndexError> {
-        self.0.index(limits)
+    fn entries(&self) -> Result<impl Iterator<Item = (EpubPath, Option<u64>)>, ProviderIndexError> {
+        self.0.entries()
     }
 }
 
@@ -898,18 +949,15 @@ impl ResourceProvider for AcquisitionFailureProvider {
         &self,
         path: &EpubPath,
         read: impl FnOnce(&mut dyn Read) -> T,
-    ) -> ReadResult<T> {
+    ) -> Result<T, ProviderReadError> {
         if path.as_str() == "EPUB/chapter.xhtml" {
-            return Err(ProviderReadError::MissingResource { path: path.clone() });
+            return Err(ProviderReadError::Missing { path: path.clone() });
         }
         self.0.read_with(path, read)
     }
 
-    fn index(
-        &self,
-        limits: &ResourceProviderIndexLimits,
-    ) -> Result<ResourceProviderIndex, ResourceProviderIndexError> {
-        self.0.index(limits)
+    fn entries(&self) -> Result<impl Iterator<Item = (EpubPath, Option<u64>)>, ProviderIndexError> {
+        self.0.entries()
     }
 }
 
@@ -917,7 +965,7 @@ impl ResourceProvider for AcquisitionFailureProvider {
 fn export_distinguishes_provider_acquisition_and_stream_failures() {
     let acquisition = Epub::from_provider(
         AcquisitionFailureProvider(provider(PACKAGE.as_bytes())),
-        "EPUB/package.opf",
+        EpubPath::new("EPUB/package.opf").unwrap(),
     )
     .unwrap();
     assert!(matches!(
@@ -927,7 +975,7 @@ fn export_distinguishes_provider_acquisition_and_stream_failures() {
 
     let streaming = Epub::from_provider(
         StreamingFailureProvider(provider(PACKAGE.as_bytes())),
-        "EPUB/package.opf",
+        EpubPath::new("EPUB/package.opf").unwrap(),
     )
     .unwrap();
     assert!(matches!(
@@ -960,7 +1008,11 @@ impl Seek for FailingWriter {
 
 #[test]
 fn export_distinguishes_output_path_and_stream_failures() {
-    let book = Epub::from_provider(provider(PACKAGE.as_bytes()), "EPUB/package.opf").unwrap();
+    let book = Epub::from_provider(
+        provider(PACKAGE.as_bytes()),
+        EpubPath::new("EPUB/package.opf").unwrap(),
+    )
+    .unwrap();
     assert!(matches!(
         book.export(FailingWriter(Cursor::new(Vec::new()))),
         Err(ExportError::OutputStream { .. })

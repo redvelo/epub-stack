@@ -1,227 +1,222 @@
 //! Completeness of extracted links, content, inspection metadata, and fingerprints.
 //!
-//! Use [`Coverage`] to distinguish an empty result from analysis that could not inspect all
-//! expected resources. Coverage belongs to one analysis snapshot, and its resource keys must be
-//! used only with that snapshot.
+//! [`Coverage`] records which results are complete, partial, or unavailable, and why.
 
-use super::AnalysisIssue;
-use crate::resource::ResourceKey;
-use std::collections::HashSet;
+use super::{AnalysisIssue, AnalysisOutcome, PublicationAnalysis, ResourceAnalysis};
+use crate::resource::ResourceOrdinal;
 
-/// One expected resource whose result is partial or unavailable.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IncompleteResource {
-    resource: ResourceKey,
-    issue: AnalysisIssue,
+/// Whether a piece of analysis finished, stopped early, or produced nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Completeness {
+    /// It finished.
+    Complete,
+    /// It produced something usable, then stopped.
+    Partial(AnalysisIssue),
+    /// It produced nothing usable.
+    Unavailable(AnalysisIssue),
 }
 
-impl IncompleteResource {
-    /// Returns the resource key in the containing analysis snapshot.
-    pub fn resource(&self) -> ResourceKey {
-        self.resource
+impl Completeness {
+    /// Why it stopped, if it did.
+    pub fn issue(self) -> Option<AnalysisIssue> {
+        match self {
+            Self::Complete => None,
+            Self::Partial(issue) | Self::Unavailable(issue) => Some(issue),
+        }
     }
 
-    /// Returns why the resource's result is incomplete.
-    pub fn issue(&self) -> AnalysisIssue {
-        self.issue
-    }
-
-    pub(crate) fn new(resource: ResourceKey, issue: AnalysisIssue) -> Self {
-        Self { resource, issue }
+    /// Whether it finished.
+    pub fn is_complete(self) -> bool {
+        self == Self::Complete
     }
 }
 
-/// Completeness of one analysis result family across its expected resources.
+/// How one resource fared for one kind of analysis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceCompleteness {
+    /// Which resource this is about.
+    pub resource: ResourceOrdinal,
+    /// Whether the resource's result is complete, and why not.
+    pub completeness: Completeness,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Entries<'a> {
+    Derived {
+        facts: &'a [ResourceAnalysis],
+        outcome: fn(&ResourceAnalysis) -> Option<Completeness>,
+    },
+    Stored(&'a [ResourceCompleteness]),
+}
+
+/// Completeness of one analysis result family across the resources it applies to.
+#[derive(Debug, Clone, Copy)]
+pub struct ResourceCoverage<'a> {
+    entries: Entries<'a>,
+}
+
+impl<'a> ResourceCoverage<'a> {
+    /// Iterates every resource for which this result family applies, in resource-index order.
+    pub fn iter(self) -> impl Iterator<Item = ResourceCompleteness> + 'a {
+        let (facts, outcome, stored) = match self.entries {
+            Entries::Derived { facts, outcome } => (facts, Some(outcome), &[][..]),
+            Entries::Stored(stored) => (&[][..], None, stored),
+        };
+        let derived = facts.iter().filter_map(move |facts| {
+            outcome?(facts).map(|completeness| ResourceCompleteness {
+                resource: facts.resource(),
+                completeness,
+            })
+        });
+        derived.chain(stored.iter().copied())
+    }
+
+    /// Iterates resources whose result is partial or unavailable.
+    pub fn incomplete(self) -> impl Iterator<Item = ResourceCompleteness> + 'a {
+        self.iter()
+            .filter(|entry| !entry.completeness.is_complete())
+    }
+
+    /// Returns whether every applicable resource completed.
+    pub fn is_complete(self) -> bool {
+        self.incomplete().next().is_none()
+    }
+}
+
+/// A document from which authored links can be extracted.
 ///
-/// Each key in [`Self::expected`] occurs in exactly one of [`Self::completed`],
-/// [`Self::partial`], or [`Self::unavailable`]. Keys are valid only in the analysis snapshot
-/// that owns this value.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ResourceCoverage {
-    expected: Vec<ResourceKey>,
-    completed: Vec<ResourceKey>,
-    partial: Vec<IncompleteResource>,
-    unavailable: Vec<IncompleteResource>,
+/// OPF package relationships come from the parsed package and are always complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RelationshipSource {
+    /// The book's navigation document.
+    Navigation(ResourceOrdinal),
+    /// A legacy NCX document.
+    Ncx(ResourceOrdinal),
+    /// A media overlay.
+    Smil(ResourceOrdinal),
+    /// An XHTML document.
+    Xhtml(ResourceOrdinal),
+    /// A stylesheet.
+    Css(ResourceOrdinal),
+    /// An SVG document.
+    Svg(ResourceOrdinal),
 }
 
-impl ResourceCoverage {
-    /// Returns every resource for which this result family applies.
-    pub fn expected(&self) -> &[ResourceKey] {
-        &self.expected
-    }
-
-    /// Returns resources with complete results.
-    pub fn completed(&self) -> &[ResourceKey] {
-        &self.completed
-    }
-
-    /// Returns resources with usable but incomplete results.
-    pub fn partial(&self) -> &[IncompleteResource] {
-        &self.partial
-    }
-
-    /// Returns resources for which no result was produced.
-    pub fn unavailable(&self) -> &[IncompleteResource] {
-        &self.unavailable
-    }
-
-    /// Returns whether every expected resource completed.
-    pub fn is_complete(&self) -> bool {
-        self.partial.is_empty()
-            && self.unavailable.is_empty()
-            && self.completed.len() == self.expected.len()
-    }
-
-    pub(crate) fn new(
-        expected: Vec<ResourceKey>,
-        completed: Vec<ResourceKey>,
-        partial: Vec<IncompleteResource>,
-        unavailable: Vec<IncompleteResource>,
-    ) -> Self {
-        assert_eq!(
-            expected.len(),
-            completed.len() + partial.len() + unavailable.len()
-        );
-        let expected_set = expected.iter().copied().collect::<HashSet<_>>();
-        assert_eq!(expected_set.len(), expected.len());
-        let states = completed
-            .iter()
-            .copied()
-            .chain(partial.iter().map(IncompleteResource::resource))
-            .chain(unavailable.iter().map(IncompleteResource::resource))
-            .collect::<Vec<_>>();
-        assert_eq!(states.iter().copied().collect::<HashSet<_>>(), expected_set);
-        assert_eq!(
-            states.iter().copied().collect::<HashSet<_>>().len(),
-            states.len()
-        );
-        Self {
-            expected,
-            completed,
-            partial,
-            unavailable,
+impl RelationshipSource {
+    /// Returns the source document's resource ordinal.
+    pub fn resource(self) -> ResourceOrdinal {
+        match self {
+            Self::Navigation(resource)
+            | Self::Ncx(resource)
+            | Self::Smil(resource)
+            | Self::Xhtml(resource)
+            | Self::Css(resource)
+            | Self::Svg(resource) => resource,
         }
     }
 }
 
-/// A package or document from which authored links can be extracted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RelationshipSource {
-    /// OPF package relationships.
-    Package,
-    /// The selected EPUB NAV document at this snapshot resource key.
-    Navigation(ResourceKey),
-    /// An NCX document at this snapshot resource key.
-    Ncx(ResourceKey),
-    /// A SMIL document at this snapshot resource key.
-    Smil(ResourceKey),
-    /// An XHTML document at this snapshot resource key.
-    Xhtml(ResourceKey),
-    /// A stylesheet at this snapshot resource key.
-    Css(ResourceKey),
-    /// An SVG document at this snapshot resource key.
-    Svg(ResourceKey),
-}
-
-/// Completeness of links extracted from one source.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CoverageState {
-    /// All supported relationships were produced.
-    Complete,
-    /// Some relationships were produced before the operational issue.
-    Partial(AnalysisIssue),
-    /// No relationships could be produced because of the operational issue.
-    Unavailable(AnalysisIssue),
-}
-
 /// Coverage of authored relationships from one source.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RelationshipCoverage {
-    source: RelationshipSource,
-    state: CoverageState,
+    /// The relationship producer.
+    pub source: RelationshipSource,
+    /// The producer's execution completeness.
+    pub completeness: Completeness,
 }
 
 impl RelationshipCoverage {
-    /// Returns the relationship producer.
-    pub fn source(&self) -> &RelationshipSource {
-        &self.source
-    }
-
-    /// Returns the producer's execution completeness.
-    pub fn state(&self) -> &CoverageState {
-        &self.state
-    }
-
-    pub(crate) fn new(source: RelationshipSource, state: CoverageState) -> Self {
-        Self { source, state }
+    pub(crate) fn new(source: RelationshipSource, completeness: Completeness) -> Self {
+        Self {
+            source,
+            completeness,
+        }
     }
 }
 
-/// Completeness summaries for links, content, inspection, classification, and fingerprints.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Coverage {
-    relationships: Vec<RelationshipCoverage>,
-    classification: ResourceCoverage,
-    fragments: ResourceCoverage,
-    content: ResourceCoverage,
-    inspection: ResourceCoverage,
-    fingerprints: ResourceCoverage,
+/// Completeness summaries for links, content, inspection, and fingerprints.
+///
+/// Remote resources declared with a supported document type have unavailable relationship
+/// coverage because their links cannot be extracted.
+#[derive(Debug, Clone, Copy)]
+pub struct Coverage<'a> {
+    analysis: &'a PublicationAnalysis,
 }
 
-impl Coverage {
-    /// Returns coverage for each package or document relationship producer.
-    pub fn relationships(&self) -> &[RelationshipCoverage] {
-        &self.relationships
+impl<'a> Coverage<'a> {
+    pub(crate) fn new(analysis: &'a PublicationAnalysis) -> Self {
+        Self { analysis }
     }
 
-    /// Returns semantic-format classification coverage.
-    pub fn classification(&self) -> &ResourceCoverage {
-        &self.classification
+    /// Whether every part of the analysis finished: relationships, fragments, content,
+    /// inspection, and fingerprints.
+    ///
+    /// A part with nothing to cover counts as complete, so this reports that nothing stopped
+    /// early rather than that there was anything to find.
+    pub fn is_complete(self) -> bool {
+        self.incomplete_relationships().next().is_none()
+            && self.fragments().is_complete()
+            && self.content().is_complete()
+            && self.inspection().is_complete()
+            && self.fingerprints().is_complete()
     }
 
-    /// Returns fragment-discovery coverage used by reference resolution.
-    pub fn fragments(&self) -> &ResourceCoverage {
-        &self.fragments
+    /// Returns coverage for each document relationship producer.
+    pub fn relationships(self) -> &'a [RelationshipCoverage] {
+        &self.analysis.relationship_coverage
+    }
+
+    /// Iterates relationship producers that did not complete.
+    pub fn incomplete_relationships(self) -> impl Iterator<Item = RelationshipSource> + 'a {
+        self.relationships()
+            .iter()
+            .filter(|coverage| !coverage.completeness.is_complete())
+            .map(|coverage| coverage.source)
+    }
+
+    /// Returns fragment-discovery coverage for resources targeted by fragment references.
+    pub fn fragments(self) -> ResourceCoverage<'a> {
+        ResourceCoverage {
+            entries: Entries::Stored(&self.analysis.fragment_coverage),
+        }
     }
 
     /// Returns semantic content-extraction coverage.
-    pub fn content(&self) -> &ResourceCoverage {
-        &self.content
+    pub fn content(self) -> ResourceCoverage<'a> {
+        self.derived(|facts| facts.content().completeness())
     }
 
     /// Returns byte-level resource-inspection coverage.
-    pub fn inspection(&self) -> &ResourceCoverage {
-        &self.inspection
+    pub fn inspection(self) -> ResourceCoverage<'a> {
+        self.derived(|facts| facts.inspection().completeness())
     }
 
     /// Returns whole-resource fingerprint coverage.
-    pub fn fingerprints(&self) -> &ResourceCoverage {
-        &self.fingerprints
+    pub fn fingerprints(self) -> ResourceCoverage<'a> {
+        self.derived(|facts| facts.fingerprint().completeness())
     }
 
-    pub(crate) fn new(
-        relationships: Vec<RelationshipCoverage>,
-        classification: ResourceCoverage,
-        fragments: ResourceCoverage,
-        content: ResourceCoverage,
-        inspection: ResourceCoverage,
-        fingerprints: ResourceCoverage,
-    ) -> Self {
-        assert_eq!(
-            relationships
-                .iter()
-                .map(RelationshipCoverage::source)
-                .collect::<HashSet<_>>()
-                .len(),
-            relationships.len()
-        );
-        Self {
-            relationships,
-            classification,
-            fragments,
-            content,
-            inspection,
-            fingerprints,
+    fn derived(
+        self,
+        outcome: fn(&ResourceAnalysis) -> Option<Completeness>,
+    ) -> ResourceCoverage<'a> {
+        ResourceCoverage {
+            entries: Entries::Derived {
+                facts: &self.analysis.resource_facts,
+                outcome,
+            },
+        }
+    }
+}
+
+impl<T> AnalysisOutcome<T> {
+    /// Returns the operation's completeness, or `None` when it was not applicable.
+    pub fn completeness(&self) -> Option<Completeness> {
+        match self {
+            Self::NotApplicable => None,
+            Self::Complete(_) => Some(Completeness::Complete),
+            Self::Partial { issue, .. } => Some(Completeness::Partial(*issue)),
+            Self::Unavailable(issue) => Some(Completeness::Unavailable(*issue)),
         }
     }
 }

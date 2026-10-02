@@ -1,5 +1,5 @@
 use crate::resource::AuthoredHref;
-use crate::semantics::{DpubAriaRole, EpubStructuralSemantic, HeadingLevel};
+use crate::semantics::{HeadingLevel, SemanticToken};
 
 /// One authored HTML viewport metadata declaration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,7 +300,9 @@ impl FragmentFact {
         self.attribute
     }
 
-    pub(crate) fn element_ordinal(&self) -> usize {
+    /// Returns the extraction-local position of the declaring element, not a persistent
+    /// identifier.
+    pub fn element_ordinal(&self) -> usize {
         self.element_ordinal
     }
 }
@@ -310,269 +312,90 @@ impl FragmentFact {
 /// One source element can produce multiple facts when its native element and authored
 /// semantics establish overlapping categories.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StructureFact {
-    /// An HTML heading with its constrained heading level and extracted label.
-    #[non_exhaustive]
-    Heading {
-        /// Extracted heading text.
-        label: Option<String>,
-        /// The nearest authored fragment identifier.
-        fragment: Option<String>,
-        /// The constrained HTML heading level.
-        level: HeadingLevel,
-        /// Tokens that established this structure.
-        semantics: Vec<SemanticToken>,
-    },
+pub struct StructureFact {
+    pub(crate) role: StructureRole,
+    pub(crate) label: Option<String>,
+    pub(crate) fragment: Option<FragmentFact>,
+    pub(crate) semantics: Vec<SemanticToken>,
+}
+
+/// The structural category of a [`StructureFact`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StructureRole {
+    /// An HTML heading with its constrained level.
+    Heading(HeadingLevel),
     /// An authored EPUB or DPUB page break.
-    #[non_exhaustive]
-    Pagebreak {
-        /// Extracted or authored page label.
-        label: Option<String>,
-        /// The nearest authored fragment identifier.
-        fragment: Option<String>,
-        /// Tokens that established this structure.
-        semantics: Vec<SemanticToken>,
-    },
-    /// An HTML figure and its extracted caption.
-    #[non_exhaustive]
-    Figure {
-        /// Extracted caption text.
-        label: Option<String>,
-        /// The nearest authored fragment identifier.
-        fragment: Option<String>,
-        /// Tokens that established this structure.
-        semantics: Vec<SemanticToken>,
-    },
-    /// An HTML table and its extracted caption.
-    #[non_exhaustive]
-    Table {
-        /// Extracted caption text.
-        label: Option<String>,
-        /// The nearest authored fragment identifier.
-        fragment: Option<String>,
-        /// Tokens that established this structure.
-        semantics: Vec<SemanticToken>,
-    },
+    Pagebreak,
+    /// An HTML figure.
+    Figure,
+    /// An HTML table.
+    Table,
     /// An authored EPUB or DPUB footnote.
-    #[non_exhaustive]
-    Footnote {
-        /// The nearest authored fragment identifier.
-        fragment: Option<String>,
-        /// Tokens that established this structure.
-        semantics: Vec<SemanticToken>,
-    },
+    Footnote,
     /// An authored EPUB or DPUB endnote.
-    #[non_exhaustive]
-    Endnote {
-        /// The nearest authored fragment identifier.
-        fragment: Option<String>,
-        /// Tokens that established this structure.
-        semantics: Vec<SemanticToken>,
-    },
+    Endnote,
     /// An authored generic note.
-    #[non_exhaustive]
-    Note {
-        /// The nearest authored fragment identifier.
-        fragment: Option<String>,
-        /// Tokens that established this structure.
-        semantics: Vec<SemanticToken>,
-    },
+    Note,
     /// An HTML navigation list.
-    #[non_exhaustive]
-    NavigationList {
-        /// The nearest authored fragment identifier.
-        fragment: Option<String>,
-        /// Tokens that established this structure.
-        semantics: Vec<SemanticToken>,
-    },
+    NavigationList,
     /// A publication section identified by EPUB or DPUB semantics.
-    #[non_exhaustive]
-    PublicationSection {
-        /// The nearest authored fragment identifier.
-        fragment: Option<String>,
-        /// Tokens that established this structure.
-        semantics: Vec<SemanticToken>,
-    },
+    PublicationSection,
+}
+
+impl StructureRole {
+    fn is_labeled(self) -> bool {
+        matches!(
+            self,
+            Self::Heading(_) | Self::Pagebreak | Self::Figure | Self::Table
+        )
+    }
 }
 
 impl StructureFact {
-    /// Returns extracted visible labeling when this fact has a label.
+    pub(crate) fn new(
+        role: StructureRole,
+        label: Option<String>,
+        fragment: Option<FragmentFact>,
+        semantics: Vec<SemanticToken>,
+    ) -> Self {
+        Self {
+            role,
+            label: label.filter(|_| role.is_labeled()),
+            fragment,
+            semantics,
+        }
+    }
+
+    /// Returns the structural category.
+    pub fn role(&self) -> StructureRole {
+        self.role
+    }
+
+    /// Returns extracted heading text, page label, or figure or table caption.
     pub fn label(&self) -> Option<&str> {
-        match self {
-            Self::Heading { label, .. }
-            | Self::Pagebreak { label, .. }
-            | Self::Figure { label, .. }
-            | Self::Table { label, .. } => label.as_deref(),
-            _ => None,
-        }
+        self.label.as_deref()
     }
 
-    /// Returns the nearest authored fragment identifier when recorded.
-    pub fn fragment(&self) -> Option<&str> {
-        match self {
-            Self::Heading { fragment, .. }
-            | Self::Pagebreak { fragment, .. }
-            | Self::Figure { fragment, .. }
-            | Self::Table { fragment, .. }
-            | Self::Footnote { fragment, .. }
-            | Self::Endnote { fragment, .. }
-            | Self::Note { fragment, .. }
-            | Self::NavigationList { fragment, .. }
-            | Self::PublicationSection { fragment, .. } => fragment.as_deref(),
-        }
-    }
-
-    /// Returns the constrained level for heading facts.
-    pub fn heading_level(&self) -> Option<HeadingLevel> {
-        match self {
-            Self::Heading { level, .. } => Some(*level),
-            _ => None,
-        }
+    /// Returns the nearest authored fragment when recorded.
+    pub fn fragment(&self) -> Option<&FragmentFact> {
+        self.fragment.as_ref()
     }
 
     /// Returns the authored and native tokens that established this structure.
     pub fn semantics(&self) -> &[SemanticToken] {
-        match self {
-            Self::Heading { semantics, .. }
-            | Self::Pagebreak { semantics, .. }
-            | Self::Figure { semantics, .. }
-            | Self::Table { semantics, .. }
-            | Self::Footnote { semantics, .. }
-            | Self::Endnote { semantics, .. }
-            | Self::Note { semantics, .. }
-            | Self::NavigationList { semantics, .. }
-            | Self::PublicationSection { semantics, .. } => semantics,
-        }
+        &self.semantics
     }
 
     pub(crate) fn set_label(&mut self, label: Option<String>) {
-        match self {
-            Self::Heading { label: value, .. }
-            | Self::Pagebreak { label: value, .. }
-            | Self::Figure { label: value, .. }
-            | Self::Table { label: value, .. } => *value = label,
-            _ => {}
-        }
-    }
-}
-
-/// One authored or native token that establishes structural meaning.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SemanticToken {
-    /// One whitespace-separated `epub:type` token and its recognized meaning.
-    EpubType {
-        /// The exact token spelling.
-        raw: String,
-        /// Its recognized EPUB structural meaning.
-        semantic: Option<EpubStructuralSemantic>,
-    },
-    /// One whitespace-separated ARIA `role` token and its recognized DPUB meaning.
-    AriaRole {
-        /// The exact token spelling.
-        raw: String,
-        /// Its recognized DPUB role.
-        role: Option<DpubAriaRole>,
-    },
-    /// Native semantics contributed by the HTML element itself.
-    HtmlElement(HtmlStructuralElement),
-}
-
-impl SemanticToken {
-    /// Returns where this structural meaning was authored or implied.
-    pub fn source(&self) -> SemanticSource {
-        match self {
-            Self::EpubType { .. } => SemanticSource::EpubType,
-            Self::AriaRole { .. } => SemanticSource::AriaRole,
-            Self::HtmlElement(_) => SemanticSource::HtmlElement,
-        }
-    }
-
-    /// Returns the authored token or lowercase HTML element name.
-    pub fn raw(&self) -> &str {
-        match self {
-            Self::EpubType { raw, .. } | Self::AriaRole { raw, .. } => raw,
-            Self::HtmlElement(element) => element.as_str(),
-        }
-    }
-
-    /// Returns a recognized EPUB meaning for an `epub:type` token.
-    pub fn epub_semantic(&self) -> Option<EpubStructuralSemantic> {
-        match self {
-            Self::EpubType { semantic, .. } => *semantic,
-            Self::AriaRole { .. } | Self::HtmlElement(_) => None,
-        }
-    }
-
-    /// Returns a recognized DPUB meaning for an ARIA `role` token.
-    pub fn dpub_role(&self) -> Option<DpubAriaRole> {
-        match self {
-            Self::AriaRole { role, .. } => *role,
-            Self::EpubType { .. } | Self::HtmlElement(_) => None,
-        }
-    }
-
-    /// Returns the native HTML element meaning when present.
-    pub fn html_element(&self) -> Option<HtmlStructuralElement> {
-        match self {
-            Self::HtmlElement(element) => Some(*element),
-            Self::EpubType { .. } | Self::AriaRole { .. } => None,
-        }
-    }
-}
-
-/// The source of one structural semantic token.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SemanticSource {
-    /// An authored `epub:type` token.
-    EpubType,
-    /// An authored ARIA `role` token.
-    AriaRole,
-    /// Native HTML element semantics.
-    HtmlElement,
-}
-
-/// An HTML element with native structural meaning.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum HtmlStructuralElement {
-    /// `section`.
-    Section,
-    /// `nav`.
-    Navigation,
-    /// `aside`.
-    Aside,
-    /// `figure`.
-    Figure,
-    /// `table`.
-    Table,
-    /// An `h1` through `h6` element.
-    Heading(HeadingLevel),
-}
-
-impl HtmlStructuralElement {
-    /// Returns the lowercase HTML local name.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Section => "section",
-            Self::Navigation => "nav",
-            Self::Aside => "aside",
-            Self::Figure => "figure",
-            Self::Table => "table",
-            Self::Heading(level) => match level.get() {
-                1 => "h1",
-                2 => "h2",
-                3 => "h3",
-                4 => "h4",
-                5 => "h5",
-                6 => "h6",
-                _ => unreachable!("HeadingLevel accepts only 1 through 6"),
-            },
+        if self.role.is_labeled() {
+            self.label = label;
         }
     }
 }
 
 /// A media occurrence extracted from XHTML.
 ///
-/// Use [`crate::analysis::PublicationAnalysis::xhtml_media`] to retrieve each occurrence with its
+/// Use [`crate::analysis::ResourceAnalysisRef::xhtml_media`] to retrieve each occurrence with its
 /// authored `src` and `srcset` links.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MediaFact {
@@ -598,7 +421,7 @@ pub enum MediaFact {
     #[non_exhaustive]
     Track {
         /// The authored track kind.
-        kind: Option<String>,
+        kind: Option<TrackKind>,
         /// The authored source language.
         srclang: Option<String>,
         /// The authored user-facing label.
@@ -606,6 +429,38 @@ pub enum MediaFact {
     },
     /// An authored video poster attribute.
     Poster,
+}
+
+/// The authored `kind` of an HTML `track` element.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TrackKind {
+    /// `subtitles`.
+    Subtitles,
+    /// `captions`.
+    Captions,
+    /// `descriptions`.
+    Descriptions,
+    /// `chapters`.
+    Chapters,
+    /// `metadata`.
+    Metadata,
+    /// An unrecognized value, retained as authored.
+    Other(String),
+}
+
+impl TrackKind {
+    pub(crate) fn from_attribute(value: &str) -> Self {
+        [
+            ("subtitles", Self::Subtitles),
+            ("captions", Self::Captions),
+            ("descriptions", Self::Descriptions),
+            ("chapters", Self::Chapters),
+            ("metadata", Self::Metadata),
+        ]
+        .into_iter()
+        .find_map(|(token, kind)| token.eq_ignore_ascii_case(value).then_some(kind))
+        .unwrap_or_else(|| Self::Other(value.to_string()))
+    }
 }
 
 /// The containing media context of an HTML source element.
@@ -641,8 +496,8 @@ pub enum FormFact {
     /// A form with its optional submission method.
     #[non_exhaustive]
     Form {
-        /// The nearest authored fragment identifier.
-        fragment: Option<String>,
+        /// The nearest authored fragment.
+        fragment: Option<FragmentFact>,
         /// The normalized authored submission method.
         method: Option<String>,
     },
@@ -651,8 +506,8 @@ pub enum FormFact {
     Control {
         /// The control element's local name.
         element: String,
-        /// The nearest authored fragment identifier.
-        fragment: Option<String>,
+        /// The nearest authored fragment.
+        fragment: Option<FragmentFact>,
         /// The authored control type.
         control_type: Option<String>,
         /// The authored control name.
@@ -671,10 +526,10 @@ impl FormFact {
         }
     }
 
-    /// Returns the nearest authored fragment identifier when recorded.
-    pub fn fragment(&self) -> Option<&str> {
+    /// Returns the nearest authored fragment when recorded.
+    pub fn fragment(&self) -> Option<&FragmentFact> {
         match self {
-            Self::Form { fragment, .. } | Self::Control { fragment, .. } => fragment.as_deref(),
+            Self::Form { fragment, .. } | Self::Control { fragment, .. } => fragment.as_ref(),
         }
     }
 }
@@ -685,16 +540,16 @@ pub enum ScriptFact {
     /// An executable external script whose source link is available from analysis.
     #[non_exhaustive]
     External {
-        /// The nearest authored fragment identifier.
-        fragment: Option<String>,
+        /// The nearest authored fragment.
+        fragment: Option<FragmentFact>,
         /// The authored script MIME type.
         script_type: Option<String>,
     },
     /// An executable inline script.
     #[non_exhaustive]
     Inline {
-        /// The nearest authored fragment identifier.
-        fragment: Option<String>,
+        /// The nearest authored fragment.
+        fragment: Option<FragmentFact>,
         /// The authored script MIME type.
         script_type: Option<String>,
         /// Whether the script contains non-whitespace text.
@@ -703,8 +558,8 @@ pub enum ScriptFact {
     /// A non-executable script data block.
     #[non_exhaustive]
     DataBlock {
-        /// The nearest authored fragment identifier.
-        fragment: Option<String>,
+        /// The nearest authored fragment.
+        fragment: Option<FragmentFact>,
         /// The authored script MIME type.
         script_type: Option<String>,
         /// Whether the block contains non-whitespace text.
@@ -715,21 +570,27 @@ pub enum ScriptFact {
     EventHandler {
         /// The source element's local name.
         element: String,
-        /// The nearest authored fragment identifier.
-        fragment: Option<String>,
+        /// The nearest authored fragment.
+        fragment: Option<FragmentFact>,
         /// The authored event-handler attribute name.
         attribute: String,
     },
 }
 
 impl ScriptFact {
-    /// Returns the nearest authored fragment identifier when recorded.
-    pub fn fragment(&self) -> Option<&str> {
+    pub(crate) fn mark_text(&mut self) {
+        if let Self::Inline { has_text, .. } | Self::DataBlock { has_text, .. } = self {
+            *has_text = true;
+        }
+    }
+
+    /// Returns the nearest authored fragment when recorded.
+    pub fn fragment(&self) -> Option<&FragmentFact> {
         match self {
             Self::External { fragment, .. }
             | Self::Inline { fragment, .. }
             | Self::DataBlock { fragment, .. }
-            | Self::EventHandler { fragment, .. } => fragment.as_deref(),
+            | Self::EventHandler { fragment, .. } => fragment.as_ref(),
         }
     }
 
@@ -760,10 +621,10 @@ impl ScriptFact {
     }
 
     /// Returns the source element's local name.
-    pub fn element(&self) -> Option<&str> {
+    pub fn element(&self) -> &str {
         match self {
-            Self::External { .. } | Self::Inline { .. } | Self::DataBlock { .. } => Some("script"),
-            Self::EventHandler { element, .. } => Some(element),
+            Self::External { .. } | Self::Inline { .. } | Self::DataBlock { .. } => "script",
+            Self::EventHandler { element, .. } => element,
         }
     }
 
@@ -838,16 +699,17 @@ impl LinkConstructors {
 
 #[cfg(test)]
 mod tests {
-    use crate::accessibility::AccessibilityFact;
+    use crate::accessibility::{AccessibilityFact, AccessibilityObservation};
     use crate::content::extraction::xhtml::{
         EVENT_HANDLER_ATTRIBUTES, is_event_handler_attr, is_executable_script_type,
         parse_srcset_candidates,
     };
     use crate::content::text::{
-        TextChunk, TextChunkContent, TextChunkKind, TextRange, TextRangeError,
+        SupplementaryTextSource, TextRange, TextRangeError, TextRole, TextSpanRef,
     };
     use crate::content::*;
     use crate::semantics::{DpubAriaRole, EpubStructuralSemantic, HeadingLevel, TextDirection};
+    use crate::semantics::{HtmlStructuralElement, SemanticToken};
     fn analyze(xml: &str) -> XhtmlExtraction {
         let mut reader = std::io::Cursor::new(xml.as_bytes());
         parse_xhtml_document_from_reader_counted(&mut reader)
@@ -855,8 +717,89 @@ mod tests {
             .0
     }
 
-    fn chunk_text<'a>(facts: &'a XhtmlFacts, chunk: &'a TextChunk) -> &'a str {
-        chunk.text(facts.text_stream()).unwrap()
+    fn spans(facts: &XhtmlFacts) -> Vec<TextSpanRef<'_>> {
+        facts
+            .text_stream()
+            .spans()
+            .filter(|span| span.role() != TextRole::Element)
+            .collect()
+    }
+
+    #[test]
+    fn character_references_are_decoded_once_across_reader_boundaries() {
+        struct SmallReads<'a>(&'a [u8]);
+        impl std::io::Read for SmallReads<'_> {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                let count = self.0.len().min(output.len()).min(3);
+                output[..count].copy_from_slice(&self.0[..count]);
+                self.0 = &self.0[count..];
+                Ok(count)
+            }
+        }
+        let xml = "<html><body><p>Fish &amp; chips &#x1F600; &nbsp; &amp;amp;</p><p>Next</p></body></html>";
+        let normal = analyze(xml);
+        let split = parse_xhtml_document_from_reader_counted(&mut SmallReads(xml.as_bytes()))
+            .unwrap()
+            .0;
+        assert_eq!(normal.facts, split.facts);
+        assert_eq!(
+            normal.facts.text_stream().text(),
+            "Fish & chips 😀 \u{a0} &amp;\nNext"
+        );
+        let expected = "Fish & chips 😀 \u{a0} &amp;";
+        let span = spans(&normal.facts)[0];
+        assert_eq!(span.text(), expected);
+        assert_eq!(span.range().end(), expected.chars().count() as u64);
+    }
+
+    #[test]
+    fn spans_retain_inline_language_and_exact_fragment_provenance() {
+        let extraction = analyze(
+            r#"<html><body><p id="same" lang="en">Hello <span xml:id="same" lang="fr" dir="rtl">monde</span> again</p><p id="same">Elsewhere</p></body></html>"#,
+        );
+        let stream = extraction.facts.text_stream();
+        assert_eq!(stream.text(), "Hello monde again\nElsewhere");
+        let paragraph = stream
+            .spans()
+            .find(|span| span.origin().element() == "p")
+            .unwrap();
+        let inline = stream
+            .spans()
+            .find(|span| span.origin().element() == "span")
+            .unwrap();
+        assert_eq!(paragraph.text(), "Hello monde again");
+        assert_eq!(inline.text(), "monde");
+        assert_eq!(inline.origin().lang(), Some("fr"));
+        assert_eq!(inline.origin().dir(), Some(TextDirection::Rtl));
+        assert_eq!(paragraph.origin().lang(), Some("en"));
+        let parent = paragraph.origin().fragment().unwrap();
+        let child = inline.origin().fragment().unwrap();
+        assert_eq!(parent.attribute(), FragmentAttribute::Id);
+        assert_eq!(child.attribute(), FragmentAttribute::XmlId);
+        assert_ne!(parent.element_ordinal(), child.element_ordinal());
+        assert_eq!(
+            stream.text_for_range(inline.range()).unwrap(),
+            inline.text()
+        );
+    }
+
+    #[test]
+    fn supplementary_text_retains_its_own_element_in_source_order() {
+        let extraction = analyze(
+            r#"<html><body><p>Before<img id="image" alt="Fish &amp; chips"/>after<span role="doc-pagebreak" aria-label="Page 2" title="Ignored">2</span></p></body></html>"#,
+        );
+        let stream = extraction.facts.text_stream();
+        assert_eq!(stream.text(), "Beforeafter2");
+        let supplementary = stream.supplementary();
+        assert_eq!(supplementary.len(), 2);
+        assert_eq!(supplementary[0].text(), "Fish & chips");
+        assert_eq!(supplementary[0].origin().element(), "img");
+        assert_eq!(supplementary[0].origin().fragment().unwrap().id(), "image");
+        assert_eq!(
+            supplementary[1].source(),
+            SupplementaryTextSource::PagebreakTitle
+        );
+        assert_eq!(supplementary[1].text(), "Ignored");
     }
 
     #[test]
@@ -998,15 +941,12 @@ mod tests {
             [Some("width=600")]
         );
         assert_eq!(extraction.facts.text_stream().text(), "Visible text");
-        assert_eq!(extraction.facts.text().len(), 1);
-        assert_eq!(
-            chunk_text(&extraction.facts, &extraction.facts.text()[0]),
-            "Visible text"
-        );
+        assert_eq!(spans(&extraction.facts).len(), 1);
+        assert_eq!(spans(&extraction.facts)[0].text(), "Visible text");
     }
 
     #[test]
-    fn extracts_content_facts_with_owned_text_chunks() {
+    fn separates_document_text_spans_and_attribute_text() {
         let extraction = analyze(
             r#"<html xmlns:epub="http://www.idpf.org/2007/ops"><body>
                 <h1 id="ch1"> Chapter <em>One</em> </h1>
@@ -1020,34 +960,32 @@ mod tests {
 
         assert_eq!(facts.fragments().len(), 2);
         assert_eq!(extraction.links.len(), 2);
-        assert!(
-            extraction
-                .accessibility
-                .iter()
-                .any(|fact| matches!(fact, AccessibilityFact::ImageAlt(_)))
-        );
-        let text: Vec<_> = facts
-            .text()
-            .iter()
-            .map(|chunk| chunk_text(facts, chunk))
-            .collect();
-        assert_eq!(
-            text,
-            vec!["Chapter One", "Call me Ishmael.", "Picture", "1"]
-        );
+        assert!(extraction.accessibility.iter().any(|fact| matches!(
+            fact,
+            AccessibilityFact {
+                observation: AccessibilityObservation::ImageAlt(_),
+                ..
+            }
+        )));
+        let text: Vec<_> = spans(facts).iter().map(|span| span.text()).collect();
+        assert_eq!(text, vec!["Chapter One", "Call me Ishmael."]);
         assert_eq!(
             facts.text_stream().text(),
             "Chapter One\nCall me Ishmael.\nOther"
         );
-        assert_eq!(facts.text()[0].stream_range().unwrap().start(), 0);
-        assert_eq!(facts.text()[2].kind(), TextChunkKind::AltText);
-        assert!(matches!(
-            &facts.text()[2].content,
-            TextChunkContent::Owned(_)
-        ));
-        assert!(facts.text()[2].stream_range().is_none());
-        assert!(facts.text()[3].stream_range().is_none());
-        assert_eq!(facts.text().len(), 4);
+        assert_eq!(spans(facts)[0].range().start(), 0);
+        assert_eq!(
+            facts
+                .text_stream()
+                .supplementary()
+                .iter()
+                .map(|text| (text.source(), text.text()))
+                .collect::<Vec<_>>(),
+            [
+                (SupplementaryTextSource::Alternative, "Picture"),
+                (SupplementaryTextSource::PagebreakTitle, "1")
+            ]
+        );
     }
 
     #[test]
@@ -1065,12 +1003,15 @@ mod tests {
         let structure = facts
             .structure()
             .iter()
-            .find(|fact| matches!(fact, StructureFact::PublicationSection { .. }))
+            .find(|fact| matches!(fact.role(), StructureRole::PublicationSection))
             .expect("chapter section should be extracted");
         let semantics = structure.semantics();
 
         assert_eq!(
-            semantics.iter().map(SemanticToken::raw).collect::<Vec<_>>(),
+            semantics
+                .iter()
+                .map(SemanticToken::as_str)
+                .collect::<Vec<_>>(),
             vec![
                 "chapter",
                 "vendor:experimental",
@@ -1087,27 +1028,26 @@ mod tests {
         assert_eq!(semantics[2].dpub_role(), Some(DpubAriaRole::Chapter));
         assert_eq!(semantics[3].dpub_role(), None);
         assert_eq!(
-            semantics[4].html_element(),
-            Some(HtmlStructuralElement::Section)
+            semantics[4],
+            SemanticToken::HtmlElement {
+                element: HtmlStructuralElement::Section
+            }
         );
 
         let alt = facts
-            .text()
+            .text_stream()
+            .supplementary()
             .iter()
-            .find(|chunk| chunk.kind() == TextChunkKind::AltText)
-            .expect("image alt should become a search chunk");
-        assert_eq!(
-            alt.text(facts.text_stream()).unwrap(),
-            "Illustration de couverture"
-        );
-        assert_eq!(alt.fragment(), Some("chapter"));
-        assert_eq!(alt.lang(), Some("fr"));
-        assert_eq!(alt.dir(), Some(TextDirection::Rtl));
-        assert_eq!(alt.stream_range(), None);
+            .find(|text| text.source() == SupplementaryTextSource::Alternative)
+            .expect("image alternative");
+        assert_eq!(alt.text(), "Illustration de couverture");
+        assert_eq!(alt.origin().fragment().unwrap().id(), "chapter");
+        assert_eq!(alt.origin().lang(), Some("fr"));
+        assert_eq!(alt.origin().dir(), Some(TextDirection::Rtl));
     }
 
     #[test]
-    fn alt_text_chunks_follow_readable_block_order_and_suppression() {
+    fn alternative_text_is_separate_and_respects_suppression() {
         let extraction = analyze(
             r#"<html><head><img alt="Head" /></head><body>
                 <p>Before <img alt="Inline" /> after</p>
@@ -1115,18 +1055,15 @@ mod tests {
             </body></html>"#,
         );
         let facts = &extraction.facts;
-        let chunks = facts
-            .text()
-            .iter()
-            .map(|chunk| (chunk.kind(), chunk_text(facts, chunk)))
-            .collect::<Vec<_>>();
-
+        assert_eq!(facts.text_stream().text(), "Before after");
         assert_eq!(
-            chunks,
-            vec![
-                (TextChunkKind::Body, "Before after"),
-                (TextChunkKind::AltText, "Inline"),
-            ]
+            facts
+                .text_stream()
+                .supplementary()
+                .iter()
+                .map(|text| text.text())
+                .collect::<Vec<_>>(),
+            ["Inline"]
         );
     }
 
@@ -1144,14 +1081,14 @@ mod tests {
         assert_eq!(
             structures
                 .iter()
-                .filter(|fact| matches!(fact, StructureFact::Pagebreak { .. }))
+                .filter(|fact| matches!(fact.role(), StructureRole::Pagebreak))
                 .count(),
             2
         );
         assert_eq!(
             structures
                 .iter()
-                .filter(|fact| matches!(fact, StructureFact::Footnote { .. }))
+                .filter(|fact| matches!(fact.role(), StructureRole::Footnote))
                 .count(),
             1
         );
@@ -1171,7 +1108,7 @@ mod tests {
             accessibility
                 .iter()
                 .filter(
-                    |fact| matches!(fact, AccessibilityFact::Role(value) if value.value() == "doc-pagebreak")
+                    |fact| matches!(fact, AccessibilityFact { observation: AccessibilityObservation::Role(value), .. } if value == "doc-pagebreak")
                 )
                 .count(),
             1
@@ -1180,7 +1117,7 @@ mod tests {
             accessibility
                 .iter()
                 .filter(
-                    |fact| matches!(fact, AccessibilityFact::EpubType(value) if value.value() == "pagebreak")
+                    |fact| matches!(fact, AccessibilityFact { observation: AccessibilityObservation::EpubType(value), .. } if value == "pagebreak")
                 )
                 .count(),
             1
@@ -1197,16 +1134,17 @@ mod tests {
         );
         let facts = &extraction.facts;
         let alt = facts
-            .text()
+            .text_stream()
+            .supplementary()
             .iter()
-            .find(|chunk| chunk.kind() == TextChunkKind::AltText)
-            .expect("image input alt should become a search chunk");
+            .find(|text| text.source() == SupplementaryTextSource::Alternative)
+            .expect("image input alternative");
 
-        assert_eq!(alt.text(facts.text_stream()).unwrap(), "Envoyer");
-        assert_eq!(alt.lang(), Some("fr"));
-        assert_eq!(alt.dir(), Some(TextDirection::Rtl));
+        assert_eq!(alt.text(), "Envoyer");
+        assert_eq!(alt.origin().lang(), Some("fr"));
+        assert_eq!(alt.origin().dir(), Some(TextDirection::Rtl));
         assert!(extraction.accessibility.iter().any(
-            |fact| matches!(fact, AccessibilityFact::MissingImageAlt(value) if value.element() == "input")
+            |fact| matches!(fact, AccessibilityFact { element, observation: AccessibilityObservation::MissingImageAlt, .. } if element == "input")
         ));
     }
 
@@ -1218,10 +1156,10 @@ mod tests {
         let accessibility = &extraction.accessibility;
 
         assert!(accessibility.iter().any(
-            |fact| matches!(fact, AccessibilityFact::EpubType(value) if value.value() == "keyword")
+            |fact| matches!(fact, AccessibilityFact { observation: AccessibilityObservation::EpubType(value), .. } if value == "keyword")
         ));
         assert!(accessibility.iter().any(
-            |fact| matches!(fact, AccessibilityFact::Role(value) if value.value() == "doc-noteref")
+            |fact| matches!(fact, AccessibilityFact { observation: AccessibilityObservation::Role(value), .. } if value == "doc-noteref")
         ));
         assert!(extraction.facts.structure().is_empty());
     }
@@ -1234,14 +1172,8 @@ mod tests {
 
         assert_eq!(stream.text(), "A😀B\nNext");
         assert_eq!(stream.code_point_len(), 8);
-        assert_eq!(
-            facts.text().first().unwrap().stream_range(),
-            TextRange::new(0, 3)
-        );
-        assert_eq!(
-            facts.text().get(1).unwrap().stream_range(),
-            TextRange::new(4, 8)
-        );
+        assert_eq!(Some(spans(facts)[0].range()), TextRange::new(0, 3));
+        assert_eq!(Some(spans(facts)[1].range()), TextRange::new(4, 8));
         assert_eq!(
             stream.text_for_range(TextRange::new(1, 2).unwrap()),
             Ok("😀")
@@ -1265,27 +1197,26 @@ mod tests {
         let facts = &extraction.facts;
 
         assert_eq!(facts.text_stream().text(), "Alpha\nBeta Gamma\nDelta");
-        assert_eq!(chunk_text(facts, &facts.text()[0]), "Alpha\nBeta Gamma");
-        assert_eq!(facts.text()[0].stream_range(), TextRange::new(0, 16));
+        assert_eq!(spans(facts)[0].text(), "Alpha\nBeta Gamma");
+        assert_eq!(Some(spans(facts)[0].range()), TextRange::new(0, 16));
         assert_eq!(
-            facts
-                .text_stream()
-                .text_for_range(facts.text()[0].stream_range().unwrap()),
+            facts.text_stream().text_for_range(spans(facts)[0].range()),
             Ok("Alpha\nBeta Gamma")
         );
-        assert_eq!(facts.text()[1].stream_range(), TextRange::new(17, 22));
+        assert_eq!(Some(spans(facts)[1].range()), TextRange::new(17, 22));
     }
 
     #[test]
-    fn attributed_pagebreak_text_is_excluded_before_identical_body_text() {
+    fn attributed_pagebreak_preserves_visible_text_and_separate_label() {
         let extraction = analyze(
             r#"<html xmlns:epub="http://www.idpf.org/2007/ops"><body><span epub:type="pagebreak" title="same">same</span><p>same</p></body></html>"#,
         );
         let facts = &extraction.facts;
 
-        assert_eq!(facts.text_stream().text(), "same");
-        assert!(facts.text()[0].stream_range().is_none());
-        assert_eq!(facts.text()[1].stream_range(), TextRange::new(0, 4));
+        assert_eq!(facts.text_stream().text(), "same\nsame");
+        assert_eq!(Some(spans(facts)[0].range()), TextRange::new(0, 4));
+        assert_eq!(Some(spans(facts)[1].range()), TextRange::new(5, 9));
+        assert_eq!(facts.text_stream().supplementary()[0].text(), "same");
     }
 
     #[test]
@@ -1300,15 +1231,15 @@ mod tests {
     }
 
     #[test]
-    fn unrepresented_pagebreak_chunk_does_not_claim_repeated_body_text() {
+    fn pagebreak_span_does_not_claim_repeated_body_text() {
         let extraction = analyze(
             r#"<html xmlns:epub="http://www.idpf.org/2007/ops"><body><span epub:type="pagebreak">same</span><p>same</p></body></html>"#,
         );
         let facts = &extraction.facts;
 
         assert_eq!(facts.text_stream().text(), "same\nsame");
-        assert!(facts.text()[0].stream_range().is_none());
-        assert_eq!(facts.text()[1].stream_range(), TextRange::new(5, 9));
+        assert_eq!(Some(spans(facts)[0].range()), TextRange::new(0, 4));
+        assert_eq!(Some(spans(facts)[1].range()), TextRange::new(5, 9));
     }
 
     #[test]
@@ -1317,8 +1248,8 @@ mod tests {
         let facts = &extraction.facts;
 
         assert_eq!(facts.text_stream().text(), "same\nsame");
-        assert_eq!(facts.text()[0].stream_range(), TextRange::new(0, 4));
-        assert_eq!(facts.text()[1].stream_range(), TextRange::new(5, 9));
+        assert_eq!(Some(spans(facts)[0].range()), TextRange::new(0, 4));
+        assert_eq!(Some(spans(facts)[1].range()), TextRange::new(5, 9));
     }
 
     #[test]
@@ -1327,8 +1258,8 @@ mod tests {
         let facts = &extraction.facts;
 
         assert_eq!(facts.text_stream().text(), "A\u{00a0}\u{2003}B");
-        assert_eq!(chunk_text(facts, &facts.text()[0]), "A\u{00a0}\u{2003}B");
-        assert_eq!(facts.text()[0].stream_range(), TextRange::new(0, 4));
+        assert_eq!(spans(facts)[0].text(), "A\u{00a0}\u{2003}B");
+        assert_eq!(Some(spans(facts)[0].range()), TextRange::new(0, 4));
     }
 
     #[test]
@@ -1337,9 +1268,9 @@ mod tests {
         let facts = &extraction.facts;
 
         assert_eq!(facts.text_stream().text(), "loose\nkept\ntail");
-        assert_eq!(facts.text().len(), 1);
-        assert_eq!(chunk_text(facts, &facts.text()[0]), "kept");
-        assert_eq!(facts.text()[0].stream_range(), TextRange::new(6, 10));
+        assert_eq!(spans(facts).len(), 1);
+        assert_eq!(spans(facts)[0].text(), "kept");
+        assert_eq!(Some(spans(facts)[0].range()), TextRange::new(6, 10));
     }
 
     #[test]
@@ -1397,13 +1328,13 @@ mod tests {
             .facts
             .structure()
             .iter()
-            .map(|fact| match fact {
-                StructureFact::Heading { .. } => "heading",
-                StructureFact::Pagebreak { .. } => "pagebreak",
-                StructureFact::Footnote { .. } => "footnote",
-                StructureFact::Endnote { .. } => "endnote",
-                StructureFact::Note { .. } => "note",
-                StructureFact::PublicationSection { .. } => "section",
+            .map(|fact| match fact.role() {
+                StructureRole::Heading(_) => "heading",
+                StructureRole::Pagebreak => "pagebreak",
+                StructureRole::Footnote => "footnote",
+                StructureRole::Endnote => "endnote",
+                StructureRole::Note => "note",
+                StructureRole::PublicationSection => "section",
                 _ => "other",
             })
             .collect::<Vec<_>>();
@@ -1421,13 +1352,13 @@ mod tests {
             ]
         );
         assert_eq!(
-            extraction.facts.structure()[0]
-                .heading_level()
-                .unwrap()
-                .get(),
-            2
+            extraction.facts.structure()[0].role(),
+            StructureRole::Heading(HeadingLevel::new(2).unwrap())
         );
-        assert_eq!(extraction.facts.structure()[1].heading_level(), None);
+        assert!(!matches!(
+            extraction.facts.structure()[1].role(),
+            StructureRole::Heading(_)
+        ));
     }
 
     #[test]
@@ -1439,30 +1370,26 @@ mod tests {
 
         assert_eq!(facts.text_stream().text(), "Chapter");
         assert_eq!(facts.structure().len(), 2);
-        assert!(matches!(
-            &facts.structure()[0],
-            StructureFact::Heading { label: Some(label), .. } if label == "Chapter"
-        ));
-        assert!(matches!(
-            &facts.structure()[1],
-            StructureFact::Pagebreak { label: Some(label), .. } if label == "12"
-        ));
+        assert!(
+            matches!(&facts.structure()[0].role(), StructureRole::Heading(_))
+                && facts.structure()[0].label() == Some("Chapter")
+        );
+        assert!(
+            matches!(&facts.structure()[1].role(), StructureRole::Pagebreak)
+                && facts.structure()[1].label() == Some("12")
+        );
         assert_eq!(
-            facts
-                .text()
+            spans(facts)
                 .iter()
-                .map(|chunk| (chunk.kind(), chunk_text(facts, chunk), chunk.stream_range()))
+                .map(|span| (span.role(), span.text(), Some(span.range())))
                 .collect::<Vec<_>>(),
-            [
-                (
-                    TextChunkKind::Heading {
-                        level: HeadingLevel::new(2).unwrap()
-                    },
-                    "Chapter",
-                    TextRange::new(0, 7)
-                ),
-                (TextChunkKind::PagebreakLabel, "12", None),
-            ]
+            [(
+                TextRole::Heading {
+                    level: HeadingLevel::new(2).unwrap()
+                },
+                "Chapter",
+                TextRange::new(0, 7)
+            ),]
         );
     }
 
@@ -1482,54 +1409,58 @@ mod tests {
             "Visible heading\nFigure caption\nTable caption"
         );
         assert_eq!(
-            facts
-                .text()
+            spans(facts)
                 .iter()
-                .map(|chunk| (chunk.kind(), chunk_text(facts, chunk)))
+                .map(|span| (span.role(), span.text()))
                 .collect::<Vec<_>>(),
             [
                 (
-                    TextChunkKind::Heading {
+                    TextRole::Heading {
                         level: HeadingLevel::new(1).unwrap()
                     },
                     "Visible heading"
                 ),
-                (TextChunkKind::PagebreakLabel, "Visible heading"),
-                (TextChunkKind::PagebreakLabel, "figure-page"),
-                (TextChunkKind::FigureCaption, "Figure caption"),
-                (TextChunkKind::PagebreakLabel, "table-page"),
-                (TextChunkKind::TableCaption, "Table caption"),
+                (TextRole::Pagebreak, "Figure caption"),
+                (TextRole::FigureCaption, "Figure caption"),
+                (TextRole::Pagebreak, "Table caption"),
+                (TextRole::TableCaption, "Table caption"),
             ]
         );
         assert!(
-            matches!(&facts.structure()[0], StructureFact::Heading { label: Some(label), .. } if label == "Visible heading")
+            matches!(&facts.structure()[0].role(), StructureRole::Heading(_))
+                && facts.structure()[0].label() == Some("Visible heading")
         );
         assert!(
-            matches!(&facts.structure()[1], StructureFact::Pagebreak { label: Some(label), .. } if label == "Visible heading")
+            matches!(&facts.structure()[1].role(), StructureRole::Pagebreak)
+                && facts.structure()[1].label() == Some("Visible heading")
         );
         assert!(
-            matches!(&facts.structure()[2], StructureFact::Pagebreak { label: Some(label), .. } if label == "figure-page")
+            matches!(&facts.structure()[2].role(), StructureRole::Pagebreak)
+                && facts.structure()[2].label() == Some("figure-page")
         );
         assert!(
-            matches!(&facts.structure()[3], StructureFact::Figure { label: Some(label), .. } if label == "Figure caption")
+            matches!(&facts.structure()[3].role(), StructureRole::Figure)
+                && facts.structure()[3].label() == Some("Figure caption")
         );
         assert!(
-            matches!(&facts.structure()[4], StructureFact::Pagebreak { label: Some(label), .. } if label == "table-page")
+            matches!(&facts.structure()[4].role(), StructureRole::Pagebreak)
+                && facts.structure()[4].label() == Some("table-page")
         );
         assert!(
-            matches!(&facts.structure()[5], StructureFact::Table { label: Some(label), .. } if label == "Table caption")
+            matches!(&facts.structure()[5].role(), StructureRole::Table)
+                && facts.structure()[5].label() == Some("Table caption")
         );
     }
 
     #[test]
-    fn fragmentary_xhtml_text_without_a_body_uses_owned_chunks() {
+    fn fragmentary_xhtml_text_without_a_body_has_a_stream() {
         let extraction = analyze("<p>Recovered text</p>");
         let facts = &extraction.facts;
 
-        assert_eq!(facts.text_stream().text(), "");
-        assert_eq!(facts.text().len(), 1);
-        assert_eq!(chunk_text(facts, &facts.text()[0]), "Recovered text");
-        assert_eq!(facts.text()[0].stream_range(), None);
+        assert_eq!(facts.text_stream().text(), "Recovered text");
+        assert_eq!(spans(facts).len(), 1);
+        assert_eq!(spans(facts)[0].text(), "Recovered text");
+        assert_eq!(Some(spans(facts)[0].range()), TextRange::new(0, 14));
     }
 
     #[test]
@@ -1540,30 +1471,32 @@ mod tests {
         let facts = &extraction.facts;
 
         assert_eq!(
-            facts
-                .text()
+            spans(facts)
                 .iter()
-                .map(|chunk| (chunk.kind(), chunk_text(facts, chunk)))
+                .map(|span| (span.role(), span.text()))
                 .collect::<Vec<_>>(),
             [
+                (TextRole::FigureCaption, "Before\nInside\nAfter"),
                 (
-                    TextChunkKind::Heading {
+                    TextRole::Heading {
                         level: HeadingLevel::new(2).unwrap()
                     },
                     "Inside"
                 ),
-                (TextChunkKind::FigureCaption, "Before\nInside\nAfter"),
-                (TextChunkKind::TableCaption, "One Two Three"),
+                (TextRole::TableCaption, "One Two Three"),
             ]
         );
         assert!(
-            matches!(&facts.structure()[0], StructureFact::Figure { label: Some(label), .. } if label == "Before Inside After")
+            matches!(&facts.structure()[0].role(), StructureRole::Figure)
+                && facts.structure()[0].label() == Some("Before Inside After")
         );
         assert!(
-            matches!(&facts.structure()[1], StructureFact::Heading { label: Some(label), .. } if label == "Inside")
+            matches!(&facts.structure()[1].role(), StructureRole::Heading(_))
+                && facts.structure()[1].label() == Some("Inside")
         );
         assert!(
-            matches!(&facts.structure()[2], StructureFact::Table { label: Some(label), .. } if label == "One Two Three")
+            matches!(&facts.structure()[2].role(), StructureRole::Table)
+                && facts.structure()[2].label() == Some("One Two Three")
         );
     }
 
@@ -1582,24 +1515,19 @@ mod tests {
             facts
                 .structure()
                 .iter()
-                .filter_map(|fact| match fact {
-                    StructureFact::Pagebreak { label, .. } => label.as_deref(),
-                    _ => None,
-                })
+                .filter(|fact| fact.role() == StructureRole::Pagebreak)
+                .filter_map(StructureFact::label)
                 .collect::<Vec<_>>(),
             ["12", "13"]
         );
         assert_eq!(
-            facts
-                .text()
+            spans(facts)
                 .iter()
-                .map(|chunk| (chunk.kind(), chunk_text(facts, chunk)))
+                .map(|span| (span.role(), span.text()))
                 .collect::<Vec<_>>(),
             [
-                (TextChunkKind::FigureCaption, "12"),
-                (TextChunkKind::PagebreakLabel, "12"),
-                (TextChunkKind::TableCaption, "13"),
-                (TextChunkKind::PagebreakLabel, "13"),
+                (TextRole::FigureCaption, "12"),
+                (TextRole::TableCaption, "13"),
             ]
         );
     }
@@ -1681,7 +1609,7 @@ mod tests {
 
         assert_eq!(forms.len(), 5);
         assert!(matches!(forms[0], FormFact::Form { .. }));
-        assert_eq!(forms[0].fragment(), Some("search"));
+        assert_eq!(forms[0].fragment().map(FragmentFact::id), Some("search"));
         assert!(
             matches!(&forms[0], FormFact::Form { method: Some(method), .. } if method == "get")
         );
@@ -1784,7 +1712,7 @@ mod tests {
                 .iter()
                 .filter(|fact| matches!(fact, ScriptFact::External { .. }))
                 .count(),
-            5
+            4
         );
         assert_eq!(extraction.associations.media[0].len(), 1);
         assert_eq!(
@@ -1795,8 +1723,50 @@ mod tests {
                 .filter_map(|slot| *slot)
                 .map(|index| extraction.links[index].declared().as_str())
                 .collect::<Vec<_>>(),
-            ["html.js", "svg.js", "legacy.js", "plugin.bin", "foreign.js"]
+            ["html.js", "svg.js", "legacy.js", "foreign.js"]
         );
+    }
+
+    #[test]
+    fn prefixed_xhtml_and_svg_elements_resolve_their_namespace() {
+        let extraction = analyze(
+            r#"<h:html xmlns:h="http://www.w3.org/1999/xhtml" xmlns:x="urn:example"><h:body>
+                <h:script>run()</h:script>
+                <h:script src="app.js"></h:script>
+                <h:script></h:script>
+                <h:a href="next.xhtml">Next</h:a>
+                <s:svg xmlns:s="http://www.w3.org/2000/svg"><s:script href="svg.js"></s:script></s:svg>
+                <x:script>not a script</x:script>
+            </h:body></h:html>"#,
+        );
+
+        assert_eq!(
+            extraction
+                .links
+                .iter()
+                .map(|link| (link.attribute().as_str(), link.declared().as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("src", "app.js"),
+                ("href", "next.xhtml"),
+                ("href", "svg.js")
+            ]
+        );
+        let scripts = extraction.facts.scripts();
+        assert_eq!(scripts.len(), 4);
+        assert!(matches!(
+            scripts[0],
+            ScriptFact::Inline { has_text: true, .. }
+        ));
+        assert!(matches!(scripts[1], ScriptFact::External { .. }));
+        assert!(matches!(
+            scripts[2],
+            ScriptFact::Inline {
+                has_text: false,
+                ..
+            }
+        ));
+        assert!(matches!(scripts[3], ScriptFact::External { .. }));
     }
 
     #[test]
@@ -1851,11 +1821,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["onload", "onbegin"]
         );
-        assert!(
-            !extraction
+        assert_eq!(
+            extraction
                 .links
                 .iter()
-                .any(|link| matches!(link, LinkFact::Script(_)))
+                .filter(|link| matches!(link, LinkFact::Script(_)))
+                .map(|link| link.declared().as_str())
+                .collect::<Vec<_>>(),
+            ["data.json", "not-module.js"]
         );
     }
 
@@ -2057,14 +2030,13 @@ mod tests {
         );
         let facts = &extraction.facts;
         let pagebreak = facts.structure().first().unwrap();
-        let labels: Vec<_> = facts
-            .text()
+        let labels: Vec<_> = spans(facts)
             .iter()
-            .filter(|chunk| chunk.kind() == TextChunkKind::PagebreakLabel)
-            .map(|chunk| chunk_text(facts, chunk))
+            .filter(|span| span.role() == TextRole::Pagebreak)
+            .map(|span| span.text())
             .collect();
 
-        assert!(matches!(pagebreak, StructureFact::Pagebreak { .. }));
+        assert!(matches!(pagebreak.role(), StructureRole::Pagebreak));
         assert_eq!(pagebreak.label(), Some("12"));
         assert_eq!(labels, vec!["12"]);
     }
@@ -2075,24 +2047,14 @@ mod tests {
             "<html><head><title>Head Title</title></head><body><svg><title>SVG Title</title></svg></body></html>",
         );
         let facts = &extraction.facts;
-        let text: Vec<_> = facts
-            .text()
-            .iter()
-            .map(|chunk| chunk_text(facts, chunk))
-            .collect();
-
-        assert_eq!(text, vec!["SVG Title"]);
+        assert_eq!(facts.text_stream().text(), "SVG Title");
     }
 
     #[test]
     fn html_auto_closing_does_not_corrupt_text_order() {
         let extraction = analyze("<html><body><p id=\"one\">one<p id=\"two\">two</body></html>");
         let facts = &extraction.facts;
-        let text: Vec<_> = facts
-            .text()
-            .iter()
-            .map(|chunk| chunk_text(facts, chunk))
-            .collect();
+        let text: Vec<_> = spans(facts).iter().map(|span| span.text()).collect();
 
         assert_eq!(text, vec!["one", "two"]);
         assert_eq!(facts.fragments().len(), 2);
@@ -2107,12 +2069,7 @@ mod tests {
             .facts
             .structure()
             .iter()
-            .filter(|fact| {
-                matches!(
-                    fact,
-                    StructureFact::Figure { .. } | StructureFact::Table { .. }
-                )
-            })
+            .filter(|fact| matches!(fact.role(), StructureRole::Figure | StructureRole::Table))
             .filter_map(StructureFact::label)
             .collect();
 
@@ -2120,17 +2077,14 @@ mod tests {
     }
 
     #[test]
-    fn nested_blocks_preserve_source_order_chunks() {
+    fn nested_blocks_have_overlapping_spans_without_duplicate_stream_text() {
         let extraction =
             analyze("<html><body><ul><li>one <p>two</p> three</li></ul></body></html>");
         let facts = &extraction.facts;
-        let text: Vec<_> = facts
-            .text()
-            .iter()
-            .map(|chunk| chunk_text(facts, chunk))
-            .collect();
+        let text: Vec<_> = spans(facts).iter().map(|span| span.text()).collect();
 
-        assert_eq!(text, vec!["one", "two", "three"]);
+        assert_eq!(text, vec!["one\ntwo\nthree", "two"]);
+        assert_eq!(facts.text_stream().text(), "one\ntwo\nthree");
     }
 
     #[test]
@@ -2139,11 +2093,7 @@ mod tests {
             "<html><body><table><caption>Roster</caption><tr><th>Name</th><td>Ishmael</td></tr></table></body></html>",
         );
         let facts = &extraction.facts;
-        let text: Vec<_> = facts
-            .text()
-            .iter()
-            .map(|chunk| chunk_text(facts, chunk))
-            .collect();
+        let text: Vec<_> = spans(facts).iter().map(|span| span.text()).collect();
 
         assert_eq!(text, vec!["Roster", "Name", "Ishmael"]);
     }
@@ -2154,11 +2104,7 @@ mod tests {
             r##"<html><body><p>before <a href="one.xhtml">one <a href="two.xhtml#frag">two</a> after</p></body></html>"##,
         );
         let facts = &extraction.facts;
-        let text: Vec<_> = facts
-            .text()
-            .iter()
-            .map(|chunk| chunk_text(facts, chunk))
-            .collect();
+        let text: Vec<_> = spans(facts).iter().map(|span| span.text()).collect();
         let links: Vec<_> = extraction
             .links
             .iter()
@@ -2175,11 +2121,7 @@ mod tests {
             r#"<html><body><p>Equation <math xmlns="http://www.w3.org/1998/Math/MathML"><mi>x</mi><mo>=</mo><mn>1</mn></math>.</p></body></html>"#,
         );
         let facts = &extraction.facts;
-        let text: Vec<_> = facts
-            .text()
-            .iter()
-            .map(|chunk| chunk_text(facts, chunk))
-            .collect();
+        let text: Vec<_> = spans(facts).iter().map(|span| span.text()).collect();
 
         assert_eq!(text, vec!["Equation x=1."]);
     }
@@ -2190,11 +2132,7 @@ mod tests {
             "<html><body><p>Visible</p><script>Hidden</script><style>Hidden</style><template><p>Hidden</p></template></body></html>",
         );
         let facts = &extraction.facts;
-        let text: Vec<_> = facts
-            .text()
-            .iter()
-            .map(|chunk| chunk_text(facts, chunk))
-            .collect();
+        let text: Vec<_> = spans(facts).iter().map(|span| span.text()).collect();
 
         assert_eq!(text, vec!["Visible"]);
     }

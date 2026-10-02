@@ -1,21 +1,18 @@
 //! Handle failures while staging or previewing an edit transaction.
 
 use crate::{
+    XmlDecodeError,
     annotation::{AnnotationBundleError, AnnotationError, EmbeddedAnnotationsError},
-    navigation::{
-        NavigationDepthError, NavigationGenerateError, NavigationXhtmlError,
-        parse::NavigationParseError,
-    },
+    edit::select::SelectionTarget,
+    navigation::{NavigationDepthError, parse::NavigationParseError},
     package::PackageError,
     resource::{
-        EpubHrefError, EpubPath, EpubPathError, ResourceLookupError,
-        provider::{ProviderReadError, ResourceProviderIndexError},
+        EpubPath, ResourceReadError,
+        provider::{ProviderIndexError, ProviderReadError},
     },
-    xml::XmlDecodeError,
 };
-use std::{error::Error, fmt};
 
-/// Identifies a modeled resource that raw byte edits cannot change.
+/// Identifies a structural document owned by a loaded semantic model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StructuralResourceKind {
     /// The loaded package document.
@@ -26,27 +23,54 @@ pub enum StructuralResourceKind {
     Ncx,
 }
 
+/// Why rewritten structural XML could not be verified against the staged model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructuralVerificationFailure {
+    /// A node selected through the model has no counterpart in the source XML.
+    SourceNodeMissing,
+    /// The reparsed source does not match the staged model.
+    ModelMismatch,
+}
+
+/// Why an OPF 2 guide href could not enter the EPUB 3 navigation model.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum GuideHrefFailure {
+    /// The `reference` element had no `href` attribute.
+    #[error("href is missing")]
+    Missing,
+    /// The authored href was empty or contained only whitespace.
+    #[error("href is blank: {href:?}")]
+    Blank {
+        /// The authored href, retained exactly.
+        href: String,
+    },
+    /// The authored href was not valid href syntax.
+    #[error("href has invalid syntax: {href:?}")]
+    InvalidSyntax {
+        /// The authored href, retained exactly.
+        href: String,
+    },
+}
+
 /// Reports why an edit operation or preview failed.
 ///
-/// Semantic missing or ambiguous states needed by an operation use [`Self::Selection`].
-/// The enum is non-exhaustive so applications should retain a fallback match arm.
+/// Missing or ambiguous targets are reported through [`Self::Selection`].
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum EditError {
-    /// Touched embedded annotations could not be loaded into a bundle.
-    #[error("embedded annotations could not be loaded: {source}")]
-    EmbeddedAnnotations {
-        /// The embedded-annotation loading failure.
+    /// The staged resource index cannot be represented by public ordinals.
+    #[error("staged resource index cannot be represented: {source}")]
+    ResourceIndex {
+        /// The resource-index overflow.
+        #[from]
+        source: crate::resource::ResourceIndexError,
+    },
+    /// Embedded annotation JSON, resources, or bundle limits were invalid.
+    #[error("embedded annotation edit failed: {source}")]
+    Annotations {
+        /// The annotation failure.
         #[source]
         source: EmbeddedAnnotationsError,
-    },
-    /// A caller-supplied provider path was not canonical EPUB path syntax.
-    #[error("Invalid resource path {path}: {source}")]
-    InvalidResourcePath {
-        /// The noncanonical provider path supplied by the caller.
-        path: std::path::PathBuf,
-        /// Why the path cannot be represented as an EPUB path.
-        source: EpubPathError,
     },
     /// A navigation manifest item did not resolve to a usable local path.
     #[error("Invalid navigation manifest href for item {id}: {href}")]
@@ -57,34 +81,38 @@ pub enum EditError {
         href: String,
     },
     /// An OPF 2 guide href could not enter the EPUB 3 navigation model.
-    #[error("Invalid OPF2 guide href {href:?}: {reason}")]
+    #[error("Invalid OPF2 guide href: {failure}")]
     InvalidGuideHref {
-        /// The authored guide href, when present.
-        href: Option<String>,
-        /// A stable description of why conversion was impossible.
-        reason: &'static str,
+        /// Why the authored href could not be converted.
+        failure: GuideHrefFailure,
     },
-    /// A raw byte operation targeted a loaded structural model source.
-    #[error("Raw resource edit targets loaded structural resource {path} ({kind:?})")]
+    /// A navigation href could not be rebased into the generated navigation document.
+    #[error("Navigation href {href:?} cannot be rebased into the generated navigation document")]
+    NavigationHrefRebase {
+        /// The authored navigation href.
+        href: String,
+    },
+    /// A raw or generic operation targeted a structural document owned by a semantic model.
+    #[error("Edit targets structural resource {path} ({kind:?})")]
     StructuralResourceEdit {
         /// The protected structural resource path.
         path: EpubPath,
         /// The loaded model that owns the resource.
         kind: StructuralResourceKind,
     },
-    /// A resource selector resolved to a non-local address.
-    #[error("Resource selector does not resolve to a local provider resource: {selector}")]
-    NonLocalResource {
-        /// A display form of the selector that resolved non-locally.
-        selector: String,
+    /// A raw resource edit targeted a path with no staged bytes.
+    #[error("Resource is missing from the staged publication: {path}")]
+    MissingResource {
+        /// The path without staged bytes.
+        path: EpubPath,
     },
-    /// Edited structural XML did not match the requested semantic change.
-    #[error("Structural XML edit failed for {path}: {message}")]
-    StructuralXml {
+    /// Rewritten structural XML did not verify against the staged model.
+    #[error("Structural XML verification failed for {path}: {failure:?}")]
+    StructuralVerification {
         /// The structural document being edited.
         path: EpubPath,
-        /// Description of the failed structural check.
-        message: String,
+        /// The failed check.
+        failure: StructuralVerificationFailure,
     },
     /// Structural XML bytes could not be decoded.
     #[error("Could not decode structural XML at {path}: {source}")]
@@ -93,16 +121,16 @@ pub enum EditError {
         path: EpubPath,
         /// The decoding failure.
         #[source]
-        source: StructuralXmlDecodeError,
+        source: XmlDecodeError,
     },
-    /// Structural XML could not be parsed, changed, or serialized.
-    #[error("Structural XML operation failed for {path}: {source}")]
-    StructuralXmlOperation {
+    /// Structural XML could not be parsed or serialized.
+    #[error("Structural XML processing failed for {path}: {source}")]
+    StructuralXml {
         /// The structural document being processed.
         path: EpubPath,
-        /// The underlying XML-engine failure.
+        /// The XML engine failure.
         #[source]
-        source: StructuralXmlOperationError,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
     /// A targeted package element used an unsupported namespace.
     #[error(
@@ -118,42 +146,100 @@ pub enum EditError {
         /// The namespace required for the operation.
         expected: &'static str,
     },
-    /// The requested semantic operation is intentionally unsupported for this state.
-    #[error("Unsupported semantic edit: {message}")]
-    UnsupportedSemanticEdit {
-        /// A focused description of the unsupported state or operation.
-        message: String,
+    /// A generic manifest operation targeted a navigation document item.
+    #[error("Manifest item {id:?} is a navigation document and requires a navigation edit")]
+    NavigationManifestItem {
+        /// The navigation manifest item ID, when present.
+        id: Option<String>,
     },
-    /// A semantic selector did not resolve exactly one required value.
-    #[error("Edit selection failed for {target} using {selector}: {failure}")]
+    /// A navigation edit requires an EPUB navigation document.
+    #[error("Navigation edits require an EPUB navigation document")]
+    MissingEpubNavigation,
+    /// A navigation point cannot move into itself or its descendant.
+    #[error("A navigation point cannot move into itself or its descendant")]
+    NavigationPointCycle,
+    /// A navigation point label contains inline markup that a text update would discard.
+    #[error("Navigation point label contains inline markup")]
+    NavigationLabelMarkup,
+    /// A navigation point carries NCX class semantics, which EPUB NAV cannot represent.
+    #[error("NCX class semantics cannot be inserted into an EPUB navigation document")]
+    NcxSemanticInNavigation,
+    /// A navigation point with semantics has no label element to carry them.
+    #[error("Navigation point semantics require an anchor or span label")]
+    NavigationSemanticsWithoutLabel,
+    /// A resource removal would break another manifest item sharing the same path.
+    #[error("Resource {path} is referenced by another manifest item")]
+    SharedResourcePath {
+        /// The shared resource path.
+        path: EpubPath,
+    },
+    /// A spine resource removal targets a manifest item referenced by several itemrefs.
+    #[error("Manifest item {idref} is referenced by multiple spine itemrefs")]
+    SharedSpineItem {
+        /// The shared manifest item ID.
+        idref: String,
+    },
+    /// A manifest item href does not resolve to the resource path it is staged with.
+    #[error("Manifest item href resolves to {actual:?}, not {expected}")]
+    ManifestHrefMismatch {
+        /// The staged resource path.
+        expected: EpubPath,
+        /// The local path the href resolves to, or `None` when it is not local.
+        actual: Option<EpubPath>,
+    },
+    /// A manifest item selected for resource removal does not target a local resource.
+    #[error("Manifest item {id:?} does not target a local resource")]
+    NonLocalManifestItem {
+        /// The manifest item ID, when present.
+        id: Option<String>,
+    },
+    /// A spine itemref does not target the manifest item staged with it.
+    #[error("Spine itemref {idref} does not target manifest item {id}")]
+    ItemRefTargetMismatch {
+        /// The itemref `idref`.
+        idref: String,
+        /// The manifest item ID.
+        id: String,
+    },
+    /// OPF 2 migration requires an OPF 2.0 package.
+    #[error("Migration requires an OPF 2.0 package")]
+    NotOpf2,
+    /// OPF 2 migration requires EPUB NAV or NCX navigation to convert.
+    #[error("Migration requires existing EPUB NAV or NCX navigation")]
+    MissingSourceNavigation,
+    /// OPF 2 cover metadata is empty or references a missing manifest item.
+    #[error("OPF2 cover metadata references missing manifest item {id:?}")]
+    InvalidOpf2Cover {
+        /// The referenced manifest ID, or `None` when the metadata has no content.
+        id: Option<String>,
+    },
+    /// An embedded annotation resource would overwrite an unrelated existing resource.
+    #[error("Embedded annotation resource already exists: {path}")]
+    AnnotationResourceExists {
+        /// The annotation-relative resource path.
+        path: String,
+    },
+    /// A selector did not identify exactly one staged value.
+    #[error("Edit selection failed for {target:?}: {failure}")]
     Selection {
-        /// The kind of semantic value being selected.
-        target: &'static str,
-        /// A display form of the selector.
-        selector: String,
+        /// The selector that failed.
+        target: SelectionTarget,
         /// Why exactly one value could not be selected.
         failure: SelectionFailure,
     },
-    /// Resource lookup failed before a local edit target could be selected.
-    #[error("Resource lookup failed during editing: {source}")]
-    ResourceLookup {
-        /// The underlying resource-selection failure.
-        #[source]
-        source: ResourceLookupError,
-    },
     /// Current resource bytes could not be read from the provider or session overlay.
-    #[error("Provider read failed during editing: {source}")]
-    ProviderRead {
-        /// The underlying provider read failure.
+    #[error("Resource read failed during editing: {source}")]
+    ResourceRead {
+        /// The underlying read failure.
         #[source]
-        source: ProviderReadError,
+        source: ResourceReadError,
     },
-    /// The current resource index could not be built under the opening limits.
+    /// The staged resource index could not be built under the opening limits.
     #[error("Provider index construction failed during editing: {source}")]
     ProviderIndex {
         /// The underlying provider-index failure.
         #[source]
-        source: ResourceProviderIndexError,
+        source: ProviderIndexError,
     },
     /// The package model rejected the requested state.
     #[error("Package operation failed during editing: {source}")]
@@ -176,138 +262,12 @@ pub enum EditError {
         #[source]
         source: NavigationDepthError,
     },
-    /// Public normalized navigation XHTML generation failed.
-    #[error("Navigation XHTML generation failed during editing: {source}")]
-    NavigationXhtml {
-        /// The public normalized-XHTML generation failure.
-        #[source]
-        source: NavigationXhtmlError,
-    },
-    /// Coordinated navigation generation failed.
-    #[error("Navigation generation failed during editing: {source}")]
-    NavigationGeneration {
-        /// The navigation-generation failure.
-        #[source]
-        source: NavigationGenerationError,
-    },
-    /// Annotation JSON or model processing failed.
-    #[error("Annotation operation failed during editing: {source}")]
-    Annotation {
-        /// The annotation processing failure.
-        #[source]
-        source: AnnotationError,
-    },
-    /// Embedded annotation resource closure could not be represented.
-    #[error("Annotation bundle operation failed during editing: {source}")]
-    AnnotationBundle {
-        /// The annotation bundle or closure failure.
-        #[source]
-        source: AnnotationBundleError,
-    },
-    /// Authored href syntax required by an edit was invalid.
-    #[error("Invalid EPUB href during editing: {source}")]
-    Href {
-        /// The invalid-href failure.
-        #[source]
-        source: EpubHrefError,
-    },
     /// Raw or coordinated edits attempted to alter the export-owned OCF `mimetype` entry.
     #[error("The OCF mimetype entry is generated during export and cannot be edited")]
     MimetypeResourceEdit,
 }
 
-/// A structural XML byte-decoding failure encountered by an edit.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum StructuralXmlDecodeError {
-    /// The declaration names an encoding unsupported by the structural editor.
-    #[error("unsupported XML encoding declaration: {encoding}")]
-    UnsupportedEncoding {
-        /// The declared encoding label.
-        encoding: String,
-    },
-    /// The XML declaration conflicts with byte-order evidence.
-    #[error("XML encoding declaration {declared} conflicts with detected {detected} encoding")]
-    ConflictingEncoding {
-        /// The encoding label in the XML declaration.
-        declared: String,
-        /// The encoding inferred from the input bytes.
-        detected: &'static str,
-    },
-    /// The input contains an invalid sequence for its detected encoding.
-    #[error("invalid byte sequence for XML encoding {encoding}")]
-    InvalidBytes {
-        /// The encoding used to decode the bytes.
-        encoding: &'static str,
-    },
-}
-
-impl From<XmlDecodeError> for StructuralXmlDecodeError {
-    fn from(source: XmlDecodeError) -> Self {
-        match source {
-            XmlDecodeError::UnsupportedEncoding { encoding } => {
-                Self::UnsupportedEncoding { encoding }
-            }
-            XmlDecodeError::ConflictingEncoding { declared, detected } => {
-                Self::ConflictingEncoding { declared, detected }
-            }
-            XmlDecodeError::InvalidBytes { encoding } => Self::InvalidBytes { encoding },
-        }
-    }
-}
-
-/// Wraps the underlying structural XML operation failure.
-#[derive(Debug)]
-pub struct StructuralXmlOperationError {
-    source: Box<dyn Error + Send + Sync + 'static>,
-}
-
-impl StructuralXmlOperationError {
-    pub(crate) fn new(source: impl Error + Send + Sync + 'static) -> Self {
-        Self {
-            source: Box::new(source),
-        }
-    }
-}
-
-impl fmt::Display for StructuralXmlOperationError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.source.fmt(formatter)
-    }
-}
-
-impl Error for StructuralXmlOperationError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(self.source.as_ref())
-    }
-}
-
-/// Wraps the underlying coordinated navigation-generation failure.
-#[derive(Debug)]
-pub struct NavigationGenerationError {
-    source: Box<dyn Error + Send + Sync + 'static>,
-}
-
-impl NavigationGenerationError {
-    fn new(source: impl Error + Send + Sync + 'static) -> Self {
-        Self {
-            source: Box::new(source),
-        }
-    }
-}
-
-impl fmt::Display for NavigationGenerationError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.source.fmt(formatter)
-    }
-}
-
-impl Error for NavigationGenerationError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(self.source.as_ref())
-    }
-}
-
-/// Why a semantic selector failed to identify exactly one value.
+/// Why a selector failed to identify exactly one value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SelectionFailure {
     /// No value matched.
@@ -316,9 +276,42 @@ pub enum SelectionFailure {
     /// More than one value matched where uniqueness was required.
     #[error("ambiguous")]
     Ambiguous,
-    /// The selected source value lacked identity required by the operation.
+    /// The selected value lacks identity required by the operation.
     #[error("selected value has no required identity")]
     MissingIdentity,
+}
+
+impl EditError {
+    pub(crate) fn selection(target: impl Into<SelectionTarget>, failure: SelectionFailure) -> Self {
+        Self::Selection {
+            target: target.into(),
+            failure,
+        }
+    }
+
+    pub(crate) fn source_node_missing(path: &EpubPath) -> Self {
+        Self::StructuralVerification {
+            path: path.clone(),
+            failure: StructuralVerificationFailure::SourceNodeMissing,
+        }
+    }
+
+    pub(crate) fn model_mismatch(path: &EpubPath) -> Self {
+        Self::StructuralVerification {
+            path: path.clone(),
+            failure: StructuralVerificationFailure::ModelMismatch,
+        }
+    }
+
+    pub(crate) fn structural_xml(
+        path: &EpubPath,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::StructuralXml {
+            path: path.clone(),
+            source: Box::new(source),
+        }
+    }
 }
 
 macro_rules! edit_error_from {
@@ -331,21 +324,47 @@ macro_rules! edit_error_from {
     };
 }
 
-edit_error_from!(ResourceLookupError, ResourceLookup);
-edit_error_from!(ProviderReadError, ProviderRead);
-edit_error_from!(ResourceProviderIndexError, ProviderIndex);
+edit_error_from!(ResourceReadError, ResourceRead);
+edit_error_from!(ProviderIndexError, ProviderIndex);
 edit_error_from!(PackageError, Package);
 edit_error_from!(NavigationParseError, NavigationParse);
 edit_error_from!(NavigationDepthError, NavigationDepth);
-edit_error_from!(NavigationXhtmlError, NavigationXhtml);
-edit_error_from!(AnnotationError, Annotation);
-edit_error_from!(AnnotationBundleError, AnnotationBundle);
-edit_error_from!(EpubHrefError, Href);
+edit_error_from!(EmbeddedAnnotationsError, Annotations);
 
-impl From<NavigationGenerateError> for EditError {
-    fn from(source: NavigationGenerateError) -> Self {
-        Self::NavigationGeneration {
-            source: NavigationGenerationError::new(source),
+impl From<ProviderReadError> for EditError {
+    fn from(source: ProviderReadError) -> Self {
+        Self::ResourceRead {
+            source: source.into(),
         }
     }
 }
+
+impl From<AnnotationError> for EditError {
+    fn from(source: AnnotationError) -> Self {
+        EmbeddedAnnotationsError::from(source).into()
+    }
+}
+
+impl From<AnnotationBundleError> for EditError {
+    fn from(source: AnnotationBundleError) -> Self {
+        EmbeddedAnnotationsError::from(source).into()
+    }
+}
+
+macro_rules! selection_target_from {
+    ($source:ident, $variant:ident) => {
+        impl From<crate::edit::select::$source> for SelectionTarget {
+            fn from(value: crate::edit::select::$source) -> Self {
+                Self::$variant(value)
+            }
+        }
+    };
+}
+
+selection_target_from!(ManifestItemSelector, ManifestItem);
+selection_target_from!(SpineItemRefSelector, SpineItemRef);
+selection_target_from!(MetadataElementSelector, MetadataElement);
+selection_target_from!(MetaSelector, Meta);
+selection_target_from!(MetadataLinkSelector, MetadataLink);
+selection_target_from!(ListSelector, NavigationList);
+selection_target_from!(PointSelector, NavigationPoint);

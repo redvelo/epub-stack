@@ -1,15 +1,15 @@
 use super::Epub;
 use crate::{
     annotation::{
-        AnnotationBundle, AnnotationBundleError, AnnotationError, AnnotationResource,
-        AnnotationSet, EmbeddedAnnotationsError, MAX_ANNOTATIONS_JSON_BYTES, MAX_ARCHIVE_ENTRIES,
+        AnnotationBundle, AnnotationBundleError, AnnotationResource, AnnotationSet,
+        EmbeddedAnnotationsError, MAX_ANNOTATIONS_JSON_BYTES, MAX_ARCHIVE_ENTRIES,
         MAX_ARCHIVE_RESOURCE_BYTES, MAX_ARCHIVE_UNCOMPRESSED_BYTES,
     },
     edit::EditError,
     publication::persistence::ResourceChanges,
     resource::{
         EpubPath,
-        provider::{ProviderReadError, ResourceProvider, ResourceProviderIndex},
+        provider::{ProviderIndex, ProviderReadError, ResourceProvider},
     },
 };
 use std::{collections::HashSet, io::Read};
@@ -17,46 +17,27 @@ use std::{collections::HashSet, io::Read};
 impl<R: ResourceProvider> Epub<R> {
     /// Loads annotations packaged inside this EPUB, when present.
     ///
-    /// Each call reflects the current committed publication state and returns an independent
-    /// [`AnnotationBundle`]. It reads `META-INF/annotations.json` and each distinct referenced
-    /// audiovisual body below `META-INF/`; unrelated files are not read. A missing annotations
-    /// document returns `Ok(None)`. The result can become stale after a later edit.
-    ///
-    /// The operation permits at most 4,096 entries including `annotations.json`, 8 MiB of JSON,
-    /// 64 MiB per referenced resource, and 256 MiB of total loaded payload bytes. The aggregate
-    /// limit counts JSON and referenced resource payloads, not all memory allocated while parsing
-    /// or modeling them. Provider-index limits come from [`super::EpubOpenLimits`]. Reads may
-    /// consume one byte beyond an individual limit to detect overflow.
-    ///
-    /// Parsing recovers malformed representable members according to [`AnnotationSet`] rules and
-    /// retains supported extension data, but original JSON whitespace, member ordering, and
-    /// malformed shapes are not source-preserved; later serialization is normalized. Referenced
-    /// resource payload bytes are preserved exactly in the returned bundle.
+    /// Reads `META-INF/annotations.json` and its referenced audiovisual resources.
+    /// Returns `Ok(None)` if the annotations document is absent.
     ///
     /// # Errors
     ///
-    /// Returns [`EmbeddedAnnotationsError`] if the effective index cannot be built, JSON or a
-    /// referenced resource cannot be read within limits, the JSON has no usable annotation-set
-    /// root, a protected OCF control path is referenced, or referenced-resource closure cannot be
-    /// represented. Missing referenced body resources are reported as bundle errors rather than
-    /// silently producing a partial bundle.
+    /// Fails on index or read errors, exceeded limits, an unusable annotation-set root,
+    /// or missing or disallowed resource references.
     pub fn embedded_annotations(
         &self,
     ) -> std::result::Result<Option<AnnotationBundle>, EmbeddedAnnotationsError> {
-        let provider_index = self
-            .resource_changes
-            .apply_to_index(
-                &self.provider_index,
-                self.open_limits.provider_index_limits(),
-            )
-            .map_err(|source| EmbeddedAnnotationsError::ProviderIndex { source })?;
-        load_embedded_annotations(&self.container, &self.resource_changes, &provider_index)
+        load_embedded_annotations(
+            &self.container,
+            &self.resource_changes,
+            &self.provider_index,
+        )
     }
 
     pub(crate) fn embedded_annotations_with_changes(
         &self,
         changes: &ResourceChanges,
-        provider_index: &ResourceProviderIndex,
+        provider_index: &ProviderIndex,
     ) -> std::result::Result<Option<AnnotationBundle>, EmbeddedAnnotationsError> {
         load_embedded_annotations(&self.container, changes, provider_index)
     }
@@ -65,11 +46,11 @@ impl<R: ResourceProvider> Epub<R> {
 fn load_embedded_annotations<R: ResourceProvider>(
     provider: &R,
     changes: &ResourceChanges,
-    provider_index: &ResourceProviderIndex,
+    provider_index: &ProviderIndex,
 ) -> std::result::Result<Option<AnnotationBundle>, EmbeddedAnnotationsError> {
     let annotations_path =
         EpubPath::new("META-INF/annotations.json").expect("static annotation path is valid");
-    if provider_index.get(&annotations_path).is_none() {
+    if !is_committed(changes, provider_index, &annotations_path) {
         return Ok(None);
     }
 
@@ -79,7 +60,8 @@ fn load_embedded_annotations<R: ResourceProvider>(
         &annotations_path,
         MAX_ANNOTATIONS_JSON_BYTES,
     )?;
-    let text = std::str::from_utf8(&bytes).map_err(|source| AnnotationError::Utf8 { source })?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|source| AnnotationBundleError::InvalidUtf8 { source })?;
     let set = AnnotationSet::parse_json(text)?;
     let mut resources = Vec::new();
     let mut seen = HashSet::new();
@@ -100,7 +82,7 @@ fn load_embedded_annotations<R: ResourceProvider>(
         }
         let epub_path = EpubPath::new(format!("META-INF/{path}"))
             .expect("normalized annotation resource path is valid");
-        if provider_index.get(&epub_path).is_none() {
+        if !is_committed(changes, provider_index, &epub_path) {
             continue;
         }
         let bytes = embedded_annotation_bytes_bounded(
@@ -123,18 +105,29 @@ fn load_embedded_annotations<R: ResourceProvider>(
     Ok(Some(AnnotationBundle::new(set, resources)?))
 }
 
+fn is_committed(
+    changes: &ResourceChanges,
+    provider_index: &ProviderIndex,
+    path: &EpubPath,
+) -> bool {
+    match changes.entry(path) {
+        Some(change) => change.is_some(),
+        None => provider_index.get(path).is_some(),
+    }
+}
+
 fn embedded_annotation_bytes_bounded<R: ResourceProvider>(
     provider: &R,
     changes: &ResourceChanges,
     path: &EpubPath,
     limit: u64,
 ) -> std::result::Result<Vec<u8>, EmbeddedAnnotationsError> {
-    let bytes = if let Some(change) = changes.entry(path.as_path()) {
+    let bytes = if let Some(change) = changes.entry(path) {
         change
             .map(Vec::from)
             .ok_or_else(|| EmbeddedAnnotationsError::ResourceRead {
                 path: path.clone(),
-                source: ProviderReadError::MissingResource { path: path.clone() },
+                source: ProviderReadError::Missing { path: path.clone() },
             })?
     } else {
         provider
@@ -143,7 +136,7 @@ fn embedded_annotation_bytes_bounded<R: ResourceProvider>(
                 reader
                     .take(limit.saturating_add(1))
                     .read_to_end(&mut bytes)
-                    .map_err(|source| ProviderReadError::IoPath {
+                    .map_err(|source| ProviderReadError::Io {
                         source,
                         path: path.clone(),
                     })?;
@@ -195,17 +188,17 @@ pub(crate) fn provider_bytes_with_changes_bounded<R: ResourceProvider>(
     path: &EpubPath,
     limit: u64,
 ) -> std::result::Result<Vec<u8>, EditError> {
-    let bytes = if let Some(change) = changes.entry(path.as_path()) {
+    let bytes = if let Some(change) = changes.entry(path) {
         change
             .map(Vec::from)
-            .ok_or_else(|| ProviderReadError::MissingResource { path: path.clone() })?
+            .ok_or_else(|| ProviderReadError::Missing { path: path.clone() })?
     } else {
         provider.read_with(path, |reader| {
             let mut bytes = Vec::new();
             reader
                 .take(limit + 1)
                 .read_to_end(&mut bytes)
-                .map_err(|source| ProviderReadError::IoPath {
+                .map_err(|source| ProviderReadError::Io {
                     source,
                     path: path.clone(),
                 })?;
@@ -249,7 +242,11 @@ mod tests {
     }
 
     fn memory_provider_epub() -> Epub<MemoryResourceProvider> {
-        Epub::from_provider(memory_provider(), "EPUB/package.opf").unwrap()
+        Epub::from_provider(
+            memory_provider(),
+            EpubPath::new("EPUB/package.opf").unwrap(),
+        )
+        .unwrap()
     }
 
     fn annotation_json(body_type: &str, body_id: &str) -> Vec<u8> {
@@ -281,16 +278,16 @@ mod tests {
     #[test]
     fn embedded_annotations_load_annotation_set_and_meta_inf_resources() {
         let mut provider = memory_provider();
-        provider
-            .insert(
-                "META-INF/annotations.json",
-                annotation_json("Audio", "audio/note.mp3"),
-            )
-            .unwrap();
-        provider
-            .insert("META-INF/audio/note.mp3", b"audio".to_vec())
-            .unwrap();
-        let epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        provider.insert(
+            EpubPath::new("META-INF/annotations.json").unwrap(),
+            annotation_json("Audio", "audio/note.mp3"),
+        );
+        provider.insert(
+            EpubPath::new("META-INF/audio/note.mp3").unwrap(),
+            b"audio".to_vec(),
+        );
+        let epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
 
         let annotations = epub.embedded_annotations().unwrap().unwrap();
         assert_eq!(annotations.set().items().len(), 1);
@@ -302,13 +299,12 @@ mod tests {
     #[test]
     fn embedded_annotations_reject_missing_meta_inf_body_resource() {
         let mut provider = memory_provider();
-        provider
-            .insert(
-                "META-INF/annotations.json",
-                annotation_json("Image", "images/missing.png"),
-            )
-            .unwrap();
-        let epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        provider.insert(
+            EpubPath::new("META-INF/annotations.json").unwrap(),
+            annotation_json("Image", "images/missing.png"),
+        );
+        let epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
 
         assert!(matches!(
             epub.embedded_annotations().unwrap_err(),
@@ -321,16 +317,16 @@ mod tests {
     #[test]
     fn embedded_annotations_reject_ocf_control_resources() {
         let mut provider = memory_provider();
-        provider
-            .insert(
-                "META-INF/annotations.json",
-                annotation_json("Audio", "container.xml"),
-            )
-            .unwrap();
-        provider
-            .insert("META-INF/container.xml", b"not annotation data".to_vec())
-            .unwrap();
-        let epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        provider.insert(
+            EpubPath::new("META-INF/annotations.json").unwrap(),
+            annotation_json("Audio", "container.xml"),
+        );
+        provider.insert(
+            EpubPath::new("META-INF/container.xml").unwrap(),
+            b"not annotation data".to_vec(),
+        );
+        let epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
 
         assert!(matches!(
             epub.embedded_annotations(),
@@ -343,20 +339,25 @@ mod tests {
     #[test]
     fn embedded_annotations_bound_json_before_parsing() {
         let mut provider = memory_provider();
-        provider
-            .insert(
-                "META-INF/annotations.json",
-                vec![b' '; MAX_ANNOTATIONS_JSON_BYTES as usize + 1],
-            )
-            .unwrap();
-        let epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        provider.insert(
+            EpubPath::new("META-INF/annotations.json").unwrap(),
+            vec![b' '; MAX_ANNOTATIONS_JSON_BYTES as usize + 1],
+        );
+        let epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
 
-        assert!(matches!(
-            epub.embedded_annotations(),
-            Err(EmbeddedAnnotationsError::Bundle {
-                source: AnnotationBundleError::AnnotationsJsonTooLarge { .. }
-            })
-        ));
+        let error = epub.embedded_annotations().unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "annotations.json is {} bytes; maximum is {}",
+                MAX_ANNOTATIONS_JSON_BYTES + 1,
+                MAX_ANNOTATIONS_JSON_BYTES,
+            )
+        );
+        assert!(matches!(error, EmbeddedAnnotationsError::Bundle {
+            source: AnnotationBundleError::AnnotationsJsonTooLarge { size, max }
+        } if size == MAX_ANNOTATIONS_JSON_BYTES + 1 && max == MAX_ANNOTATIONS_JSON_BYTES));
     }
 
     #[test]
@@ -379,13 +380,12 @@ mod tests {
     #[test]
     fn embedded_annotations_recover_invalid_body_resource_path() {
         let mut provider = memory_provider();
-        provider
-            .insert(
-                "META-INF/annotations.json",
-                annotation_json("Image", "../bad.png"),
-            )
-            .unwrap();
-        let epub = Epub::from_provider(provider, "EPUB/package.opf").unwrap();
+        provider.insert(
+            EpubPath::new("META-INF/annotations.json").unwrap(),
+            annotation_json("Image", "../bad.png"),
+        );
+        let epub =
+            Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap();
 
         let annotations = epub.embedded_annotations().unwrap().unwrap();
         assert!(annotations.set().items()[0].body().unwrap().id().is_none());

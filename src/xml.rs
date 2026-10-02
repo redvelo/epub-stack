@@ -1,6 +1,6 @@
 use quick_xml::XmlVersion;
 use quick_xml::escape::resolve_predefined_entity;
-use quick_xml::events::{BytesRef, BytesStart};
+use quick_xml::events::BytesRef;
 use std::borrow::Cow;
 use std::io::{BufRead, Cursor, Read};
 
@@ -376,32 +376,9 @@ fn declaration_encoding(xml: &str) -> Option<String> {
     None
 }
 
-pub(crate) fn local_name(name: &[u8]) -> &[u8] {
-    let name = name.rsplit(|byte| *byte == b'}').next().unwrap_or(name);
-    name.rsplit(|byte| *byte == b':').next().unwrap_or(name)
-}
-
-pub(crate) struct XmlAttrs {
-    pub(crate) invalid: bool,
-}
-
-impl XmlAttrs {
-    pub(crate) fn from_event(event: &BytesStart<'_>) -> Self {
-        let mut invalid = false;
-        for attr in event.attributes() {
-            let attr = match attr {
-                Ok(attr) => attr,
-                Err(_) => {
-                    invalid = true;
-                    continue;
-                }
-            };
-            if attr.normalized_value(XmlVersion::default()).is_err() {
-                invalid = true;
-            }
-        }
-        Self { invalid }
-    }
+pub(crate) fn local_name(name: &str) -> &str {
+    let name = name.rsplit('}').next().unwrap_or(name);
+    name.rsplit(':').next().unwrap_or(name)
 }
 
 pub(crate) fn normalize_optional(value: Option<String>) -> Option<String> {
@@ -415,14 +392,12 @@ pub(crate) fn normalize_optional(value: Option<String>) -> Option<String> {
     })
 }
 
-pub(crate) fn text_content(text: &quick_xml::events::BytesText<'_>) -> quick_xml::Result<String> {
-    Ok(text.xml_content(XmlVersion::default())?.to_string())
+pub(crate) fn text_content(text: &quick_xml::events::BytesText<'_>) -> String {
+    text.xml_content(XmlVersion::default()).into_owned()
 }
 
-pub(crate) fn cdata_content(
-    cdata: &quick_xml::events::BytesCData<'_>,
-) -> quick_xml::Result<String> {
-    Ok(cdata.xml_content(XmlVersion::default())?.to_string())
+pub(crate) fn cdata_content(cdata: &quick_xml::events::BytesCData<'_>) -> String {
+    cdata.xml_content(XmlVersion::default()).into_owned()
 }
 
 pub(crate) fn push_general_ref(
@@ -433,13 +408,13 @@ pub(crate) fn push_general_ref(
         output.push(ch);
         return Ok(false);
     }
-    let name = reference.decode()?;
-    if let Some(value) = resolve_predefined_entity(name.as_ref()) {
+    let name = reference.as_ref();
+    if let Some(value) = resolve_predefined_entity(name) {
         output.push_str(value);
         Ok(false)
     } else {
         output.push('&');
-        output.push_str(name.as_ref());
+        output.push_str(name);
         output.push(';');
         Ok(true)
     }

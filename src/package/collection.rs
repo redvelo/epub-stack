@@ -1,12 +1,11 @@
 //! Build and inspect nested EPUB package collections.
 //!
 //! A [`Collection`] groups metadata links, optional metadata, and child collections. Its role may
-//! be a recognized [`CollectionRole`](crate::package::collection::CollectionRole), absent, or
-//! unknown in parsed source. Use [`Collection::add_collection`] to enforce the same nesting limit
-//! as package parsing and normalized generation.
+//! be a recognized [`CollectionRole`], absent, or
+//! unknown in parsed source; unknown roles keep their authored spelling.
 
+use super::Result;
 use super::metadata::{Metadata, MetadataLink};
-use super::{Result, required_package_string};
 use crate::semantics::TextDirection;
 use crate::string::EpubString;
 
@@ -16,6 +15,12 @@ use crate::string::EpubString;
 pub const MAX_COLLECTION_NESTING_DEPTH: usize = 128;
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 /// An owned OPF `collection` subtree.
 ///
 /// Children, links, and metadata retain modeled source order. Unknown XML and invalid typed
@@ -24,7 +29,7 @@ pub struct Collection {
     dir: Option<TextDirection>,
     id: Option<EpubString>,
     xml_lang: Option<EpubString>,
-    role: Option<CollectionRole>,
+    role: Option<CollectionRoleToken>,
     link: Vec<MetadataLink>,
     metadata: Option<Metadata>,
     collections: Vec<Collection>,
@@ -35,7 +40,7 @@ impl Collection {
         dir: Option<TextDirection>,
         id: Option<EpubString>,
         xml_lang: Option<EpubString>,
-        role: Option<CollectionRole>,
+        role: Option<CollectionRoleToken>,
     ) -> Self {
         Self {
             dir,
@@ -55,60 +60,24 @@ impl Collection {
     }
 
     /// Creates an empty collection with the supplied canonical role.
+    ///
+    /// Collections are currently read-only in publications: this crate parses and regenerates
+    /// them, but no publication edit installs a constructed [`Collection`].
     pub fn new(role: CollectionRole) -> Self {
         Self {
             dir: None,
             id: None,
             xml_lang: None,
-            role: Some(role),
+            role: Some(role.into()),
             link: Vec::new(),
             metadata: None,
             collections: Vec::new(),
         }
     }
 
-    /// Sets the collection ID without changing other fields.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`super::PackageError::EmptyField`] for an empty or whitespace-only ID.
-    pub fn with_id(mut self, id: impl AsRef<str>) -> Result<Self> {
-        self.id = Some(required_package_string(id, "collection id")?);
-        Ok(self)
-    }
-
-    /// Sets the collection's text direction.
-    pub fn with_dir(mut self, dir: TextDirection) -> Self {
-        self.dir = Some(dir);
-        self
-    }
-
-    /// Sets `xml:lang` without language-tag normalization.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`super::PackageError::EmptyField`] for an empty or whitespace-only value.
-    pub fn with_xml_lang(mut self, xml_lang: impl AsRef<str>) -> Result<Self> {
-        self.xml_lang = Some(required_package_string(xml_lang, "collection xml:lang")?);
-        Ok(self)
-    }
-
-    /// Replaces the collection role with a canonical known value.
-    pub fn with_role(mut self, role: CollectionRole) -> Self {
-        self.role = Some(role);
-        self
-    }
-
     /// Appends an owned metadata link in collection order.
-    pub fn add_link(&mut self, link: MetadataLink) {
+    pub(crate) fn add_link(&mut self, link: MetadataLink) {
         self.link.push(link);
-    }
-
-    /// Replaces the collection's optional owned metadata block.
-    ///
-    /// This does not preserve the original block's XML layout.
-    pub fn set_metadata(&mut self, metadata: Metadata) {
-        self.metadata = Some(metadata);
     }
 
     /// Appends an owned nested collection.
@@ -117,7 +86,7 @@ impl Collection {
     ///
     /// Returns [`super::PackageError::CollectionNestingLimitExceeded`] if insertion would
     /// exceed [`MAX_COLLECTION_NESTING_DEPTH`]. Failure leaves `self` unchanged.
-    pub fn add_collection(&mut self, collection: Collection) -> Result<()> {
+    pub(crate) fn add_collection(&mut self, collection: Collection) -> Result<()> {
         if collection.max_nesting_depth() >= MAX_COLLECTION_NESTING_DEPTH {
             return Err(super::PackageError::CollectionNestingLimitExceeded {
                 limit: MAX_COLLECTION_NESTING_DEPTH,
@@ -139,9 +108,9 @@ impl Collection {
     pub fn xml_lang(&self) -> Option<&EpubString> {
         self.xml_lang.as_ref()
     }
-    /// Returns the recognized collection role.
-    pub fn role(&self) -> Option<CollectionRole> {
-        self.role
+    /// Borrows the authored collection role, recognized or not.
+    pub fn role(&self) -> Option<&CollectionRoleToken> {
+        self.role.as_ref()
     }
     /// Borrows metadata links in modeled source order.
     pub fn link(&self) -> &[MetadataLink] {
@@ -172,10 +141,22 @@ impl Collection {
     }
 }
 
+/// A collection `role` token retaining its authored spelling and optional known projection.
+///
+/// Roles are an open vocabulary: a publication may use an absolute URL or a term this crate does
+/// not recognize, and that spelling is preserved through parsing and generation.
+pub type CollectionRoleToken = crate::vocab::VocabToken<CollectionRole>;
+
 #[derive(
     Debug, PartialEq, Eq, Clone, Copy, strum_macros::Display, strum_macros::EnumString, Hash,
 )]
-#[strum(serialize_all = "lowercase")]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "kebab-case")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[strum(serialize_all = "kebab-case", ascii_case_insensitive)]
 /// A recognized EPUB collection role.
 pub enum CollectionRole {
     /// A dictionary collection.
@@ -183,18 +164,22 @@ pub enum CollectionRole {
     /// An index collection.
     Index,
     /// A grouping of index collections.
+    #[cfg_attr(feature = "serde", serde(rename = "index-group"))]
     IndexGroup,
     /// A distributable-object collection.
+    #[cfg_attr(feature = "serde", serde(rename = "distributable-object"))]
     DistributableObject,
     /// A resource manifest collection.
     Manifest,
     /// A publication preview collection.
     Preview,
     /// A scriptable-content collection.
+    #[cfg_attr(feature = "serde", serde(rename = "scriptable-content"))]
     ScriptableContent,
     /// A collection of learning units.
     Units,
     /// A page-list set.
+    #[cfg_attr(feature = "serde", serde(rename = "page-set"))]
     PageSet,
     /// A single page collection.
     Page,
@@ -250,5 +235,40 @@ mod tests {
             Err(super::super::PackageError::CollectionNestingLimitExceeded { limit })
                 if limit == MAX_COLLECTION_NESTING_DEPTH
         ));
+    }
+    #[test]
+    fn hyphenated_and_unknown_roles_survive_parse_and_generation() {
+        let package = Package::parse(
+            r#"<package xmlns="http://www.idpf.org/2007/opf">
+                <collection role="index-group"/>
+                <collection role="https://example.com/vocab#custom"/>
+            </package>"#,
+        )
+        .unwrap();
+
+        let roles = package.collections();
+        assert_eq!(
+            roles[0].role().and_then(CollectionRoleToken::known_value),
+            Some(CollectionRole::IndexGroup)
+        );
+        assert_eq!(
+            roles[0].role().map(CollectionRoleToken::as_str),
+            Some("index-group")
+        );
+        assert_eq!(
+            roles[1].role().and_then(CollectionRoleToken::known_value),
+            None
+        );
+        assert_eq!(
+            roles[1].role().map(CollectionRoleToken::as_str),
+            Some("https://example.com/vocab#custom")
+        );
+
+        let xml = package.to_normalized_xml().unwrap();
+        assert!(xml.contains(r#"role="index-group""#), "{xml}");
+        assert!(
+            xml.contains(r#"role="https://example.com/vocab#custom""#),
+            "{xml}"
+        );
     }
 }

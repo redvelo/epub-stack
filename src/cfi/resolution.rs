@@ -1,130 +1,150 @@
-use crate::resource::{
-    EpubPath, ResourceAddress, ResourceLookupError, provider::ProviderReadError,
-};
+use crate::resource::{EpubPath, ResourceAddress, ResourceReadError};
+use crate::xml::XmlDecodeError;
 
-use super::{CfiPath, CfiXmlDecodeError, LocalPath};
+use super::{CfiPath, LocalPath};
 
 /// A failure while resolving valid CFI syntax against a live publication.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum CfiResolveError {
-    /// The range common parent had no steps.
-    #[error("CFI parent path is empty")]
-    ParentPathEmpty,
-    /// The package portion did not contain the required spine and itemref steps.
-    #[error("CFI parent path is too short")]
-    ParentPathTooShort,
-    /// The package spine step was odd and therefore selected text rather than an element.
-    #[error("CFI spine step must be even: {step}")]
-    SpineStepOdd {
-        /// Rejected step.
-        step: usize,
+    /// The package portion of the path did not select a spine itemref and its content document.
+    #[error("CFI package path could not be resolved: {0}")]
+    PackagePath(
+        /// Why the package portion could not be resolved.
+        PackagePathFailure,
+    ),
+    /// The selected spine itemref does not resolve to a local resource.
+    ///
+    /// Inspect the occurrence through [`crate::ResourceIndex::occurrence`] for the reason.
+    #[error("CFI spine item does not resolve to a local resource")]
+    UnresolvedSpineItem,
+    /// The content document could not be read, decoded, or parsed.
+    #[error("could not load CFI content document {path}: {failure}")]
+    ContentDocument {
+        /// Content-document path.
+        path: EpubPath,
+        /// Why the document could not be loaded.
+        #[source]
+        failure: ContentDocumentFailure,
     },
-    /// The package step did not select the package `spine` element.
-    #[error("CFI package path does not select the package spine: {step}")]
-    SpineStepInvalid {
-        /// Rejected step.
-        step: usize,
-    },
-    /// An ID assertion did not match the package spine.
-    #[error("CFI spine assertion does not match the package spine")]
-    SpineAssertionMismatch,
-    /// The spine itemref step was odd.
-    #[error("CFI spine itemref step must be even: {step}")]
-    SpineItemrefStepOdd {
-        /// Rejected step.
-        step: usize,
-    },
-    /// The spine itemref step did not identify an itemref.
-    #[error("CFI spine itemref step is invalid")]
-    InvalidSpineItemrefStep,
-    /// An ID assertion did not match the selected itemref.
-    #[error("CFI spine itemref assertion does not match the selected itemref")]
-    SpineItemrefAssertionMismatch,
-    /// A path selected no valid source location.
-    #[error("CFI location is invalid")]
-    InvalidLocation,
-    /// A character offset was outside the selected text node.
-    #[error("CFI offset range is invalid")]
-    InvalidOffsetRange,
-    /// Package-to-content indirection redirected directly to an offset.
-    #[error("CFI package path cannot redirect to an offset")]
-    PackageRedirectOffset,
-    /// The package path lacked required `!` content-document indirection.
-    #[error("CFI package path is missing content-document indirection")]
-    PackageRedirectMissing,
-    /// A redirected content path attempted another redirect.
-    #[error("CFI redirected paths cannot include nested redirects")]
-    RedirectedPathUnsupported,
-    /// The common parent node did not exist.
-    #[error("CFI parent node could not be resolved")]
-    ParentNodeUnresolved,
-    /// A range-local path contained unsupported indirection.
-    #[error("CFI local paths cannot include redirects")]
-    LocalPathRedirectUnsupported,
-    /// A range-local path did not identify a node.
-    #[error("CFI local path could not be resolved")]
-    LocalPathUnresolved,
+    /// A path did not select a node in the content document.
+    #[error("CFI content path could not be resolved: {0}")]
+    ContentPath(
+        /// Why the content path could not be resolved.
+        ContentPathFailure,
+    ),
+    /// An offset could not be applied to the selected node.
+    #[error("CFI offset could not be applied: {0}")]
+    Offset(
+        /// Why the offset could not be applied.
+        OffsetFailure,
+    ),
+    /// An assertion did not match the resolved publication or content.
+    #[error("CFI assertion does not match: {0}")]
+    AssertionMismatch(
+        /// Which assertion did not match.
+        AssertionMismatch,
+    ),
     /// The resolved range end preceded its start.
     #[error("CFI range end precedes its start")]
     ReversedRange,
-    /// A range endpoint offset was attached to a non-text step.
-    #[error("CFI range endpoint offset must reference a text node")]
-    OffsetNotText,
-    /// The selected text-node slot did not contain text.
-    #[error("CFI text node is missing")]
-    MissingTextNode,
-    /// Source-text resolution encountered temporal or spatial offsets.
-    #[error("CFI offset type is not supported by source-text resolution")]
-    UnsupportedOffset,
-    /// A text assertion did not match source text around the offset.
-    #[error("CFI text assertion does not match the referenced text")]
-    TextAssertionMismatch,
-    /// Publication resource lookup failed.
-    #[error("CFI resource lookup failed: {source}")]
-    ResourceLookup {
-        /// Underlying lookup error.
-        #[source]
-        source: ResourceLookupError,
-    },
-    /// The live provider could not read the selected content document.
-    #[error("could not read CFI content document {path}: {source}")]
-    ResourceRead {
-        /// Content-document path.
-        path: EpubPath,
-        /// Underlying provider read error.
-        #[source]
-        source: ProviderReadError,
-    },
-    /// Content-document bytes could not be decoded as XML text.
-    #[error("could not decode CFI content document XML at {path}: {source}")]
-    XmlDecode {
-        /// Content-document path.
-        path: EpubPath,
-        /// Underlying XML decoding error.
-        #[source]
-        source: CfiXmlDecodeError,
-    },
-    /// Decoded content was not parseable XML.
-    #[error("CFI content document XML could not be parsed: {source}")]
-    Xml {
-        /// Underlying XML parser error.
-        #[source]
-        source: xot::Error,
-    },
-    /// A selected source range split an invalid UTF-16 sequence.
-    #[error("CFI text could not be decoded from UTF-16: {source}")]
-    Utf16 {
-        /// Underlying UTF-16 conversion error.
-        #[source]
-        source: std::string::FromUtf16Error,
-    },
 }
 
-impl From<xot::ParseError> for CfiResolveError {
-    fn from(err: xot::ParseError) -> Self {
-        Self::Xml { source: err.into() }
-    }
+/// Why the package portion of a CFI could not be resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PackagePathFailure {
+    /// The path lacked the required spine and itemref steps.
+    #[error("package path is too short")]
+    TooShort,
+    /// The first step did not select the package `spine` element.
+    #[error("step {step} does not select the package spine")]
+    SpineStep {
+        /// Rejected step.
+        step: usize,
+    },
+    /// The second step did not identify a spine itemref.
+    #[error("step {step} does not identify a spine itemref")]
+    ItemrefStep {
+        /// Rejected step.
+        step: usize,
+    },
+    /// The itemref position is outside the spine.
+    #[error("spine has no itemref at position {index}")]
+    MissingItemref {
+        /// Zero-based itemref position.
+        index: usize,
+    },
+    /// The package path lacked `!` indirection into a content document.
+    #[error("package path is missing content-document indirection")]
+    MissingContentIndirection,
+}
+
+/// Why a CFI content document could not be loaded.
+#[derive(Debug, thiserror::Error)]
+pub enum ContentDocumentFailure {
+    /// The live provider could not read the document.
+    #[error("read failed")]
+    Read(
+        /// Underlying read error.
+        #[source]
+        ResourceReadError,
+    ),
+    /// Document bytes could not be decoded as XML text.
+    #[error("XML decoding failed")]
+    Decode(
+        /// Underlying XML decoding error.
+        #[source]
+        XmlDecodeError,
+    ),
+    /// Decoded content was not parseable XML.
+    #[error("XML parsing failed")]
+    Parse(
+        /// Underlying XML parser failure.
+        #[source]
+        Box<dyn std::error::Error + Send + Sync>,
+    ),
+}
+
+/// Why a CFI content path did not select a node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ContentPathFailure {
+    /// The path did not identify a node in the content document.
+    #[error("path does not identify a node")]
+    Unresolved,
+    /// A content or range-local path attempted further `!` indirection.
+    #[error("content paths cannot include redirects")]
+    NestedRedirect,
+}
+
+/// Why a CFI offset could not be applied to the selected node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum OffsetFailure {
+    /// The offset was attached to a step that does not select text.
+    #[error("offset must reference a text node")]
+    NotText,
+    /// The offset was outside the selected text.
+    #[error("offset is outside the referenced text")]
+    OutOfRange,
+    /// Source-text resolution encountered a temporal or spatial offset.
+    #[error("offset type is not supported by source-text resolution")]
+    UnsupportedType,
+    /// The selected boundary split a UTF-16 surrogate pair.
+    #[error("offset splits a UTF-16 surrogate pair")]
+    SplitSurrogate,
+}
+
+/// Which CFI assertion did not match the publication or its content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AssertionMismatch {
+    /// An ID assertion did not match the package spine.
+    #[error("spine assertion")]
+    Spine,
+    /// An ID assertion did not match the selected itemref.
+    #[error("spine itemref assertion")]
+    SpineItemref,
+    /// A text assertion did not match source text around the offset.
+    #[error("text assertion")]
+    Text,
 }
 
 /// A source-document location found by resolving a CFI against a publication.
@@ -151,7 +171,9 @@ impl ResolvedCfiLocation {
         }
     }
 
-    /// The absolute path through package and content-document indirection.
+    /// The path inside the content document, following the package `!` indirection.
+    ///
+    /// The package portion of the original CFI is not included.
     pub fn document_path(&self) -> &CfiPath {
         &self.document_path
     }

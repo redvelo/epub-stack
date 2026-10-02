@@ -1,16 +1,19 @@
-use crate::accessibility::{
-    AccessibilityElementFact, AccessibilityFact, AccessibilityHeadingLevelFact,
-    AccessibilityValueFact,
-};
+use crate::accessibility::{AccessibilityFact, AccessibilityObservation};
 use crate::content::XhtmlFacts;
 use crate::content::facts::{
-    FormFact, FragmentAttribute, FragmentFact, HtmlStructuralElement, LinkConstructors, LinkFact,
-    LinkFactData, MediaFact, MediaSourceContext, NavigationLinkKind, ReferenceAttribute,
-    ScriptFact, SemanticToken, StructureFact, ViewportFact, XhtmlLinkSlot,
+    FormFact, FragmentAttribute, FragmentFact, LinkConstructors, LinkFact, LinkFactData, MediaFact,
+    MediaSourceContext, NavigationLinkKind, ReferenceAttribute, ScriptFact, StructureFact,
+    StructureRole, TrackKind, ViewportFact, XhtmlLinkSlot,
 };
-use crate::content::text::{TextChunk, TextChunkContent, TextChunkKind, TextRange, TextStream};
+use crate::content::text::{
+    SupplementaryText, SupplementaryTextSource, TextOrigin, TextRange, TextRole, TextSpan,
+    TextStream,
+};
 use crate::resource::AuthoredHref;
-use crate::semantics::{DpubAriaRole, EpubStructuralSemantic, HeadingLevel, TextDirection};
+use crate::semantics::{
+    DpubAriaRole, EpubStructuralSemantic, HeadingLevel, HtmlStructuralElement, SemanticToken,
+    TextDirection,
+};
 use lol_html::{HtmlRewriter, Settings, element, end_tag, text};
 use std::cell::RefCell;
 use std::io::Read;
@@ -52,6 +55,9 @@ fn media_link_indices(slots: Vec<Vec<XhtmlLinkSlot>>) -> Vec<Vec<usize>> {
         .collect()
 }
 
+const XHTML_NAMESPACE: &str = "http://www.w3.org/1999/xhtml";
+const SVG_NAMESPACE: &str = "http://www.w3.org/2000/svg";
+
 struct HtmlContentExtractor;
 
 impl HtmlContentExtractor {
@@ -59,16 +65,27 @@ impl HtmlContentExtractor {
         let state = Rc::new(RefCell::new(ExtractorState::new()));
         let start_state = Rc::clone(&state);
         let text_state = Rc::clone(&state);
+        let mut pending_text = String::new();
 
         let mut bytes_read = 0u64;
         let rewrite_result: std::result::Result<(), String> = {
             let mut rewriter = HtmlRewriter::new(
                 Settings::new()
                     .append_element_content_handler(element!("*", move |el| {
-                        let element = el.tag_name();
-                        let namespace = el.namespace_uri();
-                        let in_svg = namespace == "http://www.w3.org/2000/svg";
-                        let in_html = namespace == "http://www.w3.org/1999/xhtml";
+                        let attrs = ElementAttrs::from_lol_html(el.attributes());
+                        let tag = el.tag_name();
+                        let resolved = start_state.borrow().resolve_prefixed_element(&tag, &attrs);
+                        let (element, in_svg, in_html) = match resolved {
+                            Some((local, in_svg)) => (local, in_svg, !in_svg),
+                            None => {
+                                let namespace = el.namespace_uri();
+                                (
+                                    tag,
+                                    namespace == SVG_NAMESPACE,
+                                    namespace == XHTML_NAMESPACE,
+                                )
+                            }
+                        };
                         let end_state = Rc::clone(&start_state);
                         let end_element = element.clone();
                         let has_end = el
@@ -77,14 +94,22 @@ impl HtmlContentExtractor {
                                 Ok(())
                             }))
                             .is_ok();
-                        let attrs = ElementAttrs::from_lol_html(el.attributes());
                         start_state
                             .borrow_mut()
                             .handle_start(&element, in_svg, in_html, &attrs, has_end);
                         Ok(())
                     }))
                     .append_element_content_handler(text!("*", move |chunk| {
-                        text_state.borrow_mut().push_text(chunk.as_str());
+                        pending_text.push_str(chunk.as_str());
+                        if chunk.last_in_text_node() {
+                            let decoded = if chunk.text_type().allows_html_entities() {
+                                html_escape::decode_html_entities(&pending_text)
+                            } else {
+                                std::borrow::Cow::Borrowed(pending_text.as_str())
+                            };
+                            text_state.borrow_mut().push_text(&decoded);
+                            pending_text.clear();
+                        }
                         Ok(())
                     })),
                 |_: &[u8]| {},
@@ -108,7 +133,7 @@ impl HtmlContentExtractor {
 
         let state = Rc::try_unwrap(state).unwrap().into_inner();
         rewrite_result?;
-        Ok((state.finish(), bytes_read))
+        Ok((state.finish(true), bytes_read))
     }
 }
 
@@ -122,7 +147,12 @@ impl ElementAttrs {
         Self {
             values: attrs
                 .iter()
-                .map(|attr| (attr.name().to_string(), attr.value().to_string()))
+                .map(|attr| {
+                    (
+                        attr.name().to_string(),
+                        html_escape::decode_html_entities(&attr.value()).into_owned(),
+                    )
+                })
                 .collect(),
         }
     }
@@ -156,15 +186,14 @@ pub(super) struct ExtractorState {
     links: Vec<LinkFact>,
     authored_base: Option<AuthoredHref>,
     element_stack: Vec<ElementFrame>,
-    nearest_fragment: Option<String>,
+    nearest_fragment: Option<FragmentFact>,
     text_blocks: Vec<TextBlock>,
-    pending_alt_text: Vec<PendingAltText>,
     text_stream_builder: TextStreamBuilder,
-    next_text_chunk: usize,
     next_element_ordinal: usize,
     media_links: Vec<Vec<XhtmlLinkSlot>>,
     form_links: Vec<Option<XhtmlLinkSlot>>,
     script_links: Vec<Option<XhtmlLinkSlot>>,
+    activity: crate::content::DocumentActivities,
 }
 
 #[derive(Debug, Default)]
@@ -248,78 +277,54 @@ impl TextStreamBuilder {
     }
 
     fn finish(self) -> TextStream {
-        TextStream { text: self.text }
+        TextStream {
+            text: self.text,
+            code_point_len: self.code_point_len,
+            ..TextStream::default()
+        }
     }
 }
 
 #[derive(Debug, Clone)]
 struct ElementFrame {
     element: String,
+    namespace_bindings: Vec<(String, String)>,
     navigation: Option<NavigationLinkKind>,
     navigation_link_claimed: bool,
-    previous_fragment: Option<String>,
+    previous_fragment: Option<FragmentFact>,
     lang: Option<String>,
     dir: Option<TextDirection>,
     suppresses_text: bool,
     structure_indices: Vec<usize>,
     inline_script_index: Option<usize>,
+    text_span: TextSpan,
 }
 
 #[derive(Debug, Clone)]
 enum TextBlock {
-    Body(TextBlockData),
-    Heading(HeadingTextBlockData),
+    Heading(TextBlockData),
     PagebreakLabel(TextBlockData),
     FigureCaption(TextBlockData),
     TableCaption(TextBlockData),
 }
 
 #[derive(Debug, Clone)]
-struct PendingAltText {
-    text: String,
-    fragment: Option<String>,
-    lang: Option<String>,
-    dir: Option<TextDirection>,
-}
-
-#[derive(Debug, Clone)]
 struct TextBlockData {
     element: String,
-    fragment: Option<String>,
+    fragment: Option<FragmentFact>,
     text: String,
-    lang: Option<String>,
-    dir: Option<TextDirection>,
     structure_indices: Vec<usize>,
-    stream_range: Option<TextRange>,
-}
-
-#[derive(Debug, Clone)]
-struct HeadingTextBlockData {
-    element: String,
-    level: u8,
-    fragment: Option<String>,
-    text: String,
-    lang: Option<String>,
-    dir: Option<TextDirection>,
-    structure_indices: Vec<usize>,
-    stream_range: Option<TextRange>,
 }
 
 impl TextBlock {
     fn data(&self) -> TextBlockDataRef<'_> {
         match self {
-            Self::Body(data)
+            Self::Heading(data)
             | Self::PagebreakLabel(data)
             | Self::FigureCaption(data)
             | Self::TableCaption(data) => TextBlockDataRef {
                 element: &data.element,
-                fragment: data.fragment.as_deref(),
-                text: &data.text,
-                structure_indices: &data.structure_indices,
-            },
-            Self::Heading(data) => TextBlockDataRef {
-                element: &data.element,
-                fragment: data.fragment.as_deref(),
+                fragment: data.fragment.as_ref(),
                 text: &data.text,
                 structure_indices: &data.structure_indices,
             },
@@ -328,100 +333,27 @@ impl TextBlock {
 
     fn text_mut(&mut self) -> &mut String {
         match self {
-            Self::Body(data)
+            Self::Heading(data)
             | Self::PagebreakLabel(data)
             | Self::FigureCaption(data)
             | Self::TableCaption(data) => &mut data.text,
-            Self::Heading(data) => &mut data.text,
-        }
-    }
-
-    fn extend_stream_range(&mut self, emitted: TextRange) {
-        let range = match self {
-            Self::Body(data)
-            | Self::PagebreakLabel(data)
-            | Self::FigureCaption(data)
-            | Self::TableCaption(data) => &mut data.stream_range,
-            Self::Heading(data) => &mut data.stream_range,
-        };
-        *range = Some(match *range {
-            Some(current) => TextRange {
-                start: current.start,
-                end: emitted.end,
-            },
-            None => emitted,
-        });
-    }
-
-    fn into_text_chunk(self, id: String, text: String) -> TextChunk {
-        let (kind, content, fragment, lang, dir) = match self {
-            Self::Body(data) => (
-                TextChunkKind::Body,
-                data.stream_range
-                    .map(TextChunkContent::Stream)
-                    .unwrap_or_else(|| TextChunkContent::Owned(text.clone())),
-                data.fragment,
-                data.lang,
-                data.dir,
-            ),
-            Self::Heading(data) => (
-                TextChunkKind::Heading {
-                    level: HeadingLevel::new(data.level).expect("HTML heading level is valid"),
-                },
-                data.stream_range
-                    .map(TextChunkContent::Stream)
-                    .unwrap_or_else(|| TextChunkContent::Owned(text.clone())),
-                data.fragment,
-                data.lang,
-                data.dir,
-            ),
-            Self::PagebreakLabel(data) => (
-                TextChunkKind::PagebreakLabel,
-                TextChunkContent::Owned(text),
-                data.fragment,
-                data.lang,
-                data.dir,
-            ),
-            Self::FigureCaption(data) => (
-                TextChunkKind::FigureCaption,
-                data.stream_range
-                    .map(TextChunkContent::Stream)
-                    .unwrap_or_else(|| TextChunkContent::Owned(text.clone())),
-                data.fragment,
-                data.lang,
-                data.dir,
-            ),
-            Self::TableCaption(data) => (
-                TextChunkKind::TableCaption,
-                data.stream_range
-                    .map(TextChunkContent::Stream)
-                    .unwrap_or_else(|| TextChunkContent::Owned(text.clone())),
-                data.fragment,
-                data.lang,
-                data.dir,
-            ),
-        };
-        TextChunk {
-            id,
-            kind,
-            content,
-            fragment,
-            lang,
-            dir,
         }
     }
 }
 
 struct TextBlockDataRef<'a> {
     element: &'a str,
-    fragment: Option<&'a str>,
+    fragment: Option<&'a FragmentFact>,
     text: &'a str,
     structure_indices: &'a [usize],
 }
 
 impl ExtractorState {
     fn new() -> Self {
-        Self::with_text_stream_builder(TextStreamBuilder::default())
+        Self::with_text_stream_builder(TextStreamBuilder {
+            in_body: true,
+            ..TextStreamBuilder::default()
+        })
     }
 
     pub(super) fn new_fragment() -> Self {
@@ -437,14 +369,13 @@ impl ExtractorState {
             facts: XhtmlFacts {
                 fragments: Vec::new(),
                 viewports: Vec::new(),
-                text_stream: TextStream {
-                    text: String::new(),
-                },
-                text: Vec::new(),
+                text_stream: TextStream::default(),
                 structure: Vec::new(),
                 media: Vec::new(),
                 forms: Vec::new(),
                 scripts: Vec::new(),
+                is_document: false,
+                activity: Default::default(),
             },
             accessibility: Vec::new(),
             links: Vec::new(),
@@ -452,19 +383,23 @@ impl ExtractorState {
             element_stack: Vec::new(),
             nearest_fragment: None,
             text_blocks: Vec::new(),
-            pending_alt_text: Vec::new(),
             text_stream_builder,
-            next_text_chunk: 0,
             next_element_ordinal: 0,
             media_links: Vec::new(),
             form_links: Vec::new(),
             script_links: Vec::new(),
+            activity: Default::default(),
         }
     }
 
-    pub(super) fn finish(mut self) -> XhtmlExtraction {
+    pub(super) fn finish(mut self, document_supported: bool) -> XhtmlExtraction {
         self.finish_all_text_blocks();
+        for frame in std::mem::take(&mut self.element_stack) {
+            self.finish_text_span(frame.text_span);
+        }
         self.build_text_stream();
+        self.facts.is_document = document_supported;
+        self.facts.activity = self.activity;
         XhtmlExtraction {
             facts: self.facts,
             accessibility: self.accessibility,
@@ -494,6 +429,32 @@ impl ExtractorState {
         &self.accessibility[index..]
     }
 
+    /// Resolves an XML-prefixed name that the HTML tokenizer reports verbatim, returning the
+    /// local name and whether it is SVG. Only XHTML and SVG bindings are resolved; other
+    /// prefixes keep their verbatim name.
+    fn resolve_prefixed_element(
+        &self,
+        element: &str,
+        attrs: &ElementAttrs,
+    ) -> Option<(String, bool)> {
+        let (prefix, local) = element.split_once(':')?;
+        let declaration = format!("xmlns:{prefix}");
+        let namespace = attrs.value(&declaration).or_else(|| {
+            self.element_stack.iter().rev().find_map(|frame| {
+                frame
+                    .namespace_bindings
+                    .iter()
+                    .find(|(bound, _)| bound == prefix)
+                    .map(|(_, namespace)| namespace.as_str())
+            })
+        })?;
+        match namespace {
+            XHTML_NAMESPACE => Some((local.to_string(), false)),
+            SVG_NAMESPACE => Some((local.to_string(), true)),
+            _ => None,
+        }
+    }
+
     pub(super) fn handle_start(
         &mut self,
         element: &str,
@@ -502,6 +463,18 @@ impl ExtractorState {
         attrs: &ElementAttrs,
         has_end: bool,
     ) {
+        if in_html {
+            let implied = self
+                .element_stack
+                .iter()
+                .rposition(|frame| frame.element == "p")
+                .filter(|_| is_text_stream_block(element) && element != "br");
+            if implied.is_some() {
+                self.handle_end("p");
+            }
+        }
+        self.activity
+            .extend(document_activity(element, in_svg, in_html, attrs));
         let element_ordinal = self.next_element_ordinal;
         self.next_element_ordinal += 1;
         let previous_fragment = self.nearest_fragment.clone();
@@ -509,8 +482,15 @@ impl ExtractorState {
         self.extract_viewport(element, in_html, attrs);
         self.extract_fragments(element, attrs, element_ordinal);
         let (lang, dir) = self.derived_text_metadata(attrs);
+        let origin = TextOrigin {
+            element: element.to_owned(),
+            element_ordinal,
+            fragment: self.nearest_fragment.clone(),
+            lang: lang.clone(),
+            dir,
+        };
         let structure_indices = self.extract_structure(element, attrs);
-        self.extract_accessibility(element, attrs, lang.clone(), dir);
+        self.extract_accessibility(element, attrs, origin.clone());
         let first_link = self.links.len();
         self.extract_links(element, in_svg, attrs);
         self.extract_media(element, attrs, first_link);
@@ -518,9 +498,7 @@ impl ExtractorState {
         let inline_script_index = self.extract_scripts(element, in_svg, attrs, first_link);
 
         let pagebreak_attr_label = is_pagebreak(attrs) && pagebreak_label(attrs).is_some();
-        let preserves_native_content = preserves_native_pagebreak_content(element);
-        let suppresses_text =
-            suppresses_text(element) || pagebreak_attr_label && !preserves_native_content;
+        let suppresses_text = suppresses_text(element);
         self.text_stream_builder
             .handle_start(element, suppresses_text);
         if element == "br"
@@ -529,8 +507,8 @@ impl ExtractorState {
         {
             append_text(block.text_mut(), " ");
         }
-        if pagebreak_attr_label && heading_level(element).is_none() {
-            self.emit_pagebreak_label(attrs, &structure_indices, lang.clone(), dir);
+        if pagebreak_attr_label && !self.text_suppressed() && !suppresses_text {
+            self.emit_pagebreak_label(attrs, &structure_indices, origin.clone());
         }
         if !has_end && suppresses_text {
             self.text_stream_builder.handle_end(element, true);
@@ -539,6 +517,13 @@ impl ExtractorState {
         if has_end {
             self.element_stack.push(ElementFrame {
                 element: element.to_string(),
+                namespace_bindings: attrs
+                    .values()
+                    .filter_map(|(name, value)| {
+                        name.strip_prefix("xmlns:")
+                            .map(|prefix| (prefix.to_string(), value.to_string()))
+                    })
+                    .collect(),
                 navigation: (!self
                     .element_stack
                     .iter()
@@ -552,39 +537,41 @@ impl ExtractorState {
                 suppresses_text,
                 structure_indices: structure_indices.clone(),
                 inline_script_index,
+                text_span: TextSpan {
+                    range: TextRange { start: 0, end: 0 },
+                    bytes: 0..0,
+                    role: text_span_role(element, attrs),
+                    origin,
+                },
             });
         } else {
             self.nearest_fragment = previous_fragment;
         }
 
-        if has_end {
-            let (lang, dir) = self.current_text_metadata();
-            if let Some(block) = text_block_for_element(
+        if has_end
+            && let Some(block) = text_block_for_element(
                 element,
                 attrs,
-                in_svg,
                 self.nearest_fragment.clone(),
-                lang,
-                dir,
                 structure_indices,
-            ) && !self.text_suppressed()
-            {
-                let aggregates_descendants = self.text_blocks.last().is_some_and(|block| {
-                    matches!(
-                        block,
-                        TextBlock::PagebreakLabel(_)
-                            | TextBlock::FigureCaption(_)
-                            | TextBlock::TableCaption(_)
-                    )
-                });
-                let preserves_nested_projection = aggregates_descendants
-                    && matches!(block, TextBlock::Heading(_) | TextBlock::PagebreakLabel(_));
-                if self.text_blocks.last().is_some() && !aggregates_descendants {
-                    self.finish_text_block();
-                }
-                if !aggregates_descendants || preserves_nested_projection {
-                    self.text_blocks.push(block);
-                }
+            )
+            && !self.text_suppressed()
+        {
+            let aggregates_descendants = self.text_blocks.last().is_some_and(|block| {
+                matches!(
+                    block,
+                    TextBlock::PagebreakLabel(_)
+                        | TextBlock::FigureCaption(_)
+                        | TextBlock::TableCaption(_)
+                )
+            });
+            let preserves_nested_projection = aggregates_descendants
+                && matches!(block, TextBlock::Heading(_) | TextBlock::PagebreakLabel(_));
+            if self.text_blocks.last().is_some() && !aggregates_descendants {
+                self.finish_text_block();
+            }
+            if !aggregates_descendants || preserves_nested_projection {
+                self.text_blocks.push(block);
             }
         }
     }
@@ -611,10 +598,13 @@ impl ExtractorState {
             .rposition(|frame| frame.element == element)
         {
             while self.element_stack.len() - 1 > pos {
-                self.element_stack.pop();
+                if let Some(frame) = self.element_stack.pop() {
+                    self.finish_text_span(frame.text_span);
+                }
             }
             if let Some(frame) = self.element_stack.pop() {
                 self.nearest_fragment = frame.previous_fragment;
+                self.finish_text_span(frame.text_span);
             }
         }
     }
@@ -641,43 +631,54 @@ impl ExtractorState {
             self.start_text_block_from_context();
         }
         let emitted = self.text_stream_builder.push_text(text);
+        if let Some(range) = emitted {
+            let end = self.text_stream_builder.text.len();
+            let count = (range.end - range.start) as usize;
+            let start = self
+                .text_stream_builder
+                .text
+                .char_indices()
+                .rev()
+                .nth(count - 1)
+                .map(|(byte, _)| byte)
+                .expect("emitted text is nonempty");
+            for frame in &mut self.element_stack {
+                let span = &mut frame.text_span;
+                if span.bytes.is_empty() {
+                    span.range.start = range.start;
+                    span.bytes.start = start;
+                }
+                span.range.end = range.end;
+                span.bytes.end = end;
+            }
+        }
         if self.text_blocks.is_empty() {
             return;
         }
         for block in &mut self.text_blocks {
             append_text(block.text_mut(), text);
-            if let Some(emitted) = emitted {
-                block.extend_stream_range(emitted);
-            }
         }
     }
 
     fn build_text_stream(&mut self) {
         let builder = std::mem::take(&mut self.text_stream_builder);
-        self.facts.text_stream = builder.finish();
+        let mut stream = builder.finish();
+        stream.spans = std::mem::take(&mut self.facts.text_stream.spans);
+        stream.spans.sort_by_key(|span| span.origin.element_ordinal);
+        stream.supplementary = std::mem::take(&mut self.facts.text_stream.supplementary);
+        self.facts.text_stream = stream;
+    }
+
+    fn finish_text_span(&mut self, span: TextSpan) {
+        if !span.bytes.is_empty() {
+            self.facts.text_stream.spans.push(span);
+        }
     }
 
     fn start_text_block_from_context(&mut self) {
-        let (lang, dir) = self.current_text_metadata();
-        let Some(block) = self
-            .element_stack
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(idx, frame)| {
-                let in_svg = self.element_stack[..=idx]
-                    .iter()
-                    .any(|frame| frame.element == "svg");
-                text_block_for_element_name(
-                    &frame.element,
-                    in_svg,
-                    self.nearest_fragment.clone(),
-                    lang.clone(),
-                    dir,
-                    Vec::new(),
-                )
-            })
-        else {
+        let Some(block) = self.element_stack.iter().rev().find_map(|frame| {
+            text_block_for_element_name(&frame.element, self.nearest_fragment.clone(), Vec::new())
+        }) else {
             return;
         };
         self.text_blocks.push(block);
@@ -690,37 +691,35 @@ impl ExtractorState {
         let data = block.data();
         let text = normalize_whitespace(data.text);
         let element = data.element.to_string();
-        let fragment = data.fragment.map(str::to_string);
+        let fragment = data.fragment.cloned();
         let structure_indices = data.structure_indices.to_vec();
         let is_heading = matches!(block, TextBlock::Heading(_));
-        let text_metadata = match &block {
-            TextBlock::Body(data)
-            | TextBlock::PagebreakLabel(data)
-            | TextBlock::FigureCaption(data)
-            | TextBlock::TableCaption(data) => (data.lang.clone(), data.dir),
-            TextBlock::Heading(data) => (data.lang.clone(), data.dir),
-        };
         if is_heading {
             for index in &structure_indices {
-                if let Some(structure @ StructureFact::Heading { .. }) =
-                    self.facts.structure.get_mut(*index)
+                if let Some(structure) = self
+                    .facts
+                    .structure
+                    .get_mut(*index)
+                    .filter(|structure| matches!(structure.role(), StructureRole::Heading(_)))
                 {
                     structure.set_label((!text.is_empty()).then(|| text.clone()));
                 }
             }
             if text.is_empty() {
-                self.accessibility.push(AccessibilityFact::EmptyHeading(
-                    AccessibilityElementFact {
-                        element,
-                        fragment: fragment.clone(),
-                    },
+                self.accessibility.push(AccessibilityFact::new(
+                    element,
+                    fragment.clone(),
+                    AccessibilityObservation::EmptyHeading,
                 ));
             }
         }
         if matches!(block, TextBlock::PagebreakLabel(_)) {
             for index in &structure_indices {
-                if let Some(structure @ StructureFact::Pagebreak { .. }) =
-                    self.facts.structure.get_mut(*index)
+                if let Some(structure) = self
+                    .facts
+                    .structure
+                    .get_mut(*index)
+                    .filter(|structure| matches!(structure.role(), StructureRole::Pagebreak))
                 {
                     structure.set_label((!text.is_empty()).then(|| text.clone()));
                 }
@@ -741,69 +740,37 @@ impl ExtractorState {
         let pagebreak_label = if !matches!(block, TextBlock::PagebreakLabel(_)) {
             structure_indices
                 .iter()
-                .find_map(|index| match self.facts.structure.get(*index) {
-                    Some(StructureFact::Pagebreak { label, .. }) => Some(
-                        label
+                .find_map(|index| {
+                    let structure = self.facts.structure.get(*index)?;
+                    (structure.role() == StructureRole::Pagebreak).then(|| {
+                        structure
+                            .label
                             .clone()
-                            .or_else(|| (!text.is_empty()).then(|| text.clone())),
-                    ),
-                    _ => None,
+                            .or_else(|| (!text.is_empty()).then(|| text.clone()))
+                    })
                 })
                 .flatten()
         } else {
             None
         };
-        if !text.is_empty() {
-            let id = self.next_text_chunk_id();
-            self.facts
-                .text
-                .push(block.into_text_chunk(id, text.clone()));
-        }
         if let Some(label) = pagebreak_label {
             for index in &structure_indices {
-                if let Some(structure @ StructureFact::Pagebreak { .. }) =
-                    self.facts.structure.get_mut(*index)
+                if let Some(structure) = self
+                    .facts
+                    .structure
+                    .get_mut(*index)
+                    .filter(|structure| matches!(structure.role(), StructureRole::Pagebreak))
                 {
                     structure.set_label(Some(label.clone()));
                 }
             }
-            let id = self.next_text_chunk_id();
-            let (lang, dir) = text_metadata;
-            self.facts.text.push(TextChunk {
-                id,
-                kind: TextChunkKind::PagebreakLabel,
-                content: TextChunkContent::Owned(label),
-                fragment,
-                lang,
-                dir,
-            });
         }
-        self.flush_pending_alt_text();
     }
 
     fn finish_all_text_blocks(&mut self) {
         while !self.text_blocks.is_empty() {
             self.finish_text_block();
         }
-        self.flush_pending_alt_text();
-    }
-
-    fn flush_pending_alt_text(&mut self) {
-        for alt in std::mem::take(&mut self.pending_alt_text) {
-            self.emit_alt_text(alt);
-        }
-    }
-
-    fn emit_alt_text(&mut self, alt: PendingAltText) {
-        let id = self.next_text_chunk_id();
-        self.facts.text.push(TextChunk {
-            id,
-            kind: TextChunkKind::AltText,
-            content: TextChunkContent::Owned(alt.text),
-            fragment: alt.fragment,
-            lang: alt.lang,
-            dir: alt.dir,
-        });
     }
 
     fn extract_fragments(&mut self, element: &str, attrs: &ElementAttrs, element_ordinal: usize) {
@@ -893,7 +860,7 @@ impl ExtractorState {
             return None;
         }
         let script_type = attrs.value("type").map(str::to_string);
-        let executable = in_svg || is_executable_script_type(script_type.as_deref());
+        let executable = is_executable_script_type(script_type.as_deref());
         let svg_source_attribute = in_svg.then(|| selected_svg_href(attrs)).flatten();
         let source_attribute = if in_svg {
             svg_source_attribute
@@ -940,13 +907,14 @@ impl ExtractorState {
         attribute: FragmentAttribute,
         element_ordinal: usize,
     ) {
-        self.nearest_fragment = Some(id.to_string());
-        self.facts.fragments.push(FragmentFact::new(
+        let fragment = FragmentFact::new(
             id.to_string(),
             element.to_string(),
             attribute,
             element_ordinal,
-        ));
+        );
+        self.nearest_fragment = Some(fragment.clone());
+        self.facts.fragments.push(fragment);
     }
 
     fn extract_structure(&mut self, element: &str, attrs: &ElementAttrs) -> Vec<usize> {
@@ -954,63 +922,49 @@ impl ExtractorState {
         let start = self.facts.structure.len();
         self.facts.structure.extend(facts);
         if let Some(level) = heading_level(element) {
-            self.accessibility.push(AccessibilityFact::HeadingLevel(
-                AccessibilityHeadingLevelFact {
-                    element: element.to_string(),
-                    fragment: self.nearest_fragment.clone(),
-                    level,
-                },
+            self.accessibility.push(AccessibilityFact::new(
+                element,
+                self.nearest_fragment.clone(),
+                AccessibilityObservation::HeadingLevel(level),
             ));
         }
         (start..self.facts.structure.len()).collect()
     }
 
-    fn extract_accessibility(
-        &mut self,
-        element: &str,
-        attrs: &ElementAttrs,
-        lang: Option<String>,
-        dir: Option<TextDirection>,
-    ) {
+    fn extract_accessibility(&mut self, element: &str, attrs: &ElementAttrs, origin: TextOrigin) {
         if let Some(value) = attrs.value("alt") {
             let normalized = normalize_whitespace(value);
             if normalized.is_empty() {
-                self.accessibility.push(AccessibilityFact::EmptyImageAlt(
-                    AccessibilityElementFact {
-                        element: element.to_string(),
-                        fragment: self.nearest_fragment.clone(),
-                    },
+                self.accessibility.push(AccessibilityFact::new(
+                    element,
+                    self.nearest_fragment.clone(),
+                    AccessibilityObservation::EmptyImageAlt,
                 ));
             } else {
                 if has_image_alt(element, attrs)
                     && self.text_stream_builder.in_body
                     && !self.text_suppressed()
                 {
-                    let alt = PendingAltText {
-                        text: normalized,
-                        fragment: self.nearest_fragment.clone(),
-                        lang,
-                        dir,
-                    };
-                    if self.text_blocks.is_empty() {
-                        self.emit_alt_text(alt);
-                    } else {
-                        self.pending_alt_text.push(alt);
-                    }
+                    self.facts
+                        .text_stream
+                        .supplementary
+                        .push(SupplementaryText {
+                            text: normalized,
+                            source: SupplementaryTextSource::Alternative,
+                            origin: origin.clone(),
+                        });
                 }
-                self.accessibility
-                    .push(AccessibilityFact::ImageAlt(AccessibilityValueFact {
-                        element: element.to_string(),
-                        fragment: self.nearest_fragment.clone(),
-                        value: value.to_string(),
-                    }));
+                self.accessibility.push(AccessibilityFact::new(
+                    element,
+                    self.nearest_fragment.clone(),
+                    AccessibilityObservation::ImageAlt(value.to_string()),
+                ));
             }
         } else if has_image_alt(element, attrs) {
-            self.accessibility.push(AccessibilityFact::MissingImageAlt(
-                AccessibilityElementFact {
-                    element: element.to_string(),
-                    fragment: self.nearest_fragment.clone(),
-                },
+            self.accessibility.push(AccessibilityFact::new(
+                element,
+                self.nearest_fragment.clone(),
+                AccessibilityObservation::MissingImageAlt,
             ));
         }
 
@@ -1023,30 +977,30 @@ impl ExtractorState {
             "dir",
         ] {
             if let Some(value) = attrs.value(attr) {
-                let fact = AccessibilityValueFact {
-                    element: element.to_string(),
-                    fragment: self.nearest_fragment.clone(),
-                    value: value.to_string(),
-                };
-                self.accessibility.push(match attr {
-                    "aria-label" => AccessibilityFact::AriaLabel(fact),
-                    "aria-labelledby" => AccessibilityFact::AriaLabelledBy(fact),
-                    "aria-describedby" => AccessibilityFact::AriaDescribedBy(fact),
-                    "role" => AccessibilityFact::Role(fact),
-                    "epub:type" => AccessibilityFact::EpubType(fact),
-                    "dir" => AccessibilityFact::Dir(fact),
+                let value = value.to_string();
+                let observation = match attr {
+                    "aria-label" => AccessibilityObservation::AriaLabel(value),
+                    "aria-labelledby" => AccessibilityObservation::AriaLabelledBy(value),
+                    "aria-describedby" => AccessibilityObservation::AriaDescribedBy(value),
+                    "role" => AccessibilityObservation::Role(value),
+                    "epub:type" => AccessibilityObservation::EpubType(value),
+                    "dir" => AccessibilityObservation::Dir(value),
                     _ => unreachable!(),
-                });
+                };
+                self.accessibility.push(AccessibilityFact::new(
+                    element,
+                    self.nearest_fragment.clone(),
+                    observation,
+                ));
             }
         }
 
-        if let Some(value) = attrs.value_any(&["lang", "xml:lang"]) {
-            self.accessibility
-                .push(AccessibilityFact::Lang(AccessibilityValueFact {
-                    element: element.to_string(),
-                    fragment: self.nearest_fragment.clone(),
-                    value: value.to_string(),
-                }));
+        if let Some(value) = attrs.value_any(&["xml:lang", "lang"]) {
+            self.accessibility.push(AccessibilityFact::new(
+                element,
+                self.nearest_fragment.clone(),
+                AccessibilityObservation::Lang(value.to_string()),
+            ));
         }
     }
 
@@ -1087,7 +1041,7 @@ impl ExtractorState {
             ),
             "track" => self.push_media(
                 MediaFact::Track {
-                    kind: attrs.value("kind").map(str::to_string),
+                    kind: attrs.value("kind").map(TrackKind::from_attribute),
                     srclang: attrs.value("srclang").map(str::to_string),
                     label: attrs.value("label").map(str::to_string),
                 },
@@ -1156,28 +1110,33 @@ impl ExtractorState {
         &mut self,
         attrs: &ElementAttrs,
         structure_indices: &[usize],
-        lang: Option<String>,
-        dir: Option<TextDirection>,
+        origin: TextOrigin,
     ) {
         let Some(label) = pagebreak_label(attrs) else {
             return;
         };
         for index in structure_indices {
-            if let Some(structure @ StructureFact::Pagebreak { .. }) =
-                self.facts.structure.get_mut(*index)
+            if let Some(structure) = self
+                .facts
+                .structure
+                .get_mut(*index)
+                .filter(|structure| matches!(structure.role(), StructureRole::Pagebreak))
             {
                 structure.set_label(Some(label.clone()));
             }
         }
-        let id = self.next_text_chunk_id();
-        self.facts.text.push(TextChunk {
-            id,
-            kind: TextChunkKind::PagebreakLabel,
-            content: TextChunkContent::Owned(label),
-            fragment: self.nearest_fragment.clone(),
-            lang,
-            dir,
-        });
+        self.facts
+            .text_stream
+            .supplementary
+            .push(SupplementaryText {
+                text: label,
+                source: if attrs.value("title").is_some() {
+                    SupplementaryTextSource::PagebreakTitle
+                } else {
+                    SupplementaryTextSource::PagebreakAriaLabel
+                },
+                origin,
+            });
     }
 
     fn derived_text_metadata(
@@ -1185,7 +1144,7 @@ impl ExtractorState {
         attrs: &ElementAttrs,
     ) -> (Option<String>, Option<TextDirection>) {
         let (mut lang, mut dir) = self.current_text_metadata();
-        if let Some(value) = attrs.value_any(&["lang", "xml:lang"]) {
+        if let Some(value) = attrs.value_any(&["xml:lang", "lang"]) {
             lang = Some(value.to_string());
         }
         if let Some(value) = attrs.value("dir") {
@@ -1220,10 +1179,10 @@ impl ExtractorState {
     fn parent_figure_structure_index(&self) -> Option<usize> {
         self.element_stack.iter().rev().find_map(|frame| {
             frame.structure_indices.iter().copied().find(|index| {
-                matches!(
-                    self.facts.structure.get(*index),
-                    Some(StructureFact::Figure { .. })
-                )
+                self.facts
+                    .structure
+                    .get(*index)
+                    .is_some_and(|structure| structure.role() == StructureRole::Figure)
             })
         })
     }
@@ -1231,18 +1190,86 @@ impl ExtractorState {
     fn parent_table_structure_index(&self) -> Option<usize> {
         self.element_stack.iter().rev().find_map(|frame| {
             frame.structure_indices.iter().copied().find(|index| {
-                matches!(
-                    self.facts.structure.get(*index),
-                    Some(StructureFact::Table { .. })
-                )
+                self.facts
+                    .structure
+                    .get(*index)
+                    .is_some_and(|structure| structure.role() == StructureRole::Table)
             })
         })
     }
+}
 
-    fn next_text_chunk_id(&mut self) -> String {
-        self.next_text_chunk += 1;
-        format!("t-{:06}", self.next_text_chunk)
+fn text_span_role(element: &str, attrs: &ElementAttrs) -> TextRole {
+    if let Some(level) = heading_level(element) {
+        TextRole::Heading {
+            level: HeadingLevel::new(level).expect("HTML heading level is valid"),
+        }
+    } else {
+        match element {
+            "figcaption" => TextRole::FigureCaption,
+            "caption" => TextRole::TableCaption,
+            _ if is_pagebreak(attrs) => TextRole::Pagebreak,
+            "p" | "li" | "blockquote" | "dt" | "dd" | "td" | "th" | "text" => TextRole::Body,
+            _ => TextRole::Element,
+        }
     }
+}
+
+fn document_activity(
+    element: &str,
+    in_svg: bool,
+    in_html: bool,
+    attrs: &ElementAttrs,
+) -> Vec<crate::content::DocumentActivity> {
+    use crate::content::DocumentActivity;
+    let mut activity = Vec::new();
+    let element = element.rsplit(':').next().unwrap_or(element);
+    for (name, _) in attrs.values() {
+        let name = name.rsplit(':').next().unwrap_or(name);
+        if name.eq_ignore_ascii_case("autofocus") {
+            activity.push(DocumentActivity::Autofocus);
+        }
+        if name.starts_with("on") {
+            activity.push(DocumentActivity::EventAttribute);
+        }
+    }
+    if in_html && matches!(element, "audio" | "video" | "source" | "track") {
+        activity.push(DocumentActivity::Media);
+    }
+    if in_html && matches!(element, "iframe" | "object" | "embed") {
+        activity.push(DocumentActivity::EmbeddedContent);
+    }
+    if (in_html || in_svg) && element.eq_ignore_ascii_case("script") {
+        activity.push(DocumentActivity::ScriptElement);
+    }
+    if matches!(
+        element,
+        "animate" | "animatecolor" | "animatemotion" | "animatetransform" | "discard" | "set"
+    ) {
+        activity.push(DocumentActivity::Animation);
+    }
+    if element == "meta"
+        && attrs
+            .value("http-equiv")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("refresh"))
+    {
+        activity.push(DocumentActivity::Refresh);
+    }
+    if element == "link"
+        && attrs.value("rel").is_some_and(|value| {
+            value.split_ascii_whitespace().any(|token| {
+                token.eq_ignore_ascii_case("dns-prefetch")
+                    || token.eq_ignore_ascii_case("preconnect")
+                    || token.eq_ignore_ascii_case("preload")
+                    || token.eq_ignore_ascii_case("prefetch")
+                    || token.eq_ignore_ascii_case("modulepreload")
+                    || token.eq_ignore_ascii_case("prerender")
+            })
+        })
+    {
+        activity.push(DocumentActivity::ResourceHint);
+    }
+    activity
 }
 
 fn navigation_kind(element: &str, attrs: &ElementAttrs) -> Option<NavigationLinkKind> {
@@ -1344,10 +1371,7 @@ fn heading_level(element: &str) -> Option<u8> {
 fn text_block_for_element(
     element: &str,
     attrs: &ElementAttrs,
-    in_svg: bool,
-    fragment: Option<String>,
-    lang: Option<String>,
-    dir: Option<TextDirection>,
+    fragment: Option<FragmentFact>,
     structure_indices: Vec<usize>,
 ) -> Option<TextBlock> {
     if is_pagebreak(attrs)
@@ -1358,13 +1382,10 @@ fn text_block_for_element(
             element: element.to_string(),
             fragment,
             text: String::new(),
-            lang,
-            dir,
             structure_indices,
-            stream_range: None,
         }));
     }
-    text_block_for_element_name(element, in_svg, fragment, lang, dir, structure_indices)
+    text_block_for_element_name(element, fragment, structure_indices)
 }
 
 fn preserves_native_pagebreak_content(element: &str) -> bool {
@@ -1374,69 +1395,36 @@ fn preserves_native_pagebreak_content(element: &str) -> bool {
 
 fn text_block_for_element_name(
     element: &str,
-    in_svg: bool,
-    fragment: Option<String>,
-    lang: Option<String>,
-    dir: Option<TextDirection>,
+    fragment: Option<FragmentFact>,
     structure_indices: Vec<usize>,
 ) -> Option<TextBlock> {
-    if let Some(level) = heading_level(element) {
-        return Some(TextBlock::Heading(HeadingTextBlockData {
+    if heading_level(element).is_some() {
+        return Some(TextBlock::Heading(TextBlockData {
             element: element.to_string(),
-            level,
             fragment,
             text: String::new(),
-            lang,
-            dir,
             structure_indices,
-            stream_range: None,
         }));
     }
     match element {
-        "p" | "li" | "blockquote" | "dt" | "dd" | "td" | "th" | "text" => {
-            Some(TextBlock::Body(TextBlockData {
-                element: element.to_string(),
-                fragment,
-                text: String::new(),
-                lang,
-                dir,
-                structure_indices,
-                stream_range: None,
-            }))
-        }
-        "title" | "desc" if in_svg => Some(TextBlock::Body(TextBlockData {
-            element: element.to_string(),
-            fragment,
-            text: String::new(),
-            lang,
-            dir,
-            structure_indices,
-            stream_range: None,
-        })),
         "figcaption" => Some(TextBlock::FigureCaption(TextBlockData {
             element: element.to_string(),
             fragment,
             text: String::new(),
-            lang,
-            dir,
             structure_indices,
-            stream_range: None,
         })),
         "caption" => Some(TextBlock::TableCaption(TextBlockData {
             element: element.to_string(),
             fragment,
             text: String::new(),
-            lang,
-            dir,
             structure_indices,
-            stream_range: None,
         })),
         _ => None,
     }
 }
 
 fn suppresses_text(element: &str) -> bool {
-    matches!(element, "script" | "style" | "template")
+    matches!(element, "head" | "script" | "style" | "template")
 }
 
 fn text_direction(value: &str) -> Option<TextDirection> {
@@ -1470,56 +1458,33 @@ fn pagebreak_label(attrs: &ElementAttrs) -> Option<String> {
 }
 
 fn structure_facts_for_element(
-    fragment: Option<String>,
+    fragment: Option<FragmentFact>,
     element: &str,
     attrs: &ElementAttrs,
 ) -> Vec<StructureFact> {
     let semantics = semantic_tokens(element, attrs);
-    let mut facts = Vec::new();
+    let mut roles = Vec::new();
     if let Some(level) = heading_level(element).and_then(HeadingLevel::new) {
-        facts.push(StructureFact::Heading {
-            label: None,
-            fragment: fragment.clone(),
-            level,
-            semantics: semantics.clone(),
-        });
+        roles.push(StructureRole::Heading(level));
     }
     if is_pagebreak(attrs) {
-        facts.push(StructureFact::Pagebreak {
-            label: pagebreak_label(attrs),
-            fragment: fragment.clone(),
-            semantics: semantics.clone(),
-        });
+        roles.push(StructureRole::Pagebreak);
     }
     if element == "figure" {
-        facts.push(StructureFact::Figure {
-            label: None,
-            fragment: fragment.clone(),
-            semantics: semantics.clone(),
-        });
+        roles.push(StructureRole::Figure);
     }
     if element == "table" {
-        facts.push(StructureFact::Table {
-            label: None,
-            fragment: fragment.clone(),
-            semantics: semantics.clone(),
-        });
+        roles.push(StructureRole::Table);
     }
     if has_epub_semantic(attrs, EpubStructuralSemantic::Footnote)
         || has_dpub_role(attrs, DpubAriaRole::Footnote)
     {
-        facts.push(StructureFact::Footnote {
-            fragment: fragment.clone(),
-            semantics: semantics.clone(),
-        });
+        roles.push(StructureRole::Footnote);
     }
     if has_epub_semantic(attrs, EpubStructuralSemantic::Endnote)
         || has_dpub_role(attrs, DpubAriaRole::Endnote)
     {
-        facts.push(StructureFact::Endnote {
-            fragment: fragment.clone(),
-            semantics: semantics.clone(),
-        });
+        roles.push(StructureRole::Endnote);
     }
     if has_epub_semantic(attrs, EpubStructuralSemantic::Note)
         || attrs
@@ -1528,24 +1493,23 @@ fn structure_facts_for_element(
             .flat_map(str::split_whitespace)
             .any(|role| role.eq_ignore_ascii_case("note"))
     {
-        facts.push(StructureFact::Note {
-            fragment: fragment.clone(),
-            semantics: semantics.clone(),
-        });
+        roles.push(StructureRole::Note);
     }
     if element == "nav" {
-        facts.push(StructureFact::NavigationList {
-            fragment: fragment.clone(),
-            semantics: semantics.clone(),
-        });
+        roles.push(StructureRole::NavigationList);
     }
     if publication_section(attrs) {
-        facts.push(StructureFact::PublicationSection {
-            fragment,
-            semantics,
-        });
+        roles.push(StructureRole::PublicationSection);
     }
-    facts
+    roles
+        .into_iter()
+        .map(|role| {
+            let label = (role == StructureRole::Pagebreak)
+                .then(|| pagebreak_label(attrs))
+                .flatten();
+            StructureFact::new(role, label, fragment.clone(), semantics.clone())
+        })
+        .collect()
 }
 
 fn publication_section(attrs: &ElementAttrs) -> bool {
@@ -1615,19 +1579,21 @@ fn publication_section(attrs: &ElementAttrs) -> bool {
 fn semantic_tokens(element: &str, attrs: &ElementAttrs) -> Vec<SemanticToken> {
     let mut tokens = Vec::new();
     if let Some(value) = attrs.value("epub:type") {
-        tokens.extend(value.split_whitespace().map(|raw| SemanticToken::EpubType {
-            raw: raw.to_string(),
-            semantic: EpubStructuralSemantic::from_token(raw),
-        }));
+        tokens.extend(
+            value
+                .split_whitespace()
+                .filter_map(|raw| SemanticToken::epub_type(raw).ok()),
+        );
     }
     if let Some(value) = attrs.value("role") {
-        tokens.extend(value.split_whitespace().map(|raw| SemanticToken::AriaRole {
-            raw: raw.to_string(),
-            role: DpubAriaRole::from_html_token(raw),
-        }));
+        tokens.extend(
+            value
+                .split_whitespace()
+                .filter_map(|raw| SemanticToken::aria_role(raw).ok()),
+        );
     }
     if let Some(element) = html_structural_element(element) {
-        tokens.push(SemanticToken::HtmlElement(element));
+        tokens.push(SemanticToken::HtmlElement { element });
     }
     tokens
 }
@@ -1713,10 +1679,9 @@ fn link_attributes(
         "script" if in_svg => selected_svg_href(attrs)
             .map(|attribute| vec![(attribute, LinkConstructors::SCRIPT)])
             .unwrap_or_default(),
-        "script" if is_executable_script_type(attrs.value("type")) => {
+        "script" => {
             vec![(ReferenceAttribute::Src, LinkConstructors::SCRIPT)]
         }
-        "script" => Vec::new(),
         "audio" => vec![(ReferenceAttribute::Src, LinkConstructors::AUDIO)],
         "video" => vec![
             (ReferenceAttribute::Src, LinkConstructors::VIDEO),

@@ -1,6 +1,6 @@
 use super::{
     AccessibilityCertifierReport, AccessibilityClaim, AccessibilityConformance,
-    AccessibilityMetadata, AccessibilityMetadataKind, AccessibilityMetadataValue,
+    AccessibilityMetadata, AccessibilityMetadataValue, AccessibilityProperty,
     EpubAccessibilityVersion, PageBreakSourceTerm, WcagLevel, WcagVersion,
 };
 use crate::analysis::reference::ReferenceSlot;
@@ -17,7 +17,7 @@ pub(super) fn collect_metadata(
             continue;
         };
         let property = resolve_accessibility_property(package, property);
-        if property == Some(AccessibilityProperty::ConformsTo) {
+        if property == Some(AccessibilityMetadataTerm::ConformsTo) {
             claims.push(AccessibilityClaim {
                 conformance: meta
                     .content()
@@ -26,11 +26,11 @@ pub(super) fn collect_metadata(
             });
             continue;
         }
-        let Some(kind) = property.and_then(AccessibilityProperty::metadata_kind) else {
+        let Some(property) = property.and_then(AccessibilityMetadataTerm::property) else {
             continue;
         };
         metadata.values.push(AccessibilityMetadataValue {
-            kind,
+            property,
             authored: meta.clone(),
         });
     }
@@ -42,7 +42,7 @@ pub(super) fn collect_metadata(
         .filter(|(_, link)| {
             link.rel().is_some_and(|rel| {
                 resolve_accessibility_property(package, rel.as_str())
-                    == Some(AccessibilityProperty::CertifierReport)
+                    == Some(AccessibilityMetadataTerm::CertifierReport)
             })
         })
         .map(|(index, authored)| AccessibilityCertifierReport {
@@ -54,7 +54,7 @@ pub(super) fn collect_metadata(
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum AccessibilityProperty {
+enum AccessibilityMetadataTerm {
     AccessMode,
     AccessModeSufficient,
     Feature,
@@ -69,22 +69,22 @@ enum AccessibilityProperty {
     ConformsTo,
 }
 
-impl AccessibilityProperty {
-    fn metadata_kind(self) -> Option<AccessibilityMetadataKind> {
+impl AccessibilityMetadataTerm {
+    fn property(self) -> Option<AccessibilityProperty> {
         Some(match self {
-            Self::AccessMode => AccessibilityMetadataKind::AccessMode,
-            Self::AccessModeSufficient => AccessibilityMetadataKind::AccessModeSufficient,
-            Self::Feature => AccessibilityMetadataKind::Feature,
-            Self::Hazard => AccessibilityMetadataKind::Hazard,
-            Self::Summary => AccessibilityMetadataKind::Summary,
-            Self::ContactEmail => AccessibilityMetadataKind::ContactEmail,
-            Self::CertifiedBy => AccessibilityMetadataKind::CertifiedBy,
-            Self::CertifierCredential => AccessibilityMetadataKind::CertifierCredential,
+            Self::AccessMode => AccessibilityProperty::AccessMode,
+            Self::AccessModeSufficient => AccessibilityProperty::AccessModeSufficient,
+            Self::Feature => AccessibilityProperty::Feature,
+            Self::Hazard => AccessibilityProperty::Hazard,
+            Self::Summary => AccessibilityProperty::Summary,
+            Self::ContactEmail => AccessibilityProperty::ContactEmail,
+            Self::CertifiedBy => AccessibilityProperty::CertifiedBy,
+            Self::CertifierCredential => AccessibilityProperty::CertifierCredential,
             Self::PageBreakSource => {
-                AccessibilityMetadataKind::PageBreakSource(PageBreakSourceTerm::Current)
+                AccessibilityProperty::PageBreakSource(PageBreakSourceTerm::Current)
             }
             Self::LegacyPageSource => {
-                AccessibilityMetadataKind::PageBreakSource(PageBreakSourceTerm::LegacyPageSource)
+                AccessibilityProperty::PageBreakSource(PageBreakSourceTerm::LegacyPageSource)
             }
             Self::CertifierReport | Self::ConformsTo => return None,
         })
@@ -94,7 +94,7 @@ impl AccessibilityProperty {
 fn resolve_accessibility_property(
     package: &Package,
     property: &str,
-) -> Option<AccessibilityProperty> {
+) -> Option<AccessibilityMetadataTerm> {
     let (prefix, local) = property.split_once(':').unwrap_or(("", property));
     let vocabulary = match prefix {
         "schema" => Some("schema"),
@@ -106,20 +106,22 @@ fn resolve_accessibility_property(
             .and_then(|prefixes| vocabulary_for_prefix(prefixes.as_str(), custom)),
     };
     match (vocabulary, local) {
-        (Some("schema"), "accessMode") => Some(AccessibilityProperty::AccessMode),
+        (Some("schema"), "accessMode") => Some(AccessibilityMetadataTerm::AccessMode),
         (Some("schema"), "accessModeSufficient") => {
-            Some(AccessibilityProperty::AccessModeSufficient)
+            Some(AccessibilityMetadataTerm::AccessModeSufficient)
         }
-        (Some("schema"), "accessibilityFeature") => Some(AccessibilityProperty::Feature),
-        (Some("schema"), "accessibilityHazard") => Some(AccessibilityProperty::Hazard),
-        (Some("schema"), "accessibilitySummary") => Some(AccessibilityProperty::Summary),
-        (Some("a11y"), "contactEmail") => Some(AccessibilityProperty::ContactEmail),
-        (Some("a11y"), "certifiedBy") => Some(AccessibilityProperty::CertifiedBy),
-        (Some("a11y"), "certifierCredential") => Some(AccessibilityProperty::CertifierCredential),
-        (Some("a11y"), "certifierReport") => Some(AccessibilityProperty::CertifierReport),
-        (None, "pageBreakSource") => Some(AccessibilityProperty::PageBreakSource),
-        (None, "page-source") => Some(AccessibilityProperty::LegacyPageSource),
-        (Some("dcterms"), "conformsTo") => Some(AccessibilityProperty::ConformsTo),
+        (Some("schema"), "accessibilityFeature") => Some(AccessibilityMetadataTerm::Feature),
+        (Some("schema"), "accessibilityHazard") => Some(AccessibilityMetadataTerm::Hazard),
+        (Some("schema"), "accessibilitySummary") => Some(AccessibilityMetadataTerm::Summary),
+        (Some("a11y"), "contactEmail") => Some(AccessibilityMetadataTerm::ContactEmail),
+        (Some("a11y"), "certifiedBy") => Some(AccessibilityMetadataTerm::CertifiedBy),
+        (Some("a11y"), "certifierCredential") => {
+            Some(AccessibilityMetadataTerm::CertifierCredential)
+        }
+        (Some("a11y"), "certifierReport") => Some(AccessibilityMetadataTerm::CertifierReport),
+        (None, "pageBreakSource") => Some(AccessibilityMetadataTerm::PageBreakSource),
+        (None, "page-source") => Some(AccessibilityMetadataTerm::LegacyPageSource),
+        (Some("dcterms"), "conformsTo") => Some(AccessibilityMetadataTerm::ConformsTo),
         _ => None,
     }
 }
@@ -183,14 +185,14 @@ mod tests {
     #[test]
     fn recognizes_current_and_legacy_page_break_source_terms() {
         assert_eq!(
-            AccessibilityProperty::PageBreakSource.metadata_kind(),
-            Some(AccessibilityMetadataKind::PageBreakSource(
+            AccessibilityMetadataTerm::PageBreakSource.property(),
+            Some(AccessibilityProperty::PageBreakSource(
                 PageBreakSourceTerm::Current
             ))
         );
         assert_eq!(
-            AccessibilityProperty::LegacyPageSource.metadata_kind(),
-            Some(AccessibilityMetadataKind::PageBreakSource(
+            AccessibilityMetadataTerm::LegacyPageSource.property(),
+            Some(AccessibilityProperty::PageBreakSource(
                 PageBreakSourceTerm::LegacyPageSource
             ))
         );
@@ -226,6 +228,38 @@ mod tests {
     }
 
     #[test]
+    fn access_mode_tokens_keep_unrecognized_authored_spellings() {
+        let package = Package::parse(
+            r#"<package xmlns="http://www.idpf.org/2007/opf">
+                <metadata>
+                    <meta property="schema:accessModeSufficient">textual unknownMode</meta>
+                </metadata>
+            </package>"#,
+        )
+        .unwrap();
+
+        let (metadata, _) = collect_metadata(&package, &[None, None]);
+        let tokens = metadata
+            .values_of(AccessibilityProperty::AccessModeSufficient)
+            .next()
+            .map(|value| {
+                value
+                    .access_modes()
+                    .map(|token| (token.as_str().to_string(), token.known_value()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap();
+
+        assert_eq!(
+            tokens,
+            [
+                ("textual".to_string(), Some(AccessMode::Textual)),
+                ("unknownMode".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
     fn resolves_custom_accessibility_vocab_prefixes_case_sensitively() {
         let package = Package::parse(
             r#"<package xmlns="http://www.idpf.org/2007/opf" prefix="s: https://schema.org/ d: http://purl.org/dc/terms/ ax: http://www.idpf.org/epub/vocab/package/a11y/#">
@@ -247,21 +281,26 @@ mod tests {
         assert_eq!(metadata.values().count(), 3);
         assert_eq!(
             metadata
-                .values_of(AccessibilityMetadataKind::Feature)
+                .values_of(AccessibilityProperty::Feature)
                 .next()
                 .and_then(AccessibilityMetadataValue::feature),
             Some(AccessibilityFeature::AlternativeText)
         );
         assert_eq!(
             metadata
-                .values_of(AccessibilityMetadataKind::AccessModeSufficient)
+                .values_of(AccessibilityProperty::AccessModeSufficient)
                 .next()
-                .and_then(AccessibilityMetadataValue::access_modes),
-            Some(vec![AccessMode::Textual, AccessMode::Visual])
+                .map(|value| {
+                    value
+                        .access_modes()
+                        .map(|token| token.known_value())
+                        .collect::<Vec<_>>()
+                }),
+            Some(vec![Some(AccessMode::Textual), Some(AccessMode::Visual)])
         );
         assert_eq!(
             metadata
-                .values_of(AccessibilityMetadataKind::Hazard)
+                .values_of(AccessibilityProperty::Hazard)
                 .next()
                 .and_then(AccessibilityMetadataValue::hazard),
             Some(AccessibilityHazard::NoFlashingHazard)

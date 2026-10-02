@@ -1,126 +1,148 @@
 //! Inspect and edit Dublin Core and OPF metadata.
 //!
 //! [`Metadata`] groups supported Dublin Core elements, EPUB 3 [`Meta`] and
-//! [`MetadataLink`](crate::package::metadata::MetadataLink) nodes, and EPUB 2 metadata. Use
-//! [`MetadataElement`](crate::package::metadata::MetadataElement) when code needs to handle
-//! Dublin Core kinds uniformly. Property and relationship token types retain their authored
-//! spelling after [`EpubString`] trims surrounding Unicode whitespace, while exposing recognized
-//! vocabulary values separately.
+//! [`MetadataLink`] nodes, and EPUB 2 metadata. Dublin
+//! Core elements are keyed by [`DcElement`], so code can handle every kind uniformly. Property
+//! and relationship token types retain their authored spelling after [`EpubString`] trims
+//! surrounding Unicode whitespace, while exposing recognized vocabulary values separately.
+//!
+//! Read the book's title and other metadata.
+//!
+//! ```
+//! use epub_stack::{
+//!     EpubZip,
+//!     package::{
+//!         RenditionLayout,
+//!         metadata::{DcElement, Meta},
+//!     },
+//! };
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let book = EpubZip::open("fixtures/real/alice-in-wonderland.epub")?.default_rendition()?;
+//! let metadata = book.package().metadata();
+//!
+//! for title in metadata
+//!     .elements(DcElement::Title)
+//!     .iter()
+//!     .filter_map(|title| title.content())
+//! {
+//!     println!("Title: {title}");
+//! }
+//!
+//! let layout = metadata
+//!     .meta()
+//!     .iter()
+//!     .filter(|meta| meta.refines().is_none())
+//!     .find_map(Meta::rendition_layout);
+//!
+//! match layout {
+//!     Some(RenditionLayout::Reflowable) => println!("Reflowable content"),
+//!     Some(RenditionLayout::PrePaginated) => println!("Fixed-layout pages"),
+//!     Some(RenditionLayout::Roll) => println!("Continuous fixed-layout content"),
+//!     None => println!("No recognized layout declared"),
+//! }
+//! # Ok(())
+//! # }
+//! ```
 
 use super::legacy::Opf2Meta;
 use super::{
-    CONTRIBUTOR, COVERAGE, CREATOR, DATE, DESCRIPTION, FORMAT, IDENTIFIER, LANGUAGE, LINK, META,
-    PUBLISHER, PackageError, RELATION, RIGHTS, RenditionFlow, RenditionLayout,
+    CONTRIBUTOR, COVERAGE, CREATOR, DATE, DESCRIPTION, FORMAT, IDENTIFIER, LANGUAGE,
+    MetadataCollection, PUBLISHER, PackageError, RELATION, RIGHTS, RenditionFlow, RenditionLayout,
     RenditionOrientation, RenditionSpread, RenditionViewport, Result, SOURCE, SUBJECT, TITLE, TYPE,
-    required_package_string,
 };
 use crate::resource::{AuthoredHref, EpubHref};
 use crate::semantics::TextDirection;
-use crate::string::{EpubString, EpubStringEmpty};
+use crate::string::EpubString;
 use std::str::FromStr;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-/// An owned supported Dublin Core element tagged with its OPF local name.
-pub enum MetadataElement {
-    /// A `dc:identifier` element.
-    Identifier(Element),
-    /// A `dc:title` element.
-    Title(Element),
-    /// A `dc:language` element.
-    Language(Element),
-    /// A `dc:contributor` element.
-    Contributor(Element),
-    /// A `dc:coverage` element.
-    Coverage(Element),
-    /// A `dc:creator` element.
-    Creator(Element),
-    /// A `dc:date` element.
-    Date(Element),
-    /// A `dc:description` element.
-    Description(Element),
-    /// A `dc:format` element.
-    Format(Element),
-    /// A `dc:publisher` element.
-    Publisher(Element),
-    /// A `dc:relation` element.
-    Relation(Element),
-    /// A `dc:rights` element.
-    Rights(Element),
-    /// A `dc:source` element.
-    Source(Element),
-    /// A `dc:subject` element.
-    Subject(Element),
-    /// A `dc:type` element.
-    Type(Element),
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "kebab-case")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+/// A supported Dublin Core metadata element.
+pub enum DcElement {
+    /// `dc:identifier`.
+    Identifier,
+    /// `dc:title`.
+    Title,
+    /// `dc:language`.
+    Language,
+    /// `dc:contributor`.
+    Contributor,
+    /// `dc:coverage`.
+    Coverage,
+    /// `dc:creator`.
+    Creator,
+    /// `dc:date`.
+    Date,
+    /// `dc:description`.
+    Description,
+    /// `dc:format`.
+    Format,
+    /// `dc:publisher`.
+    Publisher,
+    /// `dc:relation`.
+    Relation,
+    /// `dc:rights`.
+    Rights,
+    /// `dc:source`.
+    Source,
+    /// `dc:subject`.
+    Subject,
+    /// `dc:type`.
+    Type,
 }
 
-impl MetadataElement {
-    /// Returns the static Dublin Core local name associated with this variant.
-    pub fn local_name(&self) -> &'static str {
+impl DcElement {
+    /// Every supported element in OPF serialization order.
+    pub const ALL: [Self; 15] = [
+        Self::Title,
+        Self::Language,
+        Self::Identifier,
+        Self::Creator,
+        Self::Contributor,
+        Self::Publisher,
+        Self::Description,
+        Self::Subject,
+        Self::Rights,
+        Self::Date,
+        Self::Format,
+        Self::Type,
+        Self::Source,
+        Self::Relation,
+        Self::Coverage,
+    ];
+
+    /// Returns the Dublin Core local name.
+    pub fn local_name(self) -> &'static str {
         match self {
-            Self::Identifier(_) => IDENTIFIER,
-            Self::Title(_) => TITLE,
-            Self::Language(_) => LANGUAGE,
-            Self::Contributor(_) => CONTRIBUTOR,
-            Self::Coverage(_) => COVERAGE,
-            Self::Creator(_) => CREATOR,
-            Self::Date(_) => DATE,
-            Self::Description(_) => DESCRIPTION,
-            Self::Format(_) => FORMAT,
-            Self::Publisher(_) => PUBLISHER,
-            Self::Relation(_) => RELATION,
-            Self::Rights(_) => RIGHTS,
-            Self::Source(_) => SOURCE,
-            Self::Subject(_) => SUBJECT,
-            Self::Type(_) => TYPE,
+            Self::Identifier => IDENTIFIER,
+            Self::Title => TITLE,
+            Self::Language => LANGUAGE,
+            Self::Contributor => CONTRIBUTOR,
+            Self::Coverage => COVERAGE,
+            Self::Creator => CREATOR,
+            Self::Date => DATE,
+            Self::Description => DESCRIPTION,
+            Self::Format => FORMAT,
+            Self::Publisher => PUBLISHER,
+            Self::Relation => RELATION,
+            Self::Rights => RIGHTS,
+            Self::Source => SOURCE,
+            Self::Subject => SUBJECT,
+            Self::Type => TYPE,
         }
     }
 
-    /// Borrows the element payload regardless of its local-name variant.
-    pub fn element(&self) -> &Element {
-        match self {
-            Self::Identifier(element)
-            | Self::Title(element)
-            | Self::Language(element)
-            | Self::Contributor(element)
-            | Self::Coverage(element)
-            | Self::Creator(element)
-            | Self::Date(element)
-            | Self::Description(element)
-            | Self::Format(element)
-            | Self::Publisher(element)
-            | Self::Relation(element)
-            | Self::Rights(element)
-            | Self::Source(element)
-            | Self::Subject(element)
-            | Self::Type(element) => element,
-        }
-    }
-
-    /// Wraps `element` in the variant for a supported Dublin Core local name.
-    ///
-    /// Unknown names return `None`, dropping the supplied `element`. Check the local name first
-    /// if the caller needs to keep the element on failure. Matching is case-sensitive and does
-    /// not inspect namespaces.
-    pub fn from_local_name(local_name: &str, element: Element) -> Option<Self> {
-        match local_name {
-            IDENTIFIER => Some(Self::Identifier(element)),
-            TITLE => Some(Self::Title(element)),
-            LANGUAGE => Some(Self::Language(element)),
-            CONTRIBUTOR => Some(Self::Contributor(element)),
-            COVERAGE => Some(Self::Coverage(element)),
-            CREATOR => Some(Self::Creator(element)),
-            DATE => Some(Self::Date(element)),
-            DESCRIPTION => Some(Self::Description(element)),
-            FORMAT => Some(Self::Format(element)),
-            PUBLISHER => Some(Self::Publisher(element)),
-            RELATION => Some(Self::Relation(element)),
-            RIGHTS => Some(Self::Rights(element)),
-            SOURCE => Some(Self::Source(element)),
-            SUBJECT => Some(Self::Subject(element)),
-            TYPE => Some(Self::Type(element)),
-            _ => None,
-        }
+    /// Returns the element for a case-sensitive Dublin Core local name.
+    pub fn from_local_name(local_name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|element| element.local_name() == local_name)
     }
 }
 
@@ -135,15 +157,20 @@ macro_rules! vec_getter {
 
 macro_rules! vec_adder {
     ($field:ident, $method:ident, $ty:ty) => {
-        #[doc = concat!("Appends a node to the `", stringify!($field), "` collection.")]
-        pub fn $method(&mut self, value: $ty) {
+        pub(crate) fn $method(&mut self, value: $ty) {
             self.$field.push(value);
         }
     };
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
-/// Owned modeled contents of an OPF `metadata` block.
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+/// The modeled contents of an OPF `metadata` block.
 ///
 /// Each node kind preserves its own source order, but interleaving between kinds, unknown XML,
 /// comments, and lexical formatting are not retained. Authored href and vocabulary token
@@ -172,10 +199,10 @@ pub struct Metadata {
 /// An authored package metadata node carrying an `id`.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum MetadataIdTarget<'a> {
-    /// A Dublin Core element and its static local name.
+    /// A Dublin Core element and the kind it was modeled under.
     Element {
-        /// The Dublin Core local name.
-        local_name: &'static str,
+        /// The Dublin Core element kind.
+        kind: DcElement,
         /// The borrowed element carrying the ID.
         element: &'a Element,
     },
@@ -208,40 +235,10 @@ pub enum MetadataIdLookup<'a> {
 }
 
 impl Metadata {
-    vec_getter!(identifier, Element);
-    vec_getter!(title, Element);
-    vec_getter!(language, Element);
-    vec_getter!(contributor, Element);
-    vec_getter!(coverage, Element);
-    vec_getter!(creator, Element);
-    vec_getter!(date, Element);
-    vec_getter!(description, Element);
-    vec_getter!(format, Element);
-    vec_getter!(publisher, Element);
-    vec_getter!(relation, Element);
-    vec_getter!(rights, Element);
-    vec_getter!(source, Element);
-    vec_getter!(subject, Element);
-    vec_getter!(dc_type, Element);
     vec_getter!(meta, Meta);
     vec_getter!(opf2meta, Opf2Meta);
     vec_getter!(link, MetadataLink);
 
-    vec_adder!(identifier, add_identifier, Element);
-    vec_adder!(title, add_title, Element);
-    vec_adder!(language, add_language, Element);
-    vec_adder!(contributor, add_contributor, Element);
-    vec_adder!(coverage, add_coverage, Element);
-    vec_adder!(creator, add_creator, Element);
-    vec_adder!(date, add_date, Element);
-    vec_adder!(description, add_description, Element);
-    vec_adder!(format, add_format, Element);
-    vec_adder!(publisher, add_publisher, Element);
-    vec_adder!(relation, add_relation, Element);
-    vec_adder!(rights, add_rights, Element);
-    vec_adder!(source, add_source, Element);
-    vec_adder!(subject, add_subject, Element);
-    vec_adder!(dc_type, add_dc_type, Element);
     vec_adder!(meta, add_meta, Meta);
     vec_adder!(opf2meta, add_opf2meta, Opf2Meta);
     vec_adder!(link, add_link, MetadataLink);
@@ -254,31 +251,10 @@ impl Metadata {
         id: impl AsRef<str>,
     ) -> impl Iterator<Item = MetadataIdTarget<'_>> + '_ {
         let id = id.as_ref().to_owned();
-        let elements = [
-            (IDENTIFIER, self.identifier()),
-            (TITLE, self.title()),
-            (LANGUAGE, self.language()),
-            (CONTRIBUTOR, self.contributor()),
-            (COVERAGE, self.coverage()),
-            (CREATOR, self.creator()),
-            (DATE, self.date()),
-            (DESCRIPTION, self.description()),
-            (FORMAT, self.format()),
-            (PUBLISHER, self.publisher()),
-            (RELATION, self.relation()),
-            (RIGHTS, self.rights()),
-            (SOURCE, self.source()),
-            (SUBJECT, self.subject()),
-            (TYPE, self.dc_type()),
-        ]
-        .into_iter()
-        .flat_map(|(local_name, elements)| {
-            elements
+        let elements = DcElement::ALL.into_iter().flat_map(move |kind| {
+            self.elements(kind)
                 .iter()
-                .map(move |element| MetadataIdTarget::Element {
-                    local_name,
-                    element,
-                })
+                .map(move |element| MetadataIdTarget::Element { kind, element })
         });
         elements
             .chain(self.meta().iter().map(MetadataIdTarget::Meta))
@@ -333,59 +309,10 @@ impl Metadata {
         self.link.append(&mut other.link);
     }
 
-    /// Returns the first unrefined recognized `rendition:layout` value.
-    ///
-    /// Property matching and value parsing are ASCII case-insensitive; the stored meta token and
-    /// content remain unchanged.
-    pub fn rendition_layout(&self) -> Option<RenditionLayout> {
-        self.meta()
-            .iter()
-            .filter(|meta| meta.refines().is_none())
-            .find_map(Meta::rendition_layout)
-    }
-
-    /// Returns the first unrefined recognized historical `rendition:flow` value.
-    ///
-    /// No default or runtime flow policy is inferred.
-    pub fn rendition_flow(&self) -> Option<RenditionFlow> {
-        self.meta()
-            .iter()
-            .filter(|meta| meta.refines().is_none())
-            .find_map(Meta::rendition_flow)
-    }
-
-    /// Returns the first unrefined recognized historical `rendition:orientation` value.
-    ///
-    /// No default or runtime orientation policy is inferred.
-    pub fn rendition_orientation(&self) -> Option<RenditionOrientation> {
-        self.meta()
-            .iter()
-            .filter(|meta| meta.refines().is_none())
-            .find_map(Meta::rendition_orientation)
-    }
-
-    /// Returns the first unrefined recognized historical `rendition:spread` value.
-    ///
-    /// No default or runtime spread policy is inferred.
-    pub fn rendition_spread(&self) -> Option<RenditionSpread> {
-        self.meta()
-            .iter()
-            .filter(|meta| meta.refines().is_none())
-            .find_map(Meta::rendition_spread)
-    }
-
-    /// Returns the first unrefined recognized deprecated `rendition:viewport` value.
-    pub fn rendition_viewport(&self) -> Option<RenditionViewport> {
-        self.meta()
-            .iter()
-            .filter(|meta| meta.refines().is_none())
-            .find_map(Meta::rendition_viewport)
-    }
-
     /// Borrows the first EPUB 2 cover manifest ID from modeled `meta` pairs.
     ///
     /// Name matching is ASCII case-insensitive.
-    pub fn opf2_cover_id(&self) -> Option<&EpubString> {
+    pub fn opf2_cover_id(&self) -> Option<&str> {
         self.opf2meta.iter().find_map(|meta| {
             meta.name()
                 .is_some_and(|name| name.eq_ignore_ascii_case("cover"))
@@ -395,42 +322,41 @@ impl Metadata {
     }
 
     /// Appends an owned Dublin Core element to its variant-specific collection.
-    pub fn add_element(&mut self, element: MetadataElement) {
+    pub(crate) fn add_element(&mut self, kind: DcElement, element: Element) {
+        self.elements_mut(kind).push(element);
+    }
+
+    /// Returns the modeled elements of one Dublin Core kind in source order.
+    pub fn elements(&self, element: DcElement) -> &[Element] {
         match element {
-            MetadataElement::Identifier(element) => self.add_identifier(element),
-            MetadataElement::Title(element) => self.add_title(element),
-            MetadataElement::Language(element) => self.add_language(element),
-            MetadataElement::Contributor(element) => self.add_contributor(element),
-            MetadataElement::Coverage(element) => self.add_coverage(element),
-            MetadataElement::Creator(element) => self.add_creator(element),
-            MetadataElement::Date(element) => self.add_date(element),
-            MetadataElement::Description(element) => self.add_description(element),
-            MetadataElement::Format(element) => self.add_format(element),
-            MetadataElement::Publisher(element) => self.add_publisher(element),
-            MetadataElement::Relation(element) => self.add_relation(element),
-            MetadataElement::Rights(element) => self.add_rights(element),
-            MetadataElement::Source(element) => self.add_source(element),
-            MetadataElement::Subject(element) => self.add_subject(element),
-            MetadataElement::Type(element) => self.add_dc_type(element),
+            DcElement::Identifier => &self.identifier,
+            DcElement::Title => &self.title,
+            DcElement::Language => &self.language,
+            DcElement::Contributor => &self.contributor,
+            DcElement::Coverage => &self.coverage,
+            DcElement::Creator => &self.creator,
+            DcElement::Date => &self.date,
+            DcElement::Description => &self.description,
+            DcElement::Format => &self.format,
+            DcElement::Publisher => &self.publisher,
+            DcElement::Relation => &self.relation,
+            DcElement::Rights => &self.rights,
+            DcElement::Source => &self.source,
+            DcElement::Subject => &self.subject,
+            DcElement::Type => &self.dc_type,
         }
     }
 
-    /// Removes a Dublin Core element by local name and kind-relative index.
+    /// Removes a Dublin Core element by kind-relative index.
     ///
     /// # Errors
     ///
-    /// Returns [`PackageError::MetadataIndexMissing`] for an unsupported local name or
-    /// out-of-range index. Failure is atomic; removal shifts later same-kind elements.
-    pub fn remove_element_at(&mut self, local_name: &str, index: usize) -> Result<()> {
-        let elements =
-            self.elements_mut(local_name)
-                .ok_or_else(|| PackageError::MetadataIndexMissing {
-                    kind: local_name.to_string(),
-                    index,
-                })?;
+    /// Returns [`PackageError::MetadataIndexMissing`] without mutation when out of range.
+    pub(crate) fn remove_element_at(&mut self, element: DcElement, index: usize) -> Result<()> {
+        let elements = self.elements_mut(element);
         if index >= elements.len() {
             return Err(PackageError::MetadataIndexMissing {
-                kind: local_name.to_string(),
+                collection: MetadataCollection::Element(element),
                 index,
             });
         }
@@ -438,38 +364,25 @@ impl Metadata {
         Ok(())
     }
 
-    /// Replaces a Dublin Core element in place by local name and kind-relative index.
+    /// Replaces a Dublin Core element in place by kind-relative index.
     ///
     /// # Errors
     ///
-    /// Returns [`PackageError::MetadataKindMismatch`] when the variant differs, or
-    /// [`PackageError::MetadataIndexMissing`] for an unsupported name or index. Failure is
-    /// atomic; the replacement is cloned from the consumed wrapper.
-    pub fn replace_element_at(
+    /// Returns [`PackageError::MetadataIndexMissing`] without mutation when out of range.
+    pub(crate) fn replace_element_at(
         &mut self,
-        local_name: &str,
+        element: DcElement,
         index: usize,
-        element: MetadataElement,
+        value: Element,
     ) -> Result<()> {
-        if element.local_name() != local_name {
-            return Err(PackageError::MetadataKindMismatch {
-                target: local_name.to_string(),
-                replacement: element.local_name().to_string(),
-            });
-        }
-        let elements =
-            self.elements_mut(local_name)
-                .ok_or_else(|| PackageError::MetadataIndexMissing {
-                    kind: local_name.to_string(),
-                    index,
-                })?;
-        if index >= elements.len() {
+        let elements = self.elements_mut(element);
+        let Some(slot) = elements.get_mut(index) else {
             return Err(PackageError::MetadataIndexMissing {
-                kind: local_name.to_string(),
+                collection: MetadataCollection::Element(element),
                 index,
             });
-        }
-        elements[index] = element.element().clone();
+        };
+        *slot = value;
         Ok(())
     }
 
@@ -478,10 +391,10 @@ impl Metadata {
     /// # Errors
     ///
     /// Returns [`PackageError::MetadataIndexMissing`] without mutation when out of range.
-    pub fn remove_meta_at(&mut self, index: usize) -> Result<()> {
+    pub(crate) fn remove_meta_at(&mut self, index: usize) -> Result<()> {
         if index >= self.meta.len() {
             return Err(PackageError::MetadataIndexMissing {
-                kind: META.to_string(),
+                collection: MetadataCollection::Meta,
                 index,
             });
         }
@@ -494,10 +407,10 @@ impl Metadata {
     /// # Errors
     ///
     /// Returns [`PackageError::MetadataIndexMissing`] without mutation when out of range.
-    pub fn replace_meta_at(&mut self, index: usize, meta: Meta) -> Result<()> {
+    pub(crate) fn replace_meta_at(&mut self, index: usize, meta: Meta) -> Result<()> {
         if index >= self.meta.len() {
             return Err(PackageError::MetadataIndexMissing {
-                kind: META.to_string(),
+                collection: MetadataCollection::Meta,
                 index,
             });
         }
@@ -510,10 +423,10 @@ impl Metadata {
     /// # Errors
     ///
     /// Returns [`PackageError::MetadataIndexMissing`] without mutation when out of range.
-    pub fn remove_link_at(&mut self, index: usize) -> Result<()> {
+    pub(crate) fn remove_link_at(&mut self, index: usize) -> Result<()> {
         if index >= self.link.len() {
             return Err(PackageError::MetadataIndexMissing {
-                kind: LINK.to_string(),
+                collection: MetadataCollection::Link,
                 index,
             });
         }
@@ -526,10 +439,10 @@ impl Metadata {
     /// # Errors
     ///
     /// Returns [`PackageError::MetadataIndexMissing`] without mutation when out of range.
-    pub fn replace_link_at(&mut self, index: usize, link: MetadataLink) -> Result<()> {
+    pub(crate) fn replace_link_at(&mut self, index: usize, link: MetadataLink) -> Result<()> {
         if index >= self.link.len() {
             return Err(PackageError::MetadataIndexMissing {
-                kind: LINK.to_string(),
+                collection: MetadataCollection::Link,
                 index,
             });
         }
@@ -537,63 +450,24 @@ impl Metadata {
         Ok(())
     }
 
-    fn elements_mut(&mut self, local_name: &str) -> Option<&mut Vec<Element>> {
-        match local_name {
-            IDENTIFIER => Some(&mut self.identifier),
-            TITLE => Some(&mut self.title),
-            LANGUAGE => Some(&mut self.language),
-            CONTRIBUTOR => Some(&mut self.contributor),
-            COVERAGE => Some(&mut self.coverage),
-            CREATOR => Some(&mut self.creator),
-            DATE => Some(&mut self.date),
-            DESCRIPTION => Some(&mut self.description),
-            FORMAT => Some(&mut self.format),
-            PUBLISHER => Some(&mut self.publisher),
-            RELATION => Some(&mut self.relation),
-            RIGHTS => Some(&mut self.rights),
-            SOURCE => Some(&mut self.source),
-            SUBJECT => Some(&mut self.subject),
-            TYPE => Some(&mut self.dc_type),
-            _ => None,
+    fn elements_mut(&mut self, element: DcElement) -> &mut Vec<Element> {
+        match element {
+            DcElement::Identifier => &mut self.identifier,
+            DcElement::Title => &mut self.title,
+            DcElement::Language => &mut self.language,
+            DcElement::Contributor => &mut self.contributor,
+            DcElement::Coverage => &mut self.coverage,
+            DcElement::Creator => &mut self.creator,
+            DcElement::Date => &mut self.date,
+            DcElement::Description => &mut self.description,
+            DcElement::Format => &mut self.format,
+            DcElement::Publisher => &mut self.publisher,
+            DcElement::Relation => &mut self.relation,
+            DcElement::Rights => &mut self.rights,
+            DcElement::Source => &mut self.source,
+            DcElement::Subject => &mut self.subject,
+            DcElement::Type => &mut self.dc_type,
         }
-    }
-
-    /// Creates owned metadata containing one title, identifier, and language.
-    ///
-    /// Leading and trailing Unicode whitespace is removed from every input. The remaining text
-    /// is stored without identifier or language-tag normalization.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PackageError::EmptyField`] if any required input is empty or whitespace-only.
-    pub fn new_minimal(
-        title: impl AsRef<str>,
-        identifier: impl AsRef<str>,
-        language: impl AsRef<str>,
-    ) -> Result<Self> {
-        let title = Element::new(required_package_string(title, "title")?);
-        let identifier = Element::new(required_package_string(identifier, "identifier")?);
-        let language = Element::new(required_package_string(language, "language")?);
-        Ok(Self {
-            identifier: vec![identifier],
-            title: vec![title],
-            language: vec![language],
-            contributor: Vec::new(),
-            coverage: Vec::new(),
-            creator: Vec::new(),
-            date: Vec::new(),
-            description: Vec::new(),
-            format: Vec::new(),
-            publisher: Vec::new(),
-            relation: Vec::new(),
-            rights: Vec::new(),
-            source: Vec::new(),
-            subject: Vec::new(),
-            dc_type: Vec::new(),
-            meta: Vec::new(),
-            opf2meta: Vec::new(),
-            link: Vec::new(),
-        })
     }
 
     pub(crate) fn empty() -> Self {
@@ -621,7 +495,13 @@ impl Metadata {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash, bon::Builder)]
-/// An owned Dublin Core metadata element shared by supported DC local names.
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+/// A Dublin Core metadata element.
 ///
 /// Parsed instances may have no content and preserve modeled EPUB 2 OPF attributes. Unknown
 /// attributes, child markup, and source formatting are not retained.
@@ -701,7 +581,13 @@ impl Element {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash, bon::Builder)]
-/// An owned EPUB 3 property-based `meta` element.
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+/// An EPUB 3 property-based `meta` element.
 ///
 /// Property tokens preserve authored spelling and an optional known projection. Parsed nodes
 /// may omit fields required by the EPUB specification; unknown XML is not retained.
@@ -848,6 +734,12 @@ impl Meta {
 #[derive(
     Debug, PartialEq, Eq, Clone, Copy, strum_macros::Display, strum_macros::EnumString, Hash,
 )]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "kebab-case")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[strum(serialize_all = "kebab-case", ascii_case_insensitive)]
 /// Recognized EPUB metadata property vocabulary terms.
 pub enum KnownMetaProperty {
@@ -875,24 +767,30 @@ pub enum KnownMetaProperty {
         serialize = "rendition:align-x-center",
         to_string = "rendition:align-x-center"
     )]
+    #[cfg_attr(feature = "serde", serde(rename = "rendition:align-x-center"))]
     /// Centers content on the horizontal axis.
     RenditionAlignXCenter,
     #[strum(serialize = "rendition:flow", to_string = "rendition:flow")]
+    #[cfg_attr(feature = "serde", serde(rename = "rendition:flow"))]
     /// Declares rendition flow behavior.
     RenditionFlow,
     #[strum(serialize = "rendition:layout", to_string = "rendition:layout")]
+    #[cfg_attr(feature = "serde", serde(rename = "rendition:layout"))]
     /// Declares rendition layout behavior.
     RenditionLayout,
     #[strum(
         serialize = "rendition:orientation",
         to_string = "rendition:orientation"
     )]
+    #[cfg_attr(feature = "serde", serde(rename = "rendition:orientation"))]
     /// Declares rendition orientation behavior.
     RenditionOrientation,
     #[strum(serialize = "rendition:spread", to_string = "rendition:spread")]
+    #[cfg_attr(feature = "serde", serde(rename = "rendition:spread"))]
     /// Declares rendition spread behavior.
     RenditionSpread,
     #[strum(serialize = "rendition:viewport", to_string = "rendition:viewport")]
+    #[cfg_attr(feature = "serde", serde(rename = "rendition:viewport"))]
     /// Declares rendition viewport dimensions.
     RenditionViewport,
     /// Identifies the source of a resource.
@@ -902,75 +800,21 @@ pub enum KnownMetaProperty {
     /// Identifies a title type.
     TitleType,
     #[strum(to_string = "dcterms:modified")]
+    #[cfg_attr(feature = "serde", serde(rename = "dcterms:modified"))]
     /// Records the package modification timestamp.
-    Dctermsmodified,
+    DctermsModified,
 }
+
+/// A `meta` property token retaining its authored spelling and optional known projection.
+pub type MetaPropertyToken = crate::vocab::VocabToken<KnownMetaProperty>;
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
-/// A metadata property token retaining authored spelling and an optional known projection.
-pub struct MetaPropertyToken {
-    raw: EpubString,
-    known: Option<KnownMetaProperty>,
-}
-
-impl MetaPropertyToken {
-    /// Creates a token using the canonical spelling of a known property.
-    pub fn known(property: KnownMetaProperty) -> Self {
-        let raw = EpubString::new(property.to_string()).expect("known meta property is non-empty");
-        Self {
-            raw,
-            known: Some(property),
-        }
-    }
-
-    /// Parses a token while preserving its spelling after trimming surrounding whitespace.
-    ///
-    /// Returns `None` for empty or whitespace-only input. Known recognition is ASCII
-    /// case-insensitive.
-    pub fn new(value: impl AsRef<str>) -> Option<Self> {
-        let raw = EpubString::new(value.as_ref())?;
-        let known = KnownMetaProperty::from_str(raw.as_str()).ok();
-        Some(Self { raw, known })
-    }
-
-    /// Creates a token from authored text after trimming surrounding whitespace.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EpubStringEmpty`] for empty or whitespace-only input.
-    pub fn raw(value: impl AsRef<str>) -> std::result::Result<Self, EpubStringEmpty> {
-        EpubString::try_new(value).map(Self::from_raw)
-    }
-
-    /// Classifies an already-trimmed token without changing its stored spelling.
-    pub fn from_raw(raw: EpubString) -> Self {
-        let known = KnownMetaProperty::from_str(raw.as_str()).ok();
-        Self { raw, known }
-    }
-
-    /// The stored token.
-    pub fn raw_value(&self) -> &EpubString {
-        &self.raw
-    }
-
-    /// The stored token as `str`.
-    pub fn as_str(&self) -> &str {
-        self.raw.as_str()
-    }
-
-    /// Returns the recognized semantic property, if any.
-    pub fn known_value(&self) -> Option<KnownMetaProperty> {
-        self.known
-    }
-}
-
-impl From<KnownMetaProperty> for MetaPropertyToken {
-    fn from(value: KnownMetaProperty) -> Self {
-        Self::known(value)
-    }
-}
-
-#[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 /// An OPF metadata `link`, preserving authored href and vocabulary tokens.
 ///
 /// Parsed instances can retain an unusable authored href. Unknown attributes and XML lexical
@@ -1068,72 +912,18 @@ impl MetadataLink {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Hash)]
-/// A metadata link relationship token with authored spelling and known projection.
-pub struct LinkRelToken {
-    raw: EpubString,
-    known: Option<KnownLinkRel>,
-}
-
-impl LinkRelToken {
-    /// Creates a token using the canonical spelling of a known relationship.
-    pub fn known(rel: KnownLinkRel) -> Self {
-        let raw = EpubString::new(rel.to_string()).expect("known rel is non-empty");
-        Self {
-            raw,
-            known: Some(rel),
-        }
-    }
-
-    /// Parses a relationship while preserving its spelling after trimming surrounding whitespace.
-    ///
-    /// Returns `None` for empty or whitespace-only input.
-    pub fn new(value: impl AsRef<str>) -> Option<Self> {
-        let raw = EpubString::new(value.as_ref())?;
-        let known = KnownLinkRel::from_str(raw.as_str()).ok();
-        Some(Self { raw, known })
-    }
-
-    /// Creates a relationship token from authored text after trimming surrounding whitespace.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EpubStringEmpty`] for empty or whitespace-only input.
-    pub fn raw(value: impl AsRef<str>) -> std::result::Result<Self, EpubStringEmpty> {
-        EpubString::try_new(value).map(Self::from_raw)
-    }
-
-    /// Classifies an already-trimmed token without changing its stored spelling.
-    pub fn from_raw(raw: EpubString) -> Self {
-        let known = KnownLinkRel::from_str(raw.as_str()).ok();
-        Self { raw, known }
-    }
-
-    /// The stored token.
-    pub fn raw_value(&self) -> &EpubString {
-        &self.raw
-    }
-
-    /// The stored token as `str`.
-    pub fn as_str(&self) -> &str {
-        self.raw.as_str()
-    }
-
-    /// Returns the recognized relationship, if any.
-    pub fn known_value(&self) -> Option<KnownLinkRel> {
-        self.known
-    }
-}
-
-impl From<KnownLinkRel> for LinkRelToken {
-    fn from(value: KnownLinkRel) -> Self {
-        Self::known(value)
-    }
-}
+/// A link `rel` token retaining its authored spelling and optional known projection.
+pub type LinkRelToken = crate::vocab::VocabToken<KnownLinkRel>;
 
 #[derive(
     Debug, PartialEq, Eq, Clone, Copy, strum_macros::Display, strum_macros::EnumString, Hash,
 )]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "kebab-case")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[strum(serialize_all = "kebab-case", ascii_case_insensitive)]
 /// A recognized OPF metadata link relationship.
 pub enum KnownLinkRel {
@@ -1160,72 +950,18 @@ pub enum KnownLinkRel {
     XmpRecord,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Hash)]
-/// A metadata link property token with authored spelling and known projection.
-pub struct LinkPropertyToken {
-    raw: EpubString,
-    known: Option<KnownLinkProperty>,
-}
-
-impl LinkPropertyToken {
-    /// Creates a token using the canonical spelling of a known property.
-    pub fn known(property: KnownLinkProperty) -> Self {
-        let raw = EpubString::new(property.to_string()).expect("known link property is non-empty");
-        Self {
-            raw,
-            known: Some(property),
-        }
-    }
-
-    /// Parses a property while preserving its spelling after trimming surrounding whitespace.
-    ///
-    /// Returns `None` for empty or whitespace-only input.
-    pub fn new(value: impl AsRef<str>) -> Option<Self> {
-        let raw = EpubString::new(value.as_ref())?;
-        let known = KnownLinkProperty::from_str(raw.as_str()).ok();
-        Some(Self { raw, known })
-    }
-
-    /// Creates a property token from authored text after trimming surrounding whitespace.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EpubStringEmpty`] for empty or whitespace-only input.
-    pub fn raw(value: impl AsRef<str>) -> std::result::Result<Self, EpubStringEmpty> {
-        EpubString::try_new(value).map(Self::from_raw)
-    }
-
-    /// Classifies an already-trimmed token without changing its stored spelling.
-    pub fn from_raw(raw: EpubString) -> Self {
-        let known = KnownLinkProperty::from_str(raw.as_str()).ok();
-        Self { raw, known }
-    }
-
-    /// The stored token.
-    pub fn raw_value(&self) -> &EpubString {
-        &self.raw
-    }
-
-    /// The stored token as `str`.
-    pub fn as_str(&self) -> &str {
-        self.raw.as_str()
-    }
-
-    /// Returns the recognized property, if any.
-    pub fn known_value(&self) -> Option<KnownLinkProperty> {
-        self.known
-    }
-}
-
-impl From<KnownLinkProperty> for LinkPropertyToken {
-    fn from(value: KnownLinkProperty) -> Self {
-        Self::known(value)
-    }
-}
+/// A link `properties` token retaining its authored spelling and optional known projection.
+pub type LinkPropertyToken = crate::vocab::VocabToken<KnownLinkProperty>;
 
 #[derive(
     Debug, PartialEq, Eq, Clone, Copy, strum_macros::Display, strum_macros::EnumString, Hash,
 )]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "lowercase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[strum(serialize_all = "lowercase", ascii_case_insensitive)]
 /// A recognized OPF metadata link `properties` token.
 pub enum KnownLinkProperty {
@@ -1235,6 +971,17 @@ pub enum KnownLinkProperty {
 
 #[cfg(test)]
 mod tests {
+
+    fn first_unrefined<'a, T>(
+        metadata: &'a Metadata,
+        project: impl Fn(&'a Meta) -> Option<T> + 'a,
+    ) -> Option<T> {
+        metadata
+            .meta()
+            .iter()
+            .filter(|meta| meta.refines().is_none())
+            .find_map(project)
+    }
     use super::*;
 
     fn string(value: &str) -> EpubString {
@@ -1242,7 +989,7 @@ mod tests {
     }
 
     fn rendition_meta(property: &str, value: &str) -> Meta {
-        Meta::new(MetaPropertyToken::raw(property).unwrap(), string(value))
+        Meta::new(MetaPropertyToken::try_new(property).unwrap(), string(value))
     }
 
     #[test]
@@ -1280,7 +1027,7 @@ mod tests {
         metadata.add_meta(rendition_meta("rendition:layout", "unknown"));
         metadata.add_meta(
             Meta::builder()
-                .property(MetaPropertyToken::known(KnownMetaProperty::RenditionLayout))
+                .property(MetaPropertyToken::from(KnownMetaProperty::RenditionLayout))
                 .content(string("roll"))
                 .refines(string("#chapter"))
                 .build(),
@@ -1291,17 +1038,26 @@ mod tests {
         metadata.add_meta(rendition_meta("rendition:spread", "both"));
 
         assert_eq!(
-            metadata.rendition_layout(),
+            first_unrefined(&metadata, Meta::rendition_layout),
             Some(RenditionLayout::PrePaginated)
         );
-        assert_eq!(metadata.rendition_flow(), Some(RenditionFlow::ScrolledDoc));
         assert_eq!(
-            metadata.rendition_orientation(),
+            first_unrefined(&metadata, Meta::rendition_flow),
+            Some(RenditionFlow::ScrolledDoc)
+        );
+        assert_eq!(
+            first_unrefined(&metadata, Meta::rendition_orientation),
             Some(RenditionOrientation::Portrait)
         );
-        assert_eq!(metadata.rendition_spread(), Some(RenditionSpread::Both));
+        assert_eq!(
+            first_unrefined(&metadata, Meta::rendition_spread),
+            Some(RenditionSpread::Both)
+        );
         assert_eq!(metadata.meta().len(), 6);
-        assert_eq!(Metadata::empty().rendition_layout(), None);
+        assert_eq!(
+            first_unrefined(&Metadata::empty(), Meta::rendition_layout),
+            None
+        );
     }
 
     #[test]
@@ -1314,9 +1070,8 @@ mod tests {
             let viewport = meta.rendition_viewport().unwrap();
             assert_eq!(viewport.width(), width);
             assert_eq!(viewport.height(), height);
-            assert_eq!(viewport.width_source(), width.to_string());
-            assert_eq!(viewport.height_source(), height.to_string());
             assert_eq!(meta.content().unwrap().as_str(), value.trim());
+            assert_eq!(meta.property().unwrap().as_str(), "RENDITION:VIEWPORT");
         }
     }
 
@@ -1325,7 +1080,7 @@ mod tests {
         let missing_content = Meta::from_parsed(
             None,
             None,
-            Some(MetaPropertyToken::known(
+            Some(MetaPropertyToken::from(
                 KnownMetaProperty::RenditionViewport,
             )),
             None,
@@ -1347,7 +1102,7 @@ mod tests {
             "width=1200, height=800,",
         ] {
             let meta = Meta::new(
-                MetaPropertyToken::known(KnownMetaProperty::RenditionViewport),
+                MetaPropertyToken::from(KnownMetaProperty::RenditionViewport),
                 string(value),
             );
             assert_eq!(meta.rendition_viewport(), None, "{value}");
@@ -1355,39 +1110,24 @@ mod tests {
     }
 
     #[test]
-    fn metadata_element_adders_and_getters_share_their_owner_collection() {
+    fn metadata_elements_are_stored_under_their_own_kind() {
         let mut metadata = Metadata::empty();
 
-        macro_rules! assert_element_collection {
-            ($add:ident, $get:ident, $value:literal) => {{
-                metadata.$add(Element::new(string($value)));
-                assert_eq!(
-                    metadata.$get().last().and_then(Element::content),
-                    EpubString::new($value).as_ref()
-                );
-            }};
+        for kind in DcElement::ALL {
+            let value = kind.local_name();
+            metadata.add_element(kind, Element::new(string(value)));
+            assert_eq!(
+                metadata.elements(kind).last().and_then(Element::content),
+                EpubString::new(value).as_ref(),
+                "{value}"
+            );
+            assert_eq!(metadata.elements(kind).len(), 1, "{value}");
         }
-
-        assert_element_collection!(add_identifier, identifier, "identifier");
-        assert_element_collection!(add_title, title, "title");
-        assert_element_collection!(add_language, language, "language");
-        assert_element_collection!(add_contributor, contributor, "contributor");
-        assert_element_collection!(add_coverage, coverage, "coverage");
-        assert_element_collection!(add_creator, creator, "creator");
-        assert_element_collection!(add_date, date, "date");
-        assert_element_collection!(add_description, description, "description");
-        assert_element_collection!(add_format, format, "format");
-        assert_element_collection!(add_publisher, publisher, "publisher");
-        assert_element_collection!(add_relation, relation, "relation");
-        assert_element_collection!(add_rights, rights, "rights");
-        assert_element_collection!(add_source, source, "source");
-        assert_element_collection!(add_subject, subject, "subject");
-        assert_element_collection!(add_dc_type, dc_type, "type");
     }
 
     fn meta(value: &str) -> Meta {
         Meta::new(
-            MetaPropertyToken::raw("custom:value").unwrap(),
+            MetaPropertyToken::try_new("custom:value").unwrap(),
             string(value),
         )
     }
@@ -1395,14 +1135,14 @@ mod tests {
     fn link(value: &str) -> MetadataLink {
         MetadataLink::builder()
             .href(EpubHref::try_new(value).unwrap())
-            .rel(LinkRelToken::known(KnownLinkRel::Record))
+            .rel(LinkRelToken::from(KnownLinkRel::Record))
             .build()
     }
 
     #[test]
     fn metadata_mutation_failures_are_typed_and_atomic() {
         let mut metadata = Metadata::empty();
-        metadata.add_title(Element::new(string("first")));
+        metadata.add_element(DcElement::Title, Element::new(string("first")));
         metadata.add_meta(meta("first"));
         metadata.add_link(link("first.json"));
 
@@ -1415,39 +1155,34 @@ mod tests {
         }
 
         assert_atomic_error!(
-            metadata.remove_element_at(TITLE, 1),
-            PackageError::MetadataIndexMissing { ref kind, index }
-                if kind == TITLE && index == 1
+            metadata.remove_element_at(DcElement::Title, 1),
+            PackageError::MetadataIndexMissing { collection, index }
+                if collection == MetadataCollection::Element(DcElement::Title) && index == 1
         );
         assert_atomic_error!(
-            metadata.replace_element_at(TITLE, 1, MetadataElement::Title(Element::new(string("replacement")))),
-            PackageError::MetadataIndexMissing { ref kind, index }
-                if kind == TITLE && index == 1
-        );
-        assert_atomic_error!(
-            metadata.replace_element_at(TITLE, 0, MetadataElement::Creator(Element::new(string("replacement")))),
-            PackageError::MetadataKindMismatch { ref target, ref replacement }
-                if target == TITLE && replacement == CREATOR
+            metadata.replace_element_at(DcElement::Title, 1, Element::new(string("replacement"))),
+            PackageError::MetadataIndexMissing { collection, index }
+                if collection == MetadataCollection::Element(DcElement::Title) && index == 1
         );
         assert_atomic_error!(
             metadata.remove_meta_at(1),
-            PackageError::MetadataIndexMissing { ref kind, index }
-                if kind == META && index == 1
+            PackageError::MetadataIndexMissing { collection, index }
+                if collection == MetadataCollection::Meta && index == 1
         );
         assert_atomic_error!(
             metadata.replace_meta_at(1, meta("replacement")),
-            PackageError::MetadataIndexMissing { ref kind, index }
-                if kind == META && index == 1
+            PackageError::MetadataIndexMissing { collection, index }
+                if collection == MetadataCollection::Meta && index == 1
         );
         assert_atomic_error!(
             metadata.remove_link_at(1),
-            PackageError::MetadataIndexMissing { ref kind, index }
-                if kind == LINK && index == 1
+            PackageError::MetadataIndexMissing { collection, index }
+                if collection == MetadataCollection::Link && index == 1
         );
         assert_atomic_error!(
             metadata.replace_link_at(1, link("replacement.json")),
-            PackageError::MetadataIndexMissing { ref kind, index }
-                if kind == LINK && index == 1
+            PackageError::MetadataIndexMissing { collection, index }
+                if collection == MetadataCollection::Link && index == 1
         );
     }
 
@@ -1455,17 +1190,13 @@ mod tests {
     fn metadata_replacements_preserve_order_and_removals_close_the_gap() {
         let mut metadata = Metadata::empty();
         for value in ["first", "middle", "last"] {
-            metadata.add_title(Element::new(string(value)));
+            metadata.add_element(DcElement::Title, Element::new(string(value)));
             metadata.add_meta(meta(value));
             metadata.add_link(link(&format!("{value}.json")));
         }
 
         metadata
-            .replace_element_at(
-                TITLE,
-                1,
-                MetadataElement::Title(Element::new(string("replacement"))),
-            )
+            .replace_element_at(DcElement::Title, 1, Element::new(string("replacement")))
             .unwrap();
         metadata.replace_meta_at(1, meta("replacement")).unwrap();
         metadata
@@ -1474,7 +1205,7 @@ mod tests {
 
         assert_eq!(
             metadata
-                .title()
+                .elements(DcElement::Title)
                 .iter()
                 .filter_map(Element::content)
                 .map(EpubString::as_str)
@@ -1500,13 +1231,19 @@ mod tests {
             ["first.json", "replacement.json", "last.json"]
         );
 
-        metadata.remove_element_at(TITLE, 1).unwrap();
+        metadata.remove_element_at(DcElement::Title, 1).unwrap();
         metadata.remove_meta_at(1).unwrap();
         metadata.remove_link_at(1).unwrap();
-        assert_eq!(metadata.title().len(), 2);
+        assert_eq!(metadata.elements(DcElement::Title).len(), 2);
         assert_eq!(metadata.meta().len(), 2);
         assert_eq!(metadata.link().len(), 2);
-        assert_eq!(metadata.title()[1].content().unwrap().as_str(), "last");
+        assert_eq!(
+            metadata.elements(DcElement::Title)[1]
+                .content()
+                .unwrap()
+                .as_str(),
+            "last"
+        );
         assert_eq!(metadata.meta()[1].content().unwrap().as_str(), "last");
         assert_eq!(metadata.link()[1].href().unwrap().as_str(), "last.json");
     }
@@ -1529,7 +1266,7 @@ mod tests {
     #[test]
     fn metadata_builders_accept_unknown_vocabulary_tokens() {
         let meta = Meta::builder()
-            .property(MetaPropertyToken::raw("custom:thing").unwrap())
+            .property(MetaPropertyToken::try_new("custom:thing").unwrap())
             .content(string("value"))
             .build();
         assert_eq!(
@@ -1543,10 +1280,10 @@ mod tests {
 
         let link = MetadataLink::builder()
             .href(EpubHref::try_new("meta.json").unwrap())
-            .rel(LinkRelToken::raw("custom-record").unwrap())
+            .rel(LinkRelToken::try_new("custom-record").unwrap())
             .properties(vec![
                 KnownLinkProperty::Onix.into(),
-                LinkPropertyToken::raw("custom:foo").unwrap(),
+                LinkPropertyToken::try_new("custom:foo").unwrap(),
             ])
             .build();
         assert_eq!(link.rel().map(LinkRelToken::as_str), Some("custom-record"));
@@ -1561,7 +1298,7 @@ mod tests {
 
     #[test]
     fn meta_property_tokens_parse_known_values_case_insensitively_and_preserve_unknown_values() {
-        let known = MetaPropertyToken::raw("alTERnate-script").unwrap();
+        let known = MetaPropertyToken::try_new("alTERnate-script").unwrap();
         assert_eq!(
             known.known_value(),
             Some(KnownMetaProperty::AlternateScript)
@@ -1572,7 +1309,7 @@ mod tests {
             "alternate-script"
         );
 
-        let unknown = MetaPropertyToken::raw("dcterms:published").unwrap();
+        let unknown = MetaPropertyToken::try_new("dcterms:published").unwrap();
         assert_eq!(unknown.as_str(), "dcterms:published");
         assert_eq!(unknown.known_value(), None);
     }

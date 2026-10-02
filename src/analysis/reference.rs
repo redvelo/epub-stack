@@ -2,14 +2,10 @@
 //!
 //! References retain the authored href or ID-reference text and show whether it resolves to a
 //! local resource, fragment, remote declaration, missing target, or ambiguous declaration.
-//! Resource and declaration keys belong to the analysis snapshot and must not be reused with a
-//! later analysis.
 
 use super::PublicationAnalysis;
-use crate::content::{ContentFacts, FormFact, MediaFact, ScriptFact};
-use crate::resource::{
-    AuthoredHref, AuthoredIdRef, EpubPath, IndexKeyError, ManifestKey, ResourceKey,
-};
+use crate::content::{FormFact, MediaFact, ScriptFact};
+use crate::resource::{AuthoredHref, AuthoredIdRef, EpubPath, ManifestOrdinal, ResourceOrdinal};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ReferenceSlot(usize);
@@ -24,13 +20,13 @@ impl ReferenceSlot {
     }
 }
 
-/// The snapshot-local owner of an authored reference.
+/// What wrote a link: a resource, or a manifest declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReferenceSource {
     /// A resource containing an authored href.
-    Resource(ResourceKey),
+    Resource(ResourceOrdinal),
     /// A manifest declaration containing an authored ID reference.
-    Declaration(ManifestKey),
+    Declaration(ManifestOrdinal),
 }
 
 /// The semantic use of an authored href.
@@ -42,7 +38,7 @@ pub enum HrefRole {
     PageList,
     /// A landmarks navigation target.
     Landmark,
-    /// A package reference to an NCX document.
+    /// An NCX navigation point target.
     Ncx,
     /// A legacy OPF guide target.
     Guide,
@@ -99,20 +95,20 @@ pub enum ManifestRole {
     MediaOverlay,
 }
 
-/// Resolution of an authored href against one analysis snapshot.
+/// Where a link turned out to point.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HrefTarget {
     /// A local resource, with any authored query retained.
     Resource {
-        /// The resolved snapshot-local resource key.
-        resource: ResourceKey,
+        /// The resource it points at.
+        resource: ResourceOrdinal,
         /// The query component without the leading `?`.
         query: Option<String>,
     },
     /// A local resource fragment, with fragment existence when it was inspectable.
     Fragment {
-        /// The resolved snapshot-local resource key.
-        resource: ResourceKey,
+        /// The resource it points at.
+        resource: ResourceOrdinal,
         /// The query component without the leading `?`.
         query: Option<String>,
         /// The fragment component without the leading `#`.
@@ -124,8 +120,8 @@ pub enum HrefTarget {
     Remote {
         /// The authored absolute href.
         href: String,
-        /// The snapshot-local resource represented by a matching declaration.
-        declared_resource: Option<ResourceKey>,
+        /// The resource a matching declaration points at, if one does.
+        declared_resource: Option<ResourceOrdinal>,
     },
     /// A `data:` URL retained as authored.
     Data(String),
@@ -137,40 +133,37 @@ pub enum HrefTarget {
     Invalid(AuthoredHref),
 }
 
-/// Resolution of an authored manifest ID reference in one snapshot.
+/// What a `fallback` or `media-overlay` IDREF turned out to name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestTarget {
     /// One matching declaration and its resource, when that declaration resolves to one.
     Declaration {
-        /// The matching snapshot-local declaration key.
-        declaration: ManifestKey,
-        /// The declaration's snapshot-local resource target.
-        resource: Option<ResourceKey>,
+        /// The declaration it names.
+        declaration: ManifestOrdinal,
+        /// The resource that declaration points at.
+        resource: Option<ResourceOrdinal>,
     },
+    /// The authored IDREF is not a valid normalized manifest ID.
+    InvalidManifestIdref,
     /// No declaration has the authored ID.
     Missing,
     /// Multiple declarations have the authored ID.
     Ambiguous {
-        /// All matching snapshot-local declaration keys.
-        candidates: Vec<ManifestKey>,
+        /// Every declaration it names.
+        candidates: Vec<ManifestOrdinal>,
     },
 }
 
 /// Source element or CSS construct that carried a reference.
+///
+/// The source document is identified by the reference's source resource; its use by
+/// [`HrefRole`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReferenceContext {
-    /// An OPF element and attribute.
-    Package(ElementAttribute),
-    /// An EPUB NAV or NCX element and attribute.
-    Navigation(ElementAttribute),
-    /// An XHTML element and attribute.
-    Xhtml(ElementAttribute),
-    /// A SMIL element and attribute.
-    Smil(ElementAttribute),
+    /// A markup element and attribute.
+    Element(ElementAttribute),
     /// A CSS rule or declaration context.
     Css(CssContext),
-    /// An SVG element and attribute.
-    Svg(ElementAttribute),
 }
 
 /// The source element and attribute names for an authored href.
@@ -222,10 +215,10 @@ impl CssContext {
     }
 }
 
-/// An authored href together with its role, source, and snapshot resolution.
+/// One link: where it was written, what it was written as, and where it points.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HrefReference {
-    source: ResourceKey,
+    source: ResourceOrdinal,
     declared: AuthoredHref,
     role: HrefRole,
     target: HrefTarget,
@@ -233,8 +226,8 @@ pub struct HrefReference {
 }
 
 impl HrefReference {
-    /// Returns the snapshot-local resource containing the href.
-    pub fn source(&self) -> ResourceKey {
+    /// The resource this link was written in.
+    pub fn source(&self) -> ResourceOrdinal {
         self.source
     }
 
@@ -248,7 +241,7 @@ impl HrefReference {
         self.role
     }
 
-    /// Returns resolution against this analysis snapshot.
+    /// Where it points.
     pub fn target(&self) -> &HrefTarget {
         &self.target
     }
@@ -259,18 +252,18 @@ impl HrefReference {
     }
 }
 
-/// An authored manifest ID reference and its snapshot resolution.
+/// One `fallback` or `media-overlay` IDREF, and what it names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestReference {
-    source: ManifestKey,
+    source: ManifestOrdinal,
     declared: AuthoredIdRef,
     role: ManifestRole,
     target: ManifestTarget,
 }
 
 impl ManifestReference {
-    /// Returns the snapshot-local declaration containing the ID reference.
-    pub fn source(&self) -> ManifestKey {
+    /// The declaration this IDREF was written on.
+    pub fn source(&self) -> ManifestOrdinal {
         self.source
     }
 
@@ -284,7 +277,7 @@ impl ManifestReference {
         self.role
     }
 
-    /// Returns resolution against this analysis snapshot.
+    /// Where it points.
     pub fn target(&self) -> &ManifestTarget {
         &self.target
     }
@@ -300,7 +293,7 @@ pub enum AuthoredReference {
 }
 
 impl AuthoredReference {
-    /// Returns the snapshot-local owner of the authored reference.
+    /// What wrote this link.
     pub fn source(&self) -> ReferenceSource {
         match self {
             Self::Href(reference) => ReferenceSource::Resource(reference.source()),
@@ -320,7 +313,7 @@ pub(crate) struct XhtmlReferenceIndex {
 #[derive(Debug, Clone, Copy)]
 pub struct XhtmlMediaOccurrence<'a> {
     fact: &'a MediaFact,
-    resource: ResourceKey,
+    resource: ResourceOrdinal,
     slots: &'a [ReferenceSlot],
     references: &'a [AuthoredReference],
 }
@@ -328,7 +321,7 @@ pub struct XhtmlMediaOccurrence<'a> {
 impl<'a> XhtmlMediaOccurrence<'a> {
     pub(crate) fn new(
         fact: &'a MediaFact,
-        resource: ResourceKey,
+        resource: ResourceOrdinal,
         slots: &'a [ReferenceSlot],
         references: &'a [AuthoredReference],
     ) -> Self {
@@ -389,104 +382,9 @@ pub struct XhtmlScriptOccurrence<'a> {
 }
 
 impl PublicationAnalysis {
-    /// Returns XHTML media elements with their authored `src` and `srcset` links.
-    ///
-    /// Returns `Ok(None)` when the resource has no available XHTML facts.
-    pub fn xhtml_media(
-        &self,
-        resource: ResourceKey,
-    ) -> Result<Option<impl Iterator<Item = XhtmlMediaOccurrence<'_>>>, IndexKeyError> {
-        let facts = self
-            .content_for(resource)?
-            .value()
-            .and_then(ContentFacts::as_xhtml);
-        Ok(facts.map(move |facts| {
-            facts.media().iter().enumerate().map(move |(index, fact)| {
-                let slots = self
-                    .xhtml_references
-                    .get(&resource)
-                    .and_then(|references| references.media.get(index))
-                    .map(Vec::as_slice)
-                    .unwrap_or_default();
-                XhtmlMediaOccurrence::new(fact, resource, slots, &self.references)
-            })
-        }))
-    }
-
-    /// Returns XHTML forms and controls with their optional submission links.
-    ///
-    /// Returns `Ok(None)` when the resource has no available XHTML facts.
-    pub fn xhtml_forms(
-        &self,
-        resource: ResourceKey,
-    ) -> Result<Option<impl Iterator<Item = XhtmlFormOccurrence<'_>>>, IndexKeyError> {
-        let facts = self
-            .content_for(resource)?
-            .value()
-            .and_then(ContentFacts::as_xhtml);
-        Ok(facts.map(move |facts| {
-            facts.forms().iter().enumerate().map(move |(index, fact)| {
-                let slot = self
-                    .xhtml_references
-                    .get(&resource)
-                    .and_then(|references| references.forms.get(index))
-                    .copied()
-                    .flatten();
-                XhtmlFormOccurrence::new(
-                    fact,
-                    slot.and_then(|slot| self.xhtml_reference(resource, slot)),
-                )
-            })
-        }))
-    }
-
-    /// Returns XHTML scripts with their optional external source links.
-    ///
-    /// Returns `Ok(None)` when the resource has no available XHTML facts.
-    pub fn xhtml_scripts(
-        &self,
-        resource: ResourceKey,
-    ) -> Result<Option<impl Iterator<Item = XhtmlScriptOccurrence<'_>>>, IndexKeyError> {
-        let facts = self
-            .content_for(resource)?
-            .value()
-            .and_then(ContentFacts::as_xhtml);
-        Ok(facts.map(move |facts| {
-            facts
-                .scripts()
-                .iter()
-                .enumerate()
-                .map(move |(index, fact)| {
-                    let slot = self
-                        .xhtml_references
-                        .get(&resource)
-                        .and_then(|references| references.scripts.get(index))
-                        .copied()
-                        .flatten();
-                    XhtmlScriptOccurrence::new(
-                        fact,
-                        slot.and_then(|slot| self.xhtml_reference(resource, slot)),
-                    )
-                })
-        }))
-    }
-
     /// Iterates every authored link and manifest relationship found by this analysis.
     pub fn references(&self) -> impl Iterator<Item = &AuthoredReference> {
         self.references.iter()
-    }
-
-    fn xhtml_reference(
-        &self,
-        resource: ResourceKey,
-        slot: ReferenceSlot,
-    ) -> Option<&HrefReference> {
-        match self.references.get(slot.index()) {
-            Some(AuthoredReference::Href(reference)) if reference.source() == resource => {
-                Some(reference)
-            }
-            _ => None,
-        }
     }
 }
 
@@ -508,7 +406,7 @@ impl<'a> XhtmlScriptOccurrence<'a> {
 
 pub(crate) fn href_reference(
     references: &mut Vec<AuthoredReference>,
-    source: ResourceKey,
+    source: impl Into<ResourceOrdinal>,
     declared: AuthoredHref,
     role: HrefRole,
     target: HrefTarget,
@@ -516,7 +414,7 @@ pub(crate) fn href_reference(
 ) -> ReferenceSlot {
     let slot = ReferenceSlot::new(references.len());
     references.push(AuthoredReference::Href(HrefReference {
-        source,
+        source: source.into(),
         declared,
         role,
         target,
@@ -527,14 +425,14 @@ pub(crate) fn href_reference(
 
 pub(crate) fn manifest_reference(
     references: &mut Vec<AuthoredReference>,
-    source: ManifestKey,
+    source: impl Into<ManifestOrdinal>,
     declared: AuthoredIdRef,
     role: ManifestRole,
     target: ManifestTarget,
 ) -> ReferenceSlot {
     let slot = ReferenceSlot::new(references.len());
     references.push(AuthoredReference::Manifest(ManifestReference {
-        source,
+        source: source.into(),
         declared,
         role,
         target,

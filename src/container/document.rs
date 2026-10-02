@@ -7,10 +7,12 @@ use quick_xml::{
     reader::NsReader,
 };
 
-use super::ContainerError;
+use super::{ContainerDocumentError, ContainerStructure, EpubZipError};
 use crate::{
+    media_type::MediaType,
     package::{RenditionLayout, VERSION},
-    string::EpubString,
+    resource::EpubPath,
+    string::{EpubString, EpubStringEmpty},
     xml::decode_xml,
 };
 
@@ -23,177 +25,73 @@ const RENDITION_LABEL_ATTR: &str = "rendition:label";
 const ROOTFILE: &str = "rootfile";
 const ROOTFILES: &str = "rootfiles";
 const FULL_PATH: &str = "full-path";
+const MEDIA_TYPE: &str = "media-type";
+const OPF_MEDIA_TYPE: &str = "application/oebps-package+xml";
 const URN_NS: &str = "urn:oasis:names:tc:opendocument:xmlns:container";
 const RENDITION_NS: &str = "http://www.idpf.org/2013/rendition";
 
-type Result<T> = std::result::Result<T, ContainerError>;
+type Result<T> = std::result::Result<T, ContainerDocumentError>;
 
-fn required_container_string(value: impl AsRef<str>, field: &'static str) -> Result<EpubString> {
-    EpubString::try_new(value).map_err(|_| ContainerError::EmptyField { field })
-}
-
-fn parsed_container_string(value: impl AsRef<str>) -> Option<EpubString> {
-    EpubString::new(value)
-}
-
-fn is_ocf_element<R>(reader: &NsReader<R>, event: &BytesStart<'_>, name: &[u8]) -> bool {
+fn is_ocf_element<R>(reader: &NsReader<R>, event: &BytesStart<'_>, name: &str) -> bool {
     let (resolved, local) = reader.resolver().resolve_element(event.name());
-    matches!(resolved, ResolveResult::Bound(namespace) if namespace.as_ref() == URN_NS.as_bytes())
+    matches!(resolved, ResolveResult::Bound(namespace) if namespace.as_ref() == URN_NS)
         && local.as_ref() == name
 }
 
-fn is_xml_whitespace(bytes: &[u8]) -> bool {
-    bytes.iter().all(u8::is_ascii_whitespace)
+fn xml_error(source: quick_xml::Error) -> ContainerDocumentError {
+    ContainerDocumentError::Xml { source }
+}
+
+fn is_xml_whitespace(text: &str) -> bool {
+    text.trim_ascii().is_empty()
 }
 
 fn parse_rootfile<R>(reader: &NsReader<R>, event: &BytesStart<'_>) -> Result<Rootfile> {
-    let (
-        full_path,
-        rendition_media,
-        rendition_language,
-        rendition_access_mode,
-        rendition_layout,
-        rendition_label,
-    ) = event.attributes().try_fold(
-        (None, None, None, None, None, None),
-        |state, attr| -> Result<_> {
-            let attr = attr.map_err(quick_xml::Error::from)?;
-            let value = attr.normalized_value(quick_xml::XmlVersion::default())?;
-            let (namespace, local) = reader.resolver().resolve_attribute(attr.key);
-            let is_rendition_attr = matches!(
-                namespace,
-                ResolveResult::Bound(namespace) if namespace.as_ref() == RENDITION_NS.as_bytes()
-            );
-            match local.as_ref() {
-                b"media-type" => Ok(state),
-                b"full-path" if matches!(namespace, ResolveResult::Unbound) => {
-                    let (
-                        _,
-                        rendition_media,
-                        rendition_language,
-                        rendition_access_mode,
-                        rendition_layout,
-                        rendition_label,
-                    ) = state;
-                    Ok((
-                        parsed_container_string(value.as_ref()),
-                        rendition_media,
-                        rendition_language,
-                        rendition_access_mode,
-                        rendition_layout,
-                        rendition_label,
-                    ))
-                }
-                b"media" if is_rendition_attr => {
-                    let (
-                        full_path,
-                        _,
-                        rendition_language,
-                        rendition_access_mode,
-                        rendition_layout,
-                        rendition_label,
-                    ) = state;
-                    Ok((
-                        full_path,
-                        Some(value.into_owned()),
-                        rendition_language,
-                        rendition_access_mode,
-                        rendition_layout,
-                        rendition_label,
-                    ))
-                }
-                b"language" if is_rendition_attr => {
-                    let (
-                        full_path,
-                        rendition_media,
-                        _,
-                        rendition_access_mode,
-                        rendition_layout,
-                        rendition_label,
-                    ) = state;
-                    Ok((
-                        full_path,
-                        rendition_media,
-                        Some(value.into_owned()),
-                        rendition_access_mode,
-                        rendition_layout,
-                        rendition_label,
-                    ))
-                }
-                b"accessMode" if is_rendition_attr => {
-                    let (
-                        full_path,
-                        rendition_media,
-                        rendition_language,
-                        _,
-                        rendition_layout,
-                        rendition_label,
-                    ) = state;
-                    Ok((
-                        full_path,
-                        rendition_media,
-                        rendition_language,
-                        Some(value.into_owned()),
-                        rendition_layout,
-                        rendition_label,
-                    ))
-                }
-                b"layout" if is_rendition_attr => {
-                    let (
-                        full_path,
-                        rendition_media,
-                        rendition_language,
-                        rendition_access_mode,
-                        _,
-                        rendition_label,
-                    ) = state;
-                    Ok((
-                        full_path,
-                        rendition_media,
-                        rendition_language,
-                        rendition_access_mode,
-                        Some(value.into_owned()),
-                        rendition_label,
-                    ))
-                }
-                b"label" if is_rendition_attr => {
-                    let (
-                        full_path,
-                        rendition_media,
-                        rendition_language,
-                        rendition_access_mode,
-                        rendition_layout,
-                        _,
-                    ) = state;
-                    Ok((
-                        full_path,
-                        rendition_media,
-                        rendition_language,
-                        rendition_access_mode,
-                        rendition_layout,
-                        Some(value.into_owned()),
-                    ))
-                }
-                _ => Ok(state),
+    let mut rootfile = Rootfile::default();
+    for attr in event.attributes() {
+        let attr = attr.map_err(|source| xml_error(quick_xml::Error::from(source)))?;
+        let value = attr
+            .normalized_value(quick_xml::XmlVersion::default())
+            .map_err(xml_error)?;
+        let (namespace, local) = reader.resolver().resolve_attribute(attr.key);
+        let is_rendition_attr = matches!(
+            namespace,
+            ResolveResult::Bound(namespace) if namespace.as_ref() == RENDITION_NS
+        );
+        let unbound = matches!(namespace, ResolveResult::Unbound);
+        match local.as_ref() {
+            "full-path" if unbound => rootfile.full_path = RootfilePath::parse(value.as_ref()),
+            "media-type" if unbound => rootfile.media_type = MediaType::new(value.as_ref()),
+            "media" if is_rendition_attr => {
+                rootfile.rendition_media = EpubString::new(value.as_ref());
             }
-        },
-    )?;
-
-    Ok(Rootfile::from_parsed(
-        full_path,
-        rendition_media,
-        rendition_language,
-        rendition_access_mode,
-        rendition_layout,
-        rendition_label,
-    ))
+            "language" if is_rendition_attr => {
+                rootfile.rendition_language = EpubString::new(value.as_ref());
+            }
+            "accessMode" if is_rendition_attr => {
+                rootfile.rendition_access_mode = EpubString::new(value.as_ref()).map(Into::into);
+            }
+            "layout" if is_rendition_attr => {
+                rootfile.rendition_layout = EpubString::new(value.as_ref()).map(Into::into);
+            }
+            "label" if is_rendition_attr => {
+                rootfile.rendition_label = EpubString::new(value.as_ref());
+            }
+            _ => {}
+        }
+    }
+    Ok(rootfile)
 }
 
 pub(super) fn parse_rootfiles(input: impl BufRead) -> Result<Vec<Rootfile>> {
     let mut input = input;
     let mut bytes = Vec::new();
-    input.read_to_end(&mut bytes)?;
-    let xml = decode_xml(&bytes).map_err(ContainerError::from)?;
+    input
+        .read_to_end(&mut bytes)
+        .map_err(|source| ContainerDocumentError::Read {
+            source: EpubZipError::io(source),
+        })?;
+    let xml = decode_xml(&bytes).map_err(|source| ContainerDocumentError::Decode { source })?;
     let mut reader = NsReader::from_reader(xml.as_bytes());
     reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
@@ -203,24 +101,24 @@ pub(super) fn parse_rootfiles(input: impl BufRead) -> Result<Vec<Rootfile>> {
     let mut saw_container = false;
     let mut closed_container = false;
     loop {
-        match reader.read_event_into(&mut buf)? {
+        match reader.read_event_into(&mut buf).map_err(xml_error)? {
             Event::Start(event) => {
                 if depth == 0 {
                     if saw_container {
-                        return Err(ContainerError::MalformedContainer {
-                            message: "multiple document elements".to_string(),
+                        return Err(ContainerDocumentError::Structure {
+                            structure: ContainerStructure::MultipleDocumentElements,
                         });
                     }
-                    if !is_ocf_element(&reader, &event, CONTAINER.as_bytes()) {
-                        return Err(ContainerError::MalformedContainer {
-                            message: format!("expected {{{URN_NS}}}{CONTAINER} document element"),
+                    if !is_ocf_element(&reader, &event, CONTAINER) {
+                        return Err(ContainerDocumentError::Structure {
+                            structure: ContainerStructure::UnexpectedDocumentElement,
                         });
                     }
                     saw_container = true;
-                } else if depth == 1 && is_ocf_element(&reader, &event, ROOTFILES.as_bytes()) {
+                } else if depth == 1 && is_ocf_element(&reader, &event, ROOTFILES) {
                     rootfiles_depth = Some(depth);
                 } else if rootfiles_depth == Some(depth - 1)
-                    && is_ocf_element(&reader, &event, ROOTFILE.as_bytes())
+                    && is_ocf_element(&reader, &event, ROOTFILE)
                 {
                     rootfiles.push(parse_rootfile(&reader, &event)?);
                 }
@@ -229,27 +127,27 @@ pub(super) fn parse_rootfiles(input: impl BufRead) -> Result<Vec<Rootfile>> {
             Event::Empty(event) => {
                 if depth == 0 {
                     if saw_container {
-                        return Err(ContainerError::MalformedContainer {
-                            message: "multiple document elements".to_string(),
+                        return Err(ContainerDocumentError::Structure {
+                            structure: ContainerStructure::MultipleDocumentElements,
                         });
                     }
-                    if !is_ocf_element(&reader, &event, CONTAINER.as_bytes()) {
-                        return Err(ContainerError::MalformedContainer {
-                            message: format!("expected {{{URN_NS}}}{CONTAINER} document element"),
+                    if !is_ocf_element(&reader, &event, CONTAINER) {
+                        return Err(ContainerDocumentError::Structure {
+                            structure: ContainerStructure::UnexpectedDocumentElement,
                         });
                     }
                     saw_container = true;
                     closed_container = true;
                 } else if rootfiles_depth == Some(depth - 1)
-                    && is_ocf_element(&reader, &event, ROOTFILE.as_bytes())
+                    && is_ocf_element(&reader, &event, ROOTFILE)
                 {
                     rootfiles.push(parse_rootfile(&reader, &event)?);
                 }
             }
             Event::End(_) => {
                 if depth == 0 {
-                    return Err(ContainerError::MalformedContainer {
-                        message: "content outside document element".to_string(),
+                    return Err(ContainerDocumentError::Structure {
+                        structure: ContainerStructure::ContentOutsideDocumentElement,
                     });
                 }
                 depth = depth.saturating_sub(1);
@@ -261,19 +159,19 @@ pub(super) fn parse_rootfiles(input: impl BufRead) -> Result<Vec<Rootfile>> {
                 }
             }
             Event::Text(event) if depth == 0 && !is_xml_whitespace(event.as_ref()) => {
-                return Err(ContainerError::MalformedContainer {
-                    message: "non-whitespace content outside document element".to_string(),
+                return Err(ContainerDocumentError::Structure {
+                    structure: ContainerStructure::ContentOutsideDocumentElement,
                 });
             }
             Event::CData(_) if depth == 0 => {
-                return Err(ContainerError::MalformedContainer {
-                    message: "non-whitespace content outside document element".to_string(),
+                return Err(ContainerDocumentError::Structure {
+                    structure: ContainerStructure::ContentOutsideDocumentElement,
                 });
             }
             Event::Eof => {
                 if saw_container && (!closed_container || depth != 0) {
-                    return Err(ContainerError::MalformedContainer {
-                        message: "truncated container document".to_string(),
+                    return Err(ContainerDocumentError::Structure {
+                        structure: ContainerStructure::Truncated,
                     });
                 }
                 break;
@@ -285,115 +183,148 @@ pub(super) fn parse_rootfiles(input: impl BufRead) -> Result<Vec<Rootfile>> {
     if saw_container {
         Ok(rootfiles)
     } else {
-        Err(ContainerError::MalformedContainer {
-            message: "missing document element".to_string(),
+        Err(ContainerDocumentError::Structure {
+            structure: ContainerStructure::MissingDocumentElement,
         })
     }
 }
 
-pub(super) fn serialize_rootfiles<'a>(
-    rootfiles: impl IntoIterator<Item = &'a Rootfile>,
-) -> Result<String> {
+pub(super) fn serialize_rootfiles<'a>(rootfiles: impl IntoIterator<Item = &'a Rootfile>) -> String {
+    const INFALLIBLE: &str = "writing container XML to a vector cannot fail";
     let mut writer = Writer::new_with_indent(Vec::new(), b' ', 4);
-    writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
+    writer
+        .write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))
+        .expect(INFALLIBLE);
 
     let mut container = BytesStart::new(CONTAINER);
     container.push_attribute(("xmlns", URN_NS));
     container.push_attribute(("xmlns:rendition", RENDITION_NS));
     container.push_attribute((VERSION, "1.0"));
-    writer.write_event(Event::Start(container))?;
-    writer.write_event(Event::Start(BytesStart::new(ROOTFILES)))?;
-    rootfiles
-        .into_iter()
-        .try_for_each(|rootfile| rootfile.write_xml(&mut writer))?;
-    writer.write_event(Event::End(BytesEnd::new(ROOTFILES)))?;
-    writer.write_event(Event::End(BytesEnd::new(CONTAINER)))?;
-    Ok(String::from_utf8_lossy(writer.into_inner().as_slice()).to_string())
+    writer
+        .write_event(Event::Start(container))
+        .expect(INFALLIBLE);
+    writer
+        .write_event(Event::Start(BytesStart::new(ROOTFILES)))
+        .expect(INFALLIBLE);
+    for rootfile in rootfiles {
+        rootfile.write_xml(&mut writer);
+    }
+    writer
+        .write_event(Event::End(BytesEnd::new(ROOTFILES)))
+        .expect(INFALLIBLE);
+    writer
+        .write_event(Event::End(BytesEnd::new(CONTAINER)))
+        .expect(INFALLIBLE);
+    String::from_utf8(writer.into_inner()).expect("XML writer emits UTF-8")
 }
 
+/// A rootfile `rendition:accessMode` token retaining its authored spelling.
+pub type RenditionAccessModeToken = crate::vocab::VocabToken<RenditionAccessMode>;
+
+/// A rootfile `rendition:layout` token retaining its authored spelling.
+pub type RenditionLayoutToken = crate::vocab::VocabToken<RenditionLayout>;
+
 #[derive(Debug, PartialEq, Eq, Clone)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(tag = "state", content = "value", rename_all = "kebab-case")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+/// The authored `full-path` of a rootfile.
+pub enum RootfilePath {
+    /// A canonical provider-relative package path.
+    Canonical(
+        /// Resolved canonical path.
+        EpubPath,
+    ),
+    /// Authored text that is not a canonical publication path, retained exactly.
+    Invalid(
+        /// Exact authored text with surrounding whitespace removed.
+        EpubString,
+    ),
+}
+
+impl RootfilePath {
+    fn parse(value: impl AsRef<str>) -> Option<Self> {
+        let authored = EpubString::new(value)?;
+        Some(match EpubPath::new(authored.as_str()) {
+            Ok(path) => Self::Canonical(path),
+            Err(_) => Self::Invalid(authored),
+        })
+    }
+
+    /// Returns the canonical path, or `None` when the authored text was not canonical.
+    pub fn canonical(&self) -> Option<&EpubPath> {
+        match self {
+            Self::Canonical(path) => Some(path),
+            Self::Invalid(_) => None,
+        }
+    }
+
+    /// Returns the authored text, canonical or not.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Canonical(path) => path.as_str(),
+            Self::Invalid(authored) => authored.as_str(),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Default)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 /// A package-document rendition declared by `META-INF/container.xml`.
 ///
-/// The path, media query, language, and label have surrounding whitespace trimmed, and empty
-/// values are discarded. Parsed access-mode and layout attributes retain their authored strings
-/// so unknown values survive normalized container generation.
+/// Every authored attribute has surrounding whitespace removed and is discarded when nothing
+/// remains. Unrecognized media types, access modes, and layouts retain their authored spelling
+/// and survive normalized container generation.
 pub struct Rootfile {
-    full_path: Option<EpubString>,
+    full_path: Option<RootfilePath>,
+    media_type: Option<MediaType>,
     rendition_media: Option<EpubString>,
     rendition_language: Option<EpubString>,
-    rendition_access_mode_raw: Option<String>,
-    rendition_access_mode: Option<RenditionAccessMode>,
-    rendition_layout_raw: Option<String>,
-    rendition_layout: Option<RenditionLayout>,
+    rendition_access_mode: Option<RenditionAccessModeToken>,
+    rendition_layout: Option<RenditionLayoutToken>,
     rendition_label: Option<EpubString>,
 }
 
 impl Rootfile {
-    /// Creates a rendition pointing to a package document.
-    ///
-    /// Surrounding whitespace is trimmed. The remaining path is not resolved or normalized.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ContainerError::EmptyField`] for an empty or whitespace-only path.
-    pub fn new(full_path: impl AsRef<str>) -> Result<Self> {
-        Ok(Self {
-            full_path: Some(required_container_string(full_path, "rootfile full-path")?),
-            rendition_media: None,
-            rendition_language: None,
-            rendition_access_mode_raw: None,
-            rendition_access_mode: None,
-            rendition_layout_raw: None,
-            rendition_layout: None,
-            rendition_label: None,
-        })
-    }
-
-    fn from_parsed(
-        full_path: Option<EpubString>,
-        rendition_media_raw: Option<String>,
-        rendition_language_raw: Option<String>,
-        rendition_access_mode_raw: Option<String>,
-        rendition_layout_raw: Option<String>,
-        rendition_label_raw: Option<String>,
-    ) -> Self {
-        let rendition_media = rendition_media_raw.as_deref().and_then(EpubString::new);
-        let rendition_language = rendition_language_raw.as_deref().and_then(EpubString::new);
-        let rendition_access_mode = rendition_access_mode_raw
-            .as_deref()
-            .and_then(|value| value.parse().ok());
-        let rendition_layout = rendition_layout_raw
-            .as_deref()
-            .and_then(|value| value.parse().ok());
-        let rendition_label = rendition_label_raw.as_deref().and_then(EpubString::new);
+    /// Creates a rendition pointing at a canonical package document path.
+    pub fn new(full_path: EpubPath) -> Self {
         Self {
-            full_path,
-            rendition_media,
-            rendition_language,
-            rendition_access_mode_raw,
-            rendition_access_mode,
-            rendition_layout_raw,
-            rendition_layout,
-            rendition_label,
+            full_path: Some(RootfilePath::Canonical(full_path)),
+            media_type: MediaType::new(OPF_MEDIA_TYPE),
+            ..Self::default()
         }
     }
 
-    /// Returns the trimmed `full-path`, or `None` when it was absent or empty when parsed.
-    pub fn full_path(&self) -> Option<&EpubString> {
+    /// Borrows the authored `full-path`, or `None` when it was absent or empty.
+    pub fn full_path(&self) -> Option<&RootfilePath> {
         self.full_path.as_ref()
     }
 
-    /// Borrows the package path as text.
+    /// Returns the canonical package path when one was authored and is usable.
+    pub fn package_path(&self) -> Option<&EpubPath> {
+        self.full_path.as_ref().and_then(RootfilePath::canonical)
+    }
+
+    /// Borrows the authored `media-type`, retained even when it is not the OPF media type.
+    pub fn media_type(&self) -> Option<&MediaType> {
+        self.media_type.as_ref()
+    }
+
+    /// Reports whether this rootfile declares the OPF package media type.
     ///
-    /// The value is not path-normalized or resolved.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ContainerError::MissingRootfilePath`] if no usable path was modeled.
-    pub fn package_path(&self) -> Result<&str> {
-        self.full_path()
-            .map(EpubString::as_str)
-            .ok_or(ContainerError::MissingRootfilePath)
+    /// A rootfile with no authored `media-type` is not treated as a package document.
+    pub fn is_package_document(&self) -> bool {
+        self.media_type
+            .as_ref()
+            .is_some_and(|media_type| media_type.has_essence(OPF_MEDIA_TYPE))
     }
 
     /// Returns the trimmed, non-empty `rendition:media` value.
@@ -406,24 +337,14 @@ impl Rootfile {
         self.rendition_language.as_ref()
     }
 
-    /// Borrows the authored `rendition:accessMode` spelling, including invalid or empty text.
-    pub fn rendition_access_mode_raw(&self) -> Option<&str> {
-        self.rendition_access_mode_raw.as_deref()
+    /// Borrows the authored `rendition:accessMode`, recognized or not.
+    pub fn rendition_access_mode(&self) -> Option<&RenditionAccessModeToken> {
+        self.rendition_access_mode.as_ref()
     }
 
-    /// Returns the recognized `rendition:accessMode` semantic value.
-    pub fn rendition_access_mode(&self) -> Option<RenditionAccessMode> {
-        self.rendition_access_mode
-    }
-
-    /// Borrows the authored `rendition:layout` spelling, including invalid or empty text.
-    pub fn rendition_layout_raw(&self) -> Option<&str> {
-        self.rendition_layout_raw.as_deref()
-    }
-
-    /// Returns the recognized `rendition:layout` semantic value.
-    pub fn rendition_layout(&self) -> Option<RenditionLayout> {
-        self.rendition_layout
+    /// Borrows the authored `rendition:layout`, recognized or not.
+    pub fn rendition_layout(&self) -> Option<&RenditionLayoutToken> {
+        self.rendition_layout.as_ref()
     }
 
     /// Returns the trimmed, non-empty `rendition:label` value.
@@ -431,59 +352,58 @@ impl Rootfile {
         self.rendition_label.as_ref()
     }
 
-    /// Replaces the package path, trimming surrounding whitespace.
+    /// Replaces the package path.
     ///
-    /// The remaining path is not normalized or resolved.
+    /// These setters are the authoring half of [`EpubZip::add_rootfile`], for building the
+    /// rendition entries of a multi-rendition container.
     ///
-    /// # Errors
-    ///
-    /// Returns [`ContainerError::EmptyField`] for an empty or whitespace-only value.
-    pub fn with_full_path(mut self, full_path: impl AsRef<str>) -> Result<Self> {
-        self.full_path = Some(required_container_string(full_path, "rootfile full-path")?);
-        Ok(self)
+    /// [`EpubZip::add_rootfile`]: crate::container::EpubZip::add_rootfile
+    pub fn with_package_path(mut self, full_path: EpubPath) -> Self {
+        self.full_path = Some(RootfilePath::Canonical(full_path));
+        self
+    }
+
+    /// Replaces the authored `media-type`.
+    pub fn with_media_type(mut self, media_type: MediaType) -> Self {
+        self.media_type = Some(media_type);
+        self
     }
 
     /// Sets `rendition:media`, trimming surrounding whitespace.
     ///
-    /// The remaining media query is not normalized or validated.
-    ///
     /// # Errors
     ///
-    /// Returns [`ContainerError::EmptyField`] for an empty or whitespace-only value.
-    pub fn with_rendition_media(mut self, media: impl AsRef<str>) -> Result<Self> {
-        self.rendition_media = Some(required_container_string(
-            media,
-            "rootfile rendition media",
-        )?);
+    /// Returns [`EpubStringEmpty`] for an empty or whitespace-only value.
+    pub fn with_rendition_media(
+        mut self,
+        media: impl AsRef<str>,
+    ) -> std::result::Result<Self, EpubStringEmpty> {
+        self.rendition_media = Some(EpubString::try_new(media)?);
         Ok(self)
     }
 
     /// Sets `rendition:language`, trimming surrounding whitespace.
     ///
-    /// The remaining language tag is not normalized or validated.
-    ///
     /// # Errors
     ///
-    /// Returns [`ContainerError::EmptyField`] for an empty or whitespace-only value.
-    pub fn with_rendition_language(mut self, language: impl AsRef<str>) -> Result<Self> {
-        self.rendition_language = Some(required_container_string(
-            language,
-            "rootfile rendition language",
-        )?);
+    /// Returns [`EpubStringEmpty`] for an empty or whitespace-only value.
+    pub fn with_rendition_language(
+        mut self,
+        language: impl AsRef<str>,
+    ) -> std::result::Result<Self, EpubStringEmpty> {
+        self.rendition_language = Some(EpubString::try_new(language)?);
         Ok(self)
     }
 
-    /// Sets the access mode and replaces any parsed raw spelling with its canonical token.
-    pub fn with_rendition_access_mode(mut self, mode: RenditionAccessMode) -> Self {
-        self.rendition_access_mode_raw = Some(mode.to_string());
-        self.rendition_access_mode = Some(mode);
+    /// Sets the access mode, retaining the authored spelling of unrecognized values.
+    pub fn with_rendition_access_mode(mut self, mode: impl Into<RenditionAccessModeToken>) -> Self {
+        self.rendition_access_mode = Some(mode.into());
         self
     }
 
-    /// Sets the layout and replaces any parsed raw spelling with its canonical token.
-    pub fn with_rendition_layout(mut self, layout: RenditionLayout) -> Self {
-        self.rendition_layout_raw = Some(layout.to_string());
-        self.rendition_layout = Some(layout);
+    /// Sets the layout, retaining the authored spelling of unrecognized values.
+    pub fn with_rendition_layout(mut self, layout: impl Into<RenditionLayoutToken>) -> Self {
+        self.rendition_layout = Some(layout.into());
         self
     }
 
@@ -491,20 +411,22 @@ impl Rootfile {
     ///
     /// # Errors
     ///
-    /// Returns [`ContainerError::EmptyField`] for an empty or whitespace-only value.
-    pub fn with_rendition_label(mut self, label: impl AsRef<str>) -> Result<Self> {
-        self.rendition_label = Some(required_container_string(
-            label,
-            "rootfile rendition label",
-        )?);
+    /// Returns [`EpubStringEmpty`] for an empty or whitespace-only value.
+    pub fn with_rendition_label(
+        mut self,
+        label: impl AsRef<str>,
+    ) -> std::result::Result<Self, EpubStringEmpty> {
+        self.rendition_label = Some(EpubString::try_new(label)?);
         Ok(self)
     }
 
-    fn write_xml(&self, writer: &mut Writer<Vec<u8>>) -> Result<()> {
+    fn write_xml(&self, writer: &mut Writer<Vec<u8>>) {
         let mut rootfile = BytesStart::new(ROOTFILE);
-        rootfile.push_attribute(("media-type", "application/oebps-package+xml"));
         if let Some(value) = self.full_path() {
             rootfile.push_attribute((FULL_PATH, value.as_str()));
+        }
+        if let Some(value) = self.media_type() {
+            rootfile.push_attribute((MEDIA_TYPE, value.as_str()));
         }
         if let Some(value) = self.rendition_media() {
             rootfile.push_attribute((RENDITION_MEDIA_ATTR, value.as_str()));
@@ -512,21 +434,28 @@ impl Rootfile {
         if let Some(value) = self.rendition_language() {
             rootfile.push_attribute((RENDITION_LANGUAGE_ATTR, value.as_str()));
         }
-        if let Some(value) = self.rendition_access_mode_raw() {
-            rootfile.push_attribute((RENDITION_ACCESS_MODE_ATTR, value));
+        if let Some(value) = self.rendition_access_mode() {
+            rootfile.push_attribute((RENDITION_ACCESS_MODE_ATTR, value.as_str()));
         }
-        if let Some(value) = self.rendition_layout_raw() {
-            rootfile.push_attribute((RENDITION_LAYOUT_ATTR, value));
+        if let Some(value) = self.rendition_layout() {
+            rootfile.push_attribute((RENDITION_LAYOUT_ATTR, value.as_str()));
         }
         if let Some(value) = self.rendition_label() {
             rootfile.push_attribute((RENDITION_LABEL_ATTR, value.as_str()));
         }
-        writer.write_event(Event::Empty(rootfile))?;
-        Ok(())
+        writer
+            .write_event(Event::Empty(rootfile))
+            .expect("writing container XML to a vector cannot fail");
     }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, strum_macros::Display, strum_macros::EnumString)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "lowercase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[strum(serialize_all = "lowercase", ascii_case_insensitive)]
 /// A recognized OCF `rendition:accessMode` value.
 pub enum RenditionAccessMode {

@@ -1,11 +1,11 @@
-use super::{AnalysisIssue, FontFormat, InspectionKind};
+use super::{AnalysisIssue, FontFormat, InspectionData};
 use crate::analysis::inspection::Font;
 
 pub(super) fn inspect(
     bytes: &[u8],
     format: FontFormat,
     complete: bool,
-) -> (InspectionKind, Option<AnalysisIssue>) {
+) -> (InspectionData, Option<AnalysisIssue>) {
     if matches!(format, FontFormat::Woff | FontFormat::Woff2) {
         let valid = match format {
             FontFormat::Woff => valid_woff(bytes, complete),
@@ -14,7 +14,7 @@ pub(super) fn inspect(
         };
         let collection_count = valid.then_some(1);
         return (
-            InspectionKind::Font(Font::new(
+            InspectionData::Font(Font::new(
                 format,
                 Vec::new(),
                 Vec::new(),
@@ -82,7 +82,7 @@ pub(super) fn inspect(
         None
     };
     (
-        InspectionKind::Font(Font::new(
+        InspectionData::Font(Font::new(
             format,
             families,
             subfamilies,
@@ -115,7 +115,7 @@ fn valid_woff(bytes: &[u8], complete: bool) -> bool {
     {
         return false;
     }
-    for entry in bytes[44..directory_end].chunks_exact(20) {
+    for entry in bytes[44..directory_end].as_chunks::<20>().0 {
         let offset = u32::from_be_bytes(entry[4..8].try_into().unwrap()) as usize;
         let compressed_len = u32::from_be_bytes(entry[8..12].try_into().unwrap()) as usize;
         let original_len = u32::from_be_bytes(entry[12..16].try_into().unwrap()) as usize;

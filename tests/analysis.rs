@@ -1,19 +1,34 @@
-use epub_stack::content::text::TextChunkKind;
+use epub_stack::content::text::TextRole;
 use epub_stack::{
-    AnalysisLimits, Epub, MemoryResourceProvider, ResourceSelector,
-    accessibility::{AccessibilityFact, AccessibilityObservationRef},
+    Epub, EpubPath, MemoryResourceProvider,
+    accessibility::{AccessibilityObservation, AccessibilityObservationRef},
     analysis::{
-        AnalysisIssue,
-        coverage::{CoverageState, RelationshipSource, ResourceCoverage},
-        dependency::{Root, RootError},
+        AnalysisIssue, AnalysisLimit, AnalysisLimits,
+        coverage::{Completeness, RelationshipSource, ResourceCompleteness, ResourceCoverage},
         fingerprint::{Blake3Hash, DuplicateGroup},
         reference::{HrefRole, HrefTarget, ManifestTarget, ReferenceContext},
     },
-    content::{ContentFacts, FormFact, MediaFact, MediaSourceContext, ScriptFact},
+    content::{ContentFacts, FormFact, FragmentFact, MediaFact, MediaSourceContext, ScriptFact},
     media_overlay::SmilNodeFact,
     semantics::TextDirection,
 };
 use std::collections::HashSet;
+
+fn limits(configure: impl FnOnce(&mut AnalysisLimits)) -> AnalysisLimits {
+    let mut limits = AnalysisLimits::default();
+    limits.max_analyzed_resources = None;
+    limits.max_resource_analysis_bytes = None;
+    limits.max_total_analysis_bytes = None;
+    limits.max_total_fingerprint_bytes = None;
+    limits.max_smil_nodes = None;
+    limits.max_smil_nesting = None;
+    configure(&mut limits);
+    limits
+}
+
+fn unlimited_limits() -> AnalysisLimits {
+    limits(|_| {})
+}
 
 fn publication(
     package: &[u8],
@@ -23,7 +38,242 @@ fn publication(
         std::iter::once(("EPUB/package.opf", package.to_vec())).chain(resources),
     )
     .unwrap();
-    Epub::from_provider(provider, "EPUB/package.opf").unwrap()
+    Epub::from_provider(provider, EpubPath::new("EPUB/package.opf").unwrap()).unwrap()
+}
+
+#[test]
+fn xhtml_activity_reports_authored_constructs() {
+    use epub_stack::content::DocumentActivity;
+
+    for (construct, expected) in [
+        ("<audio/>", DocumentActivity::Media),
+        ("<iframe/>", DocumentActivity::EmbeddedContent),
+        ("<input autofocus=\"\"/>", DocumentActivity::Autofocus),
+        (
+            "<p onclick=\"run()\">Text</p>",
+            DocumentActivity::EventAttribute,
+        ),
+        (
+            "<script type=\"application/ld+json\">{}</script>",
+            DocumentActivity::ScriptElement,
+        ),
+        (
+            "<meta http-equiv=\"refresh\" content=\"0\"/>",
+            DocumentActivity::Refresh,
+        ),
+        (
+            "<link rel=\"preconnect\" href=\"https://example.com\"/>",
+            DocumentActivity::ResourceHint,
+        ),
+        ("<svg><animate/></svg>", DocumentActivity::Animation),
+    ] {
+        let package = br#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0"><metadata/><manifest><item id="page" href="page.xhtml" media-type="application/xhtml+xml"/></manifest><spine/></package>"#;
+        let document = format!("<html><head>{construct}</head><body/></html>");
+        let analysis = publication(package, [("EPUB/page.xhtml", document.into_bytes())]).analyze();
+        let ordinal = analysis
+            .resources()
+            .declaration_by_id("page")
+            .unwrap()
+            .resource()
+            .unwrap()
+            .ordinal();
+        let resource = analysis.resource(ordinal).unwrap();
+        assert!(resource.content().is_complete());
+        let facts = resource
+            .content()
+            .value()
+            .and_then(ContentFacts::as_xhtml)
+            .unwrap();
+        assert_eq!(
+            facts.activity().iter().collect::<Vec<_>>(),
+            [expected],
+            "{construct}"
+        );
+    }
+}
+
+#[test]
+fn standalone_svg_executable_projection_includes_foreign_object_xhtml() {
+    let executable = |document: &str| {
+        let package = br#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0"><metadata/><manifest><item id="page" href="page.svg" media-type="image/svg+xml"/></manifest><spine><itemref idref="page"/></spine></package>"#;
+        let analysis =
+            publication(package, [("EPUB/page.svg", document.as_bytes().to_vec())]).analyze();
+        let page = analysis
+            .resources()
+            .declaration_by_id("page")
+            .unwrap()
+            .resource()
+            .unwrap();
+        analysis
+            .resource(page.ordinal())
+            .unwrap()
+            .content()
+            .value()
+            .and_then(ContentFacts::as_svg)
+            .map(epub_stack::content::SvgFacts::has_executable_content)
+    };
+
+    assert_eq!(
+        executable(r#"<svg xmlns="http://www.w3.org/2000/svg"><text>Static</text></svg>"#),
+        Some(false)
+    );
+    assert_eq!(
+        executable(
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><script type="application/ld+json">{}</script></svg>"#
+        ),
+        Some(false)
+    );
+    let package = br#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0"><metadata/><manifest><item id="page" href="page.svg" media-type="image/svg+xml"/></manifest><spine><itemref idref="page"/></spine></package>"#;
+    let analysis = publication(
+        package,
+        [("EPUB/page.svg", br#"<svg xmlns="http://www.w3.org/2000/svg"><script type="application/ld+json">{}</script></svg>"#.to_vec())],
+    )
+    .analyze();
+    let page = analysis
+        .resources()
+        .declaration_by_id("page")
+        .unwrap()
+        .resource()
+        .unwrap();
+    let svg = analysis
+        .resource(page.ordinal())
+        .unwrap()
+        .content()
+        .value()
+        .and_then(ContentFacts::as_svg)
+        .unwrap();
+    assert!(matches!(svg.scripts(), [ScriptFact::DataBlock { .. }]));
+    assert_eq!(
+        executable(
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><foreignObject><script xmlns="http://www.w3.org/1999/xhtml">run()</script></foreignObject></svg>"#
+        ),
+        Some(true)
+    );
+}
+
+#[test]
+fn inline_scripts_without_text_are_not_executable_content() {
+    let executable = |head: &str| {
+        let package = br#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0"><metadata/><manifest><item id="page" href="page.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="page"/></spine></package>"#;
+        let document = format!(
+            r#"<html xmlns="http://www.w3.org/1999/xhtml"><head>{head}</head><body><p>Text</p></body></html>"#
+        );
+        let analysis = publication(package, [("EPUB/page.xhtml", document.into_bytes())]).analyze();
+        let page = analysis
+            .resources()
+            .declaration_by_id("page")
+            .unwrap()
+            .resource()
+            .unwrap();
+        analysis
+            .resource(page.ordinal())
+            .unwrap()
+            .content()
+            .value()
+            .and_then(ContentFacts::as_xhtml)
+            .map(epub_stack::content::XhtmlFacts::has_executable_content)
+    };
+
+    assert_eq!(
+        executable(r#"<script type="text/javascript"></script>"#),
+        Some(false)
+    );
+    assert_eq!(executable("<script>\n  </script>"), Some(false));
+    assert_eq!(executable("<script>run()</script>"), Some(true));
+    assert_eq!(executable(r#"<script src=""></script>"#), Some(true));
+    assert_eq!(
+        executable("<script></script><script>run()</script>"),
+        Some(true)
+    );
+}
+
+#[test]
+fn media_overlay_durations_split_publication_totals_from_item_refinements() {
+    const PACKAGE: &[u8] = br##"<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+      <metadata>
+        <meta property="media:duration">1:30:00</meta>
+        <meta property="media:duration" refines="#overlay">0:30:00</meta>
+      </metadata><manifest>
+        <item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml" media-overlay="overlay"/>
+        <item id="overlay" href="overlay.smil" media-type="application/smil+xml"/>
+      </manifest><spine><itemref idref="chapter"/></spine>
+    </package>"##;
+    let analysis = publication(
+        PACKAGE,
+        [
+            ("EPUB/chapter.xhtml", b"<html><body/></html>".to_vec()),
+            (
+                "EPUB/overlay.smil",
+                br#"<smil xmlns="http://www.w3.org/ns/SMIL"><body><seq/></body></smil>"#.to_vec(),
+            ),
+        ],
+    )
+    .analyze();
+
+    let metadata = analysis.media_overlays().metadata();
+    assert_eq!(metadata.durations().len(), 2);
+    let totals = metadata.total_durations().collect::<Vec<_>>();
+    assert_eq!(totals.len(), 1);
+    assert_eq!(totals[0].refines(), None);
+    let items = metadata.item_durations().collect::<Vec<_>>();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].refines(), Some("#overlay"));
+}
+
+#[test]
+fn executable_content_detection_spans_xhtml_and_svg_without_matching_on_format() {
+    let detected = |path: &'static str, media_type: &str, bytes: &'static [u8]| {
+        let package = format!(
+            r#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0"><metadata/><manifest><item id="page" href="{}" media-type="{media_type}"/></manifest><spine><itemref idref="page"/></spine></package>"#,
+            path.trim_start_matches("EPUB/")
+        );
+        let analysis = publication(package.as_bytes(), [(path, bytes.to_vec())]).analyze();
+        let page = analysis
+            .resources()
+            .declaration_by_id("page")
+            .unwrap()
+            .resource()
+            .unwrap();
+        analysis
+            .resource(page.ordinal())
+            .unwrap()
+            .content()
+            .value()
+            .and_then(ContentFacts::executable_content_detected)
+    };
+
+    assert_eq!(
+        detected(
+            "EPUB/page.xhtml",
+            "application/xhtml+xml",
+            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><head><script>run()</script></head><body/></html>",
+        ),
+        Some(true)
+    );
+    assert_eq!(
+        detected(
+            "EPUB/page.xhtml",
+            "application/xhtml+xml",
+            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><head><script></script></head><body/></html>",
+        ),
+        Some(false)
+    );
+    assert_eq!(
+        detected(
+            "EPUB/page.svg",
+            "image/svg+xml",
+            br#"<svg xmlns="http://www.w3.org/2000/svg"><script>run()</script></svg>"#,
+        ),
+        Some(true)
+    );
+    assert_eq!(
+        detected(
+            "EPUB/overlay.smil",
+            "application/smil+xml",
+            br#"<smil xmlns="http://www.w3.org/ns/SMIL"><body><seq/></body></smil>"#,
+        ),
+        None
+    );
 }
 
 #[test]
@@ -68,7 +318,7 @@ fn media_overlay_associations_join_reading_order_targets_and_smil_playback_facts
             .as_str(),
         "overlay.smil"
     );
-    assert!(association.overlay_resource_facts().is_some());
+    assert!(association.overlay_resource().is_some());
     assert!(association.smil_facts().is_some());
 
     let root = association.roots().next().unwrap();
@@ -77,6 +327,59 @@ fn media_overlay_associations_join_reading_order_targets_and_smil_playback_facts
     let children = parallel.children().collect::<Vec<_>>();
     assert!(children[0].text_reference().is_some());
     assert!(children[1].audio_reference().is_some());
+}
+
+#[test]
+fn publication_analysis_applies_and_retains_smil_structural_limits() {
+    const PACKAGE: &[u8] = br#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+      <metadata/><manifest>
+        <item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml" media-overlay="overlay"/>
+        <item id="overlay" href="overlay.smil" media-type="application/smil+xml"/>
+      </manifest><spine><itemref idref="chapter"/></spine>
+    </package>"#;
+    let analyze = |limits| {
+        publication(
+            PACKAGE,
+            [
+                ("EPUB/chapter.xhtml", b"<html><body/></html>".to_vec()),
+                (
+                    "EPUB/overlay.smil",
+                    br#"<smil xmlns="http://www.w3.org/ns/SMIL"><body><seq><par/></seq></body></smil>"#.to_vec(),
+                ),
+            ],
+        )
+        .analyze_with_limits(limits)
+    };
+
+    for (limits, expected_issue) in [
+        (
+            limits(|limits| {
+                limits.max_smil_nodes = Some(3);
+                limits.max_smil_nesting = Some(64);
+            }),
+            AnalysisIssue::Limit(AnalysisLimit::SmilNodes),
+        ),
+        (
+            limits(|limits| {
+                limits.max_smil_nodes = Some(64);
+                limits.max_smil_nesting = Some(2);
+            }),
+            AnalysisIssue::Limit(AnalysisLimit::SmilNesting),
+        ),
+    ] {
+        let expected_nodes = limits.max_smil_nodes;
+        let expected_nesting = limits.max_smil_nesting;
+        let analysis = analyze(limits);
+        assert_eq!(analysis.limits().max_smil_nodes, expected_nodes);
+        assert_eq!(analysis.limits().max_smil_nesting, expected_nesting);
+        let association = analysis.media_overlay_associations().next().unwrap();
+        assert_eq!(
+            association.overlay_resource().unwrap().content().issue(),
+            Some(expected_issue)
+        );
+        assert!(association.smil_facts().is_none());
+        assert_eq!(association.roots().count(), 0);
+    }
 }
 
 #[test]
@@ -138,11 +441,7 @@ fn media_overlay_associations_preserve_missing_ambiguous_and_unavailable_targets
     let association = unavailable.media_overlay_associations().next().unwrap();
     assert!(association.overlay_resource().is_some());
     assert_eq!(
-        association
-            .overlay_resource_facts()
-            .unwrap()
-            .content()
-            .issue(),
+        association.overlay_resource().unwrap().content().issue(),
         Some(AnalysisIssue::Missing)
     );
     assert!(association.smil_facts().is_none());
@@ -171,12 +470,12 @@ fn media_overlay_associations_preserve_reading_order_occurrences() {
     let associations = analysis.media_overlay_associations().collect::<Vec<_>>();
     assert_eq!(associations.len(), 2);
     assert_ne!(
-        associations[0].reading_order().key(),
-        associations[1].reading_order().key()
+        associations[0].reading_order().ordinal(),
+        associations[1].reading_order().ordinal()
     );
     assert_eq!(
-        associations[0].content_declaration().key(),
-        associations[1].content_declaration().key()
+        associations[0].content_declaration().ordinal(),
+        associations[1].content_declaration().ordinal()
     );
 }
 
@@ -207,17 +506,15 @@ fn accessibility_observations_are_resolved_borrowed_views() {
     assert_eq!(observations.len(), 5);
     assert!(matches!(
         observations[0],
-        AccessibilityObservationRef::Content {
-            fact: AccessibilityFact::HeadingLevel(_),
-            ..
-        }
+        AccessibilityObservationRef::Content { fact, .. }
+            if matches!(fact.observation(), AccessibilityObservation::HeadingLevel(_))
     ));
     assert!(matches!(
         observations[1],
         AccessibilityObservationRef::Content {
-            fact: AccessibilityFact::ImageAlt(_),
+            fact,
             ..
-        }
+        } if matches!(fact.observation(), AccessibilityObservation::ImageAlt(_))
     ));
     assert!(matches!(
         observations[2],
@@ -226,9 +523,9 @@ fn accessibility_observations_are_resolved_borrowed_views() {
     assert!(observations.iter().any(|observation| matches!(
         observation,
         AccessibilityObservationRef::Content {
-            fact: AccessibilityFact::ImageAlt(_),
+            fact,
             ..
-        }
+        } if matches!(fact.observation(), AccessibilityObservation::ImageAlt(_))
     )));
     assert!(
         observations.iter().any(|observation| matches!(
@@ -300,76 +597,84 @@ fn accessibility_observations_resolve_navigation_and_inspection_facts() {
     );
 }
 
-fn assert_partition(coverage: &ResourceCoverage) {
-    let states = coverage
-        .completed()
-        .iter()
-        .copied()
-        .chain(coverage.partial().iter().map(|work| work.resource()))
-        .chain(coverage.unavailable().iter().map(|work| work.resource()))
-        .collect::<Vec<_>>();
-    let expected = coverage.expected().iter().copied().collect::<HashSet<_>>();
-    let actual = states.iter().copied().collect::<HashSet<_>>();
-
-    assert_eq!(states.len(), coverage.expected().len());
-    assert_eq!(
-        actual.len(),
-        states.len(),
-        "coverage states must be disjoint"
-    );
-    assert_eq!(actual, expected, "coverage states must partition expected");
-}
-
 fn assert_all_partitions(analysis: &epub_stack::PublicationAnalysis) {
     let coverage = analysis.coverage();
     for set in [
-        coverage.classification(),
         coverage.fragments(),
         coverage.content(),
         coverage.inspection(),
         coverage.fingerprints(),
     ] {
-        assert_partition(set);
+        let resources = set.iter().map(|entry| entry.resource).collect::<Vec<_>>();
+        assert_eq!(
+            resources.iter().collect::<HashSet<_>>().len(),
+            resources.len(),
+            "coverage entries must be disjoint"
+        );
     }
 
     let indexed = analysis
         .resources()
         .resources()
-        .iter()
-        .map(|resource| resource.key())
+        .map(|resource| resource.ordinal())
         .collect::<Vec<_>>();
     let facts = analysis
-        .resource_facts()
-        .map(|facts| facts.resource())
+        .analyzed_resources()
+        .map(|resource| resource.resource().ordinal())
         .collect::<Vec<_>>();
     assert_eq!(facts, indexed, "there is one facts record in index order");
 }
 
 fn assert_coverage(
-    coverage: &ResourceCoverage,
+    coverage: ResourceCoverage<'_>,
     expected: usize,
     completed: usize,
     partial: &[AnalysisIssue],
     unavailable: &[AnalysisIssue],
 ) {
-    assert_eq!(coverage.expected().len(), expected);
-    assert_eq!(coverage.completed().len(), completed);
+    let entries = coverage.iter().collect::<Vec<ResourceCompleteness>>();
+    assert_eq!(entries.len(), expected);
     assert_eq!(
-        coverage
-            .partial()
+        entries
             .iter()
-            .map(|work| work.issue())
+            .filter(|entry| entry.completeness.is_complete())
+            .count(),
+        completed
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .filter_map(|entry| match entry.completeness {
+                Completeness::Partial(issue) => Some(issue),
+                _ => None,
+            })
             .collect::<Vec<_>>(),
         partial
     );
     assert_eq!(
-        coverage
-            .unavailable()
+        entries
             .iter()
-            .map(|work| work.issue())
+            .filter_map(|entry| match entry.completeness {
+                Completeness::Unavailable(issue) => Some(issue),
+                _ => None,
+            })
             .collect::<Vec<_>>(),
         unavailable
     );
+}
+
+fn xhtml_text(
+    resource: epub_stack::analysis::ResourceAnalysisRef<'_>,
+) -> Option<&epub_stack::content::text::TextStream> {
+    resource
+        .content()
+        .value()
+        .and_then(ContentFacts::as_xhtml)
+        .map(epub_stack::content::XhtmlFacts::text_stream)
+}
+
+fn expected(coverage: ResourceCoverage<'_>) -> Vec<epub_stack::resource::ResourceOrdinal> {
+    coverage.iter().map(|entry| entry.resource).collect()
 }
 
 #[test]
@@ -396,11 +701,11 @@ fn selected_ncx_contributes_one_complete_relationship_source() {
         .coverage()
         .relationships()
         .iter()
-        .filter(|coverage| coverage.source() == &RelationshipSource::Ncx(ncx.key()))
+        .filter(|coverage| coverage.source == RelationshipSource::Ncx(ncx.ordinal()))
         .collect::<Vec<_>>();
 
     assert_eq!(coverage.len(), 1);
-    assert_eq!(coverage[0].state(), &CoverageState::Complete);
+    assert_eq!(coverage[0].completeness, Completeness::Complete);
 }
 
 #[test]
@@ -430,29 +735,37 @@ fn declaration_and_reading_order_roots_preserve_exact_declaration_identity() {
     .analyze();
     let chapter = analysis
         .resources()
-        .find_unique_resource_by_id("primary")
+        .declaration_by_id("primary")
         .unwrap()
-        .key();
+        .resource()
+        .unwrap()
+        .ordinal();
     let a = analysis
         .resources()
-        .find_unique_resource_by_id("a")
+        .declaration_by_id("a")
         .unwrap()
-        .key();
+        .resource()
+        .unwrap()
+        .ordinal();
     let b = analysis
         .resources()
-        .find_unique_resource_by_id("b")
+        .declaration_by_id("b")
         .unwrap()
-        .key();
-    let primary = analysis.resources().find_unique_by_id("primary").unwrap();
-    let alias = analysis.resources().find_unique_by_id("alias").unwrap();
+        .resource()
+        .unwrap()
+        .ordinal();
+    let primary = analysis.resources().declaration_by_id("primary").unwrap();
+    let alias = analysis.resources().declaration_by_id("alias").unwrap();
     let reading_order = analysis.resources().reading_order().collect::<Vec<_>>();
 
     let primary_closure = analysis
-        .dependency_closure(Root::Declaration(primary.key()))
-        .unwrap();
+        .declaration(primary.ordinal())
+        .unwrap()
+        .dependency_closure();
     let alias_closure = analysis
-        .dependency_closure(Root::Declaration(alias.key()))
-        .unwrap();
+        .declaration(alias.ordinal())
+        .unwrap()
+        .dependency_closure();
     assert_eq!(primary_closure.resources(), &[chapter, a]);
     assert_eq!(alias_closure.resources(), &[chapter, b]);
     assert_eq!(primary_closure.unresolved(), []);
@@ -460,39 +773,61 @@ fn declaration_and_reading_order_roots_preserve_exact_declaration_identity() {
     assert!(primary_closure.is_complete());
     assert!(alias_closure.is_complete());
 
+    let occurrence_closure = |index: usize| {
+        analysis
+            .declaration(reading_order[index].declaration().unwrap().ordinal())
+            .unwrap()
+            .dependency_closure()
+    };
+    assert_eq!(occurrence_closure(0), primary_closure);
+    assert_eq!(occurrence_closure(1), alias_closure);
+    assert_eq!(reading_order[2].target(), None);
+    assert_eq!(
+        reading_order[3].target(),
+        Some(&epub_stack::resource::IdrefTarget::Missing)
+    );
+    assert_eq!(reading_order[3].idref().unwrap().as_str(), "missing");
+    assert_eq!(
+        reading_order[4]
+            .target()
+            .map(epub_stack::resource::IdrefTarget::candidates)
+            .map(<[_]>::len),
+        Some(2)
+    );
     assert_eq!(
         analysis
-            .dependency_closure(Root::ReadingOrderOccurrence(reading_order[0].key(),))
-            .unwrap(),
-        primary_closure
+            .resources()
+            .declarations_with_id("duplicate")
+            .unwrap()
+            .count(),
+        2
     );
-    assert_eq!(
-        analysis
-            .dependency_closure(Root::ReadingOrderOccurrence(reading_order[1].key(),))
-            .unwrap(),
-        alias_closure
+}
+
+#[test]
+fn coverage_is_complete_only_when_no_part_stopped_early() {
+    const PACKAGE: &[u8] = br#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+      <metadata/><manifest>
+        <item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml"/>
+      </manifest><spine><itemref idref="chapter"/></spine>
+    </package>"#;
+    let chapter =
+        br##"<html><body><p id="target"><a href="#target">Complete</a></p></body></html>"##;
+    let book = publication(PACKAGE, [("EPUB/chapter.xhtml", chapter.to_vec())]);
+
+    assert!(
+        book.analyze_with_limits(unlimited_limits())
+            .coverage()
+            .is_complete()
     );
-    assert_eq!(
-        analysis.dependency_closure(Root::ReadingOrderOccurrence(reading_order[2].key())),
-        Err(RootError::MissingReadingOrderIdref(reading_order[2].key()))
-    );
-    assert!(matches!(
-        analysis.dependency_closure(Root::ReadingOrderOccurrence(reading_order[3].key())),
-        Err(RootError::MissingManifestId { root, idref })
-            if root == reading_order[3].key() && idref.as_str() == "missing"
-    ));
-    let duplicate_candidates = analysis
-        .resources()
-        .declarations_with_id("duplicate")
-        .map(|declaration| declaration.key())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        analysis.dependency_closure(Root::ReadingOrderOccurrence(reading_order[4].key())),
-        Err(RootError::AmbiguousManifestId {
-            root: reading_order[4].key(),
-            candidates: duplicate_candidates,
-        })
-    );
+
+    let budgeted = book.analyze_with_limits(limits(|limits| {
+        limits.max_analyzed_resources = Some(0);
+    }));
+    assert!(!budgeted.coverage().is_complete());
+    assert!(!budgeted.coverage().content().is_complete());
+    // A part with nothing to cover stays complete; the overall answer is false regardless.
+    assert!(budgeted.coverage().fragments().is_complete());
 }
 
 #[test]
@@ -513,13 +848,12 @@ fn coverage_partitions_have_stable_expected_universes_for_every_budget() {
             ("EPUB/data.bin", blob.to_vec()),
         ],
     );
-    let baseline = book.analyze_with_limits(AnalysisLimits::new(None, None, None, None));
+    let baseline = book.analyze_with_limits(unlimited_limits());
     let local = baseline
         .resources()
         .resources()
-        .iter()
         .filter(|resource| resource.local_path().is_some())
-        .map(|resource| resource.key())
+        .map(|resource| resource.ordinal())
         .collect::<Vec<_>>();
     let total_bytes = PACKAGE.len() as u64 + chapter.len() as u64 + blob.len() as u64;
     let largest = [PACKAGE.len(), chapter.len(), blob.len()]
@@ -528,63 +862,62 @@ fn coverage_partitions_have_stable_expected_universes_for_every_budget() {
         .unwrap() as u64;
     let remote = baseline
         .resources()
-        .find_unique_resource_by_id("remote")
+        .declaration_by_id("remote")
         .unwrap()
-        .key();
+        .resource()
+        .unwrap()
+        .ordinal();
 
     assert_all_partitions(&baseline);
-    assert_coverage(baseline.coverage().classification(), 3, 3, &[], &[]);
     assert_coverage(baseline.coverage().fragments(), 1, 1, &[], &[]);
     assert_coverage(baseline.coverage().content(), 1, 1, &[], &[]);
     assert_coverage(baseline.coverage().inspection(), 3, 3, &[], &[]);
     assert_coverage(baseline.coverage().fingerprints(), 3, 3, &[], &[]);
-    assert_eq!(baseline.coverage().classification().expected(), local);
-    assert_eq!(baseline.coverage().inspection().expected(), local);
-    assert_eq!(baseline.coverage().fingerprints().expected(), local);
-    assert_eq!(baseline.coverage().content().expected().len(), 1);
+    assert_eq!(expected(baseline.coverage().inspection()), local);
+    assert_eq!(expected(baseline.coverage().fingerprints()), local);
+    assert_eq!(expected(baseline.coverage().content()).len(), 1);
     let chapter_key = baseline
         .resources()
-        .find_unique_resource_by_id("chapter")
+        .declaration_by_id("chapter")
         .unwrap()
-        .key();
-    assert_eq!(baseline.coverage().fragments().expected(), &[chapter_key]);
+        .resource()
+        .unwrap()
+        .ordinal();
+    assert_eq!(expected(baseline.coverage().fragments()), [chapter_key]);
     assert_eq!(
         baseline
             .coverage()
             .relationships()
             .iter()
-            .map(|coverage| (*coverage.source(), coverage.state().clone()))
+            .map(|coverage| (coverage.source, coverage.completeness))
             .collect::<Vec<_>>(),
         [
-            (RelationshipSource::Package, CoverageState::Complete),
+            (
+                RelationshipSource::Css(remote),
+                Completeness::Unavailable(AnalysisIssue::Unsupported),
+            ),
             (
                 RelationshipSource::Xhtml(chapter_key),
-                CoverageState::Complete,
+                Completeness::Complete
             ),
         ]
     );
-    let remote_facts = baseline.facts_for(remote).unwrap();
-    assert!(remote_facts.classification().is_not_applicable());
+    let remote_facts = baseline.resource(remote).unwrap();
     assert!(remote_facts.content().is_not_applicable());
     assert!(remote_facts.inspection().is_not_applicable());
     assert!(remote_facts.fingerprint().is_not_applicable());
 
-    let no_resources = book.analyze_with_limits(AnalysisLimits::new(Some(0), None, None, None));
+    let no_resources = book.analyze_with_limits(limits(|limits| {
+        limits.max_analyzed_resources = Some(0);
+    }));
     assert_all_partitions(&no_resources);
-    assert_coverage(
-        no_resources.coverage().classification(),
-        3,
-        1,
-        &[],
-        &[AnalysisIssue::ResourceLimit, AnalysisIssue::ResourceLimit],
-    );
     assert_coverage(no_resources.coverage().fragments(), 0, 0, &[], &[]);
     assert_coverage(
         no_resources.coverage().content(),
         1,
         0,
         &[],
-        &[AnalysisIssue::ResourceLimit],
+        &[AnalysisIssue::Limit(AnalysisLimit::AnalyzedResources)],
     );
     assert_coverage(
         no_resources.coverage().inspection(),
@@ -592,9 +925,9 @@ fn coverage_partitions_have_stable_expected_universes_for_every_budget() {
         0,
         &[],
         &[
-            AnalysisIssue::ResourceLimit,
-            AnalysisIssue::ResourceLimit,
-            AnalysisIssue::ResourceLimit,
+            AnalysisIssue::Limit(AnalysisLimit::AnalyzedResources),
+            AnalysisIssue::Limit(AnalysisLimit::AnalyzedResources),
+            AnalysisIssue::Limit(AnalysisLimit::AnalyzedResources),
         ],
     );
     assert_coverage(
@@ -603,66 +936,104 @@ fn coverage_partitions_have_stable_expected_universes_for_every_budget() {
         0,
         &[],
         &[
-            AnalysisIssue::ResourceLimit,
-            AnalysisIssue::ResourceLimit,
-            AnalysisIssue::ResourceLimit,
+            AnalysisIssue::Limit(AnalysisLimit::AnalyzedResources),
+            AnalysisIssue::Limit(AnalysisLimit::AnalyzedResources),
+            AnalysisIssue::Limit(AnalysisLimit::AnalyzedResources),
         ],
     );
-    assert_eq!(no_resources.coverage().content().expected(), &[chapter_key]);
+    assert_eq!(expected(no_resources.coverage().content()), [chapter_key]);
     assert_eq!(
         no_resources
             .coverage()
             .relationships()
             .iter()
-            .map(|coverage| (*coverage.source(), coverage.state().clone()))
+            .map(|coverage| (coverage.source, coverage.completeness))
             .collect::<Vec<_>>(),
         [
-            (RelationshipSource::Package, CoverageState::Complete),
+            (
+                RelationshipSource::Css(remote),
+                Completeness::Unavailable(AnalysisIssue::Unsupported),
+            ),
             (
                 RelationshipSource::Xhtml(chapter_key),
-                CoverageState::Unavailable(AnalysisIssue::ResourceLimit),
+                Completeness::Unavailable(AnalysisIssue::Limit(AnalysisLimit::AnalyzedResources)),
             ),
         ]
     );
 
     let cases = [
         (
-            AnalysisLimits::new(Some(local.len() - 1), None, None, None),
-            (2, &[][..], &[AnalysisIssue::ResourceLimit][..]),
-            (2, &[][..], &[AnalysisIssue::ResourceLimit][..]),
-            (2, &[][..], &[AnalysisIssue::ResourceLimit][..]),
+            limits(|limits| {
+                limits.max_analyzed_resources = Some(local.len() - 1);
+            }),
+            (1, &[][..], &[][..]),
+            (
+                2,
+                &[][..],
+                &[AnalysisIssue::Limit(AnalysisLimit::AnalyzedResources)][..],
+            ),
+            (
+                2,
+                &[][..],
+                &[AnalysisIssue::Limit(AnalysisLimit::AnalyzedResources)][..],
+            ),
         ),
         (
-            AnalysisLimits::new(None, Some(largest - 1), None, None),
-            (2, &[][..], &[AnalysisIssue::PerResourceAnalysisLimit][..]),
-            (2, &[AnalysisIssue::PerResourceAnalysisLimit][..], &[][..]),
+            limits(|limits| {
+                limits.max_resource_analysis_bytes = Some(largest - 1);
+            }),
+            (
+                2,
+                &[][..],
+                &[AnalysisIssue::Limit(AnalysisLimit::ResourceAnalysisBytes)][..],
+            ),
+            (
+                2,
+                &[AnalysisIssue::Limit(AnalysisLimit::ResourceAnalysisBytes)][..],
+                &[][..],
+            ),
             (3, &[][..], &[][..]),
         ),
         (
-            AnalysisLimits::new(None, None, Some(total_bytes - 1), None),
-            (2, &[][..], &[AnalysisIssue::TotalAnalysisLimit][..]),
-            (2, &[AnalysisIssue::TotalAnalysisLimit][..], &[][..]),
+            limits(|limits| {
+                limits.max_total_analysis_bytes = Some(total_bytes - 1);
+            }),
+            (
+                2,
+                &[][..],
+                &[AnalysisIssue::Limit(AnalysisLimit::TotalAnalysisBytes)][..],
+            ),
+            (
+                2,
+                &[AnalysisIssue::Limit(AnalysisLimit::TotalAnalysisBytes)][..],
+                &[][..],
+            ),
             (3, &[][..], &[][..]),
         ),
         (
-            AnalysisLimits::new(None, None, None, Some(total_bytes - 1)),
+            limits(|limits| {
+                limits.max_total_fingerprint_bytes = Some(total_bytes - 1);
+            }),
+            (1, &[][..], &[][..]),
             (3, &[][..], &[][..]),
-            (3, &[][..], &[][..]),
-            (2, &[][..], &[AnalysisIssue::TotalFingerprintLimit][..]),
+            (
+                2,
+                &[][..],
+                &[AnalysisIssue::Limit(AnalysisLimit::TotalFingerprintBytes)][..],
+            ),
         ),
     ];
-    for (limits, classification, inspection, fingerprints) in cases {
+    for (limits, content, inspection, fingerprints) in cases {
         let constrained = book.analyze_with_limits(limits);
         assert_all_partitions(&constrained);
-        assert_coverage(
-            constrained.coverage().classification(),
-            3,
-            classification.0,
-            classification.1,
-            classification.2,
-        );
         assert_coverage(constrained.coverage().fragments(), 1, 1, &[], &[]);
-        assert_coverage(constrained.coverage().content(), 1, 1, &[], &[]);
+        assert_coverage(
+            constrained.coverage().content(),
+            content.0,
+            1,
+            content.1,
+            content.2,
+        );
         assert_coverage(
             constrained.coverage().inspection(),
             3,
@@ -677,26 +1048,25 @@ fn coverage_partitions_have_stable_expected_universes_for_every_budget() {
             fingerprints.1,
             fingerprints.2,
         );
-        assert_eq!(constrained.coverage().classification().expected(), local);
-        assert_eq!(
-            constrained.coverage().fragments().expected(),
-            &[chapter_key]
-        );
-        assert_eq!(constrained.coverage().content().expected(), &[chapter_key]);
-        assert_eq!(constrained.coverage().inspection().expected(), local);
-        assert_eq!(constrained.coverage().fingerprints().expected(), local);
+        assert_eq!(expected(constrained.coverage().fragments()), [chapter_key]);
+        assert!(expected(constrained.coverage().content()).contains(&chapter_key));
+        assert_eq!(expected(constrained.coverage().inspection()), local);
+        assert_eq!(expected(constrained.coverage().fingerprints()), local);
         assert_eq!(
             constrained
                 .coverage()
                 .relationships()
                 .iter()
-                .map(|coverage| (*coverage.source(), coverage.state().clone()))
+                .map(|coverage| (coverage.source, coverage.completeness))
                 .collect::<Vec<_>>(),
             [
-                (RelationshipSource::Package, CoverageState::Complete),
+                (
+                    RelationshipSource::Css(remote),
+                    Completeness::Unavailable(AnalysisIssue::Unsupported),
+                ),
                 (
                     RelationshipSource::Xhtml(chapter_key),
-                    CoverageState::Complete,
+                    Completeness::Complete
                 ),
             ]
         );
@@ -705,14 +1075,21 @@ fn coverage_partitions_have_stable_expected_universes_for_every_budget() {
     // Each exact boundary completes; each corresponding boundary-minus-one case above
     // exposes one precisely classified incomplete producer.
     for limits in [
-        AnalysisLimits::new(Some(local.len()), None, None, None),
-        AnalysisLimits::new(None, Some(largest), None, None),
-        AnalysisLimits::new(None, None, Some(total_bytes), None),
-        AnalysisLimits::new(None, None, None, Some(total_bytes)),
+        limits(|limits| {
+            limits.max_analyzed_resources = Some(local.len());
+        }),
+        limits(|limits| {
+            limits.max_resource_analysis_bytes = Some(largest);
+        }),
+        limits(|limits| {
+            limits.max_total_analysis_bytes = Some(total_bytes);
+        }),
+        limits(|limits| {
+            limits.max_total_fingerprint_bytes = Some(total_bytes);
+        }),
     ] {
         let boundary = book.analyze_with_limits(limits);
         assert_all_partitions(&boundary);
-        assert_coverage(boundary.coverage().classification(), 3, 3, &[], &[]);
         assert_coverage(boundary.coverage().fragments(), 1, 1, &[], &[]);
         assert_coverage(boundary.coverage().content(), 1, 1, &[], &[]);
         assert_coverage(boundary.coverage().inspection(), 3, 3, &[], &[]);
@@ -721,7 +1098,7 @@ fn coverage_partitions_have_stable_expected_universes_for_every_budget() {
 }
 
 #[test]
-fn search_entries_borrow_facts_and_keep_a_detached_text_snapshot() {
+fn text_spans_borrow_their_stream_and_keep_a_detached_snapshot() {
     const PACKAGE: &[u8] = br#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
       <metadata/><manifest>
         <item id="first" href="chapter.xhtml" media-type="application/xhtml+xml"/>
@@ -736,39 +1113,41 @@ fn search_entries_borrow_facts_and_keep_a_detached_text_snapshot() {
         )],
     );
     let analysis = book.analyze();
-    let entries = analysis.search_entries().collect::<Vec<_>>();
-    let entry = entries
-        .iter()
-        .find(|entry| entry.chunk().heading_level().is_some())
+    let resource = analysis
+        .analyzed_resources()
+        .find(|resource| xhtml_text(*resource).is_some())
+        .unwrap();
+    let entry = xhtml_text(resource)
+        .unwrap()
+        .spans()
+        .find(|span| matches!(span.role(), TextRole::Heading { .. }))
         .unwrap();
 
-    assert_eq!(entry.text().unwrap(), "Bonjour monde");
-    assert_eq!(entry.facts().resource(), entry.resource().key());
+    assert_eq!(entry.text(), "Bonjour monde");
     assert!(matches!(
-        entry.chunk().kind(),
-        TextChunkKind::Heading { .. }
+        entry.role(),
+        TextRole::Heading { level } if level.get() == 2
     ));
-    assert_eq!(entry.chunk().heading_level().unwrap().get(), 2);
-    assert_eq!(entry.chunk().fragment(), Some("opening"));
-    assert_eq!(entry.chunk().lang(), Some("fr"));
-    assert_eq!(entry.chunk().dir(), Some(TextDirection::Rtl));
-    assert!(entry.chunk().stream_range().is_some());
-    assert_eq!(entry.declarations().count(), 2);
-    assert_eq!(entry.reading_order_entries().count(), 2);
+    assert_eq!(entry.origin().fragment().unwrap().id(), "opening");
+    assert_eq!(entry.origin().lang(), Some("fr"));
+    assert_eq!(entry.origin().dir(), Some(TextDirection::Rtl));
+    assert_eq!(resource.resource().declarations().count(), 2);
 
     book.edit()
-        .replace_resource(
-            ResourceSelector::path("EPUB/chapter.xhtml").unwrap(),
+        .upsert_resource(
+            EpubPath::new("EPUB/chapter.xhtml").unwrap(),
             b"<html><body><p>Changed</p></body></html>".to_vec(),
         )
         .unwrap()
         .preview()
         .unwrap()
         .commit();
-    assert_eq!(entry.text().unwrap(), "Bonjour monde");
+    assert_eq!(entry.text(), "Bonjour monde");
     let changed = book.analyze();
     assert_eq!(
-        changed.search_entries().next().unwrap().text().unwrap(),
+        xhtml_text(changed.resource(resource.resource().ordinal()).unwrap())
+            .unwrap()
+            .text(),
         "Changed"
     );
 }
@@ -788,7 +1167,9 @@ fn fingerprint_queries_find_resources_and_duplicate_groups() {
     )
     .analyze();
     let hash = Blake3Hash::hash(b"same bytes");
-    let resources = analysis.resources_by_blake3(hash).collect::<Vec<_>>();
+    let resources = analysis
+        .resources_with_fingerprint(hash)
+        .collect::<Vec<_>>();
     let groups = analysis
         .duplicate_fingerprint_groups()
         .collect::<Vec<DuplicateGroup<'_>>>();
@@ -828,22 +1209,31 @@ fn standalone_svg_foreign_object_exposes_nested_xhtml_and_resolved_links()
         ],
     )
     .analyze();
-    let page = analysis.resources().find_unique_resource_by_id("page")?;
+    let page = analysis
+        .resources()
+        .declaration_by_id("page")
+        .ok_or("missing page declaration")?
+        .resource()
+        .ok_or("declaration has no resource")?;
     let facts = analysis
-        .content_for(page.key())?
+        .resource(page.ordinal())
+        .unwrap()
+        .content()
         .value()
         .and_then(ContentFacts::as_svg)
         .ok_or("missing SVG facts")?;
     let foreign = &facts.foreign_objects()[0];
 
-    assert_eq!(foreign.fragment(), Some("panel"));
+    assert_eq!(foreign.fragment().map(FragmentFact::id), Some("panel"));
     assert_eq!(foreign.xhtml().text_stream().text(), "Foreign text");
     assert_eq!(foreign.xhtml().fragments()[0].id(), "caption");
     assert_eq!(foreign.xhtml().media().len(), 1);
     assert_eq!(foreign.xhtml().scripts().len(), 1);
 
     let references = analysis
-        .references_from_resource(page.key())?
+        .resource(page.ordinal())
+        .unwrap()
+        .references()
         .collect::<Vec<_>>();
     assert_eq!(references.len(), 2);
     for (reference, (declared, role, element, attribute, target)) in references.into_iter().zip([
@@ -864,7 +1254,7 @@ fn standalone_svg_foreign_object_exposes_nested_xhtml_and_resolved_links()
     ]) {
         assert_eq!(reference.declared().as_str(), declared);
         assert_eq!(reference.role(), role);
-        let ReferenceContext::Svg(context) = reference.context() else {
+        let ReferenceContext::Element(context) = reference.context() else {
             panic!("foreign-object reference should retain SVG context");
         };
         assert_eq!(
@@ -877,20 +1267,26 @@ fn standalone_svg_foreign_object_exposes_nested_xhtml_and_resolved_links()
         assert_eq!(
             analysis
                 .resources()
-                .resource(*resource)?
+                .resource(*resource)
+                .unwrap()
                 .address()
                 .display_value(),
             target
         );
     }
     assert!(analysis.coverage().relationships().iter().any(|coverage| {
-        matches!(coverage.source(), RelationshipSource::Svg(key) if *key == page.key())
-            && coverage.state() == &CoverageState::Complete
+        matches!(coverage.source, RelationshipSource::Svg(key) if key == page.ordinal())
+            && coverage.completeness == Completeness::Complete
     }));
-    let unknown = analysis.resources().find_unique_resource_by_id("unknown")?;
+    let unknown = analysis
+        .resources()
+        .declaration_by_id("unknown")
+        .ok_or("missing unknown declaration")?
+        .resource()
+        .ok_or("declaration has no resource")?;
     assert!(analysis.coverage().relationships().iter().any(|coverage| {
-        matches!(coverage.source(), RelationshipSource::Svg(key) if *key == unknown.key())
-            && coverage.state() == &CoverageState::Partial(AnalysisIssue::Unsupported)
+        matches!(coverage.source, RelationshipSource::Svg(key) if key == unknown.ordinal())
+            && coverage.completeness == Completeness::Partial(AnalysisIssue::Unsupported)
     }));
 
     Ok(())
@@ -920,13 +1316,15 @@ fn curated_content_facts_expose_semantic_variants_and_joined_optional_references
     let analysis = book.analyze();
     let chapter = analysis
         .resources()
-        .find_unique_resource_by_id("chapter")
+        .declaration_by_id("chapter")
         .unwrap()
-        .key();
+        .resource()
+        .unwrap()
+        .ordinal();
     let media = analysis
-        .xhtml_media(chapter)
+        .resource(chapter)
         .unwrap()
-        .unwrap()
+        .xhtml_media()
         .collect::<Vec<_>>();
     assert_eq!(
         media
@@ -965,9 +1363,9 @@ fn curated_content_facts_expose_semantic_variants_and_joined_optional_references
         ]
     );
     let forms = analysis
-        .xhtml_forms(chapter)
+        .resource(chapter)
         .unwrap()
-        .unwrap()
+        .xhtml_forms()
         .collect::<Vec<_>>();
     assert_eq!(
         forms
@@ -989,9 +1387,9 @@ fn curated_content_facts_expose_semantic_variants_and_joined_optional_references
         ]
     );
     let scripts = analysis
-        .xhtml_scripts(chapter)
+        .resource(chapter)
         .unwrap()
-        .unwrap()
+        .xhtml_scripts()
         .collect::<Vec<_>>();
     assert_eq!(
         scripts
@@ -1041,13 +1439,15 @@ fn responsive_media_and_submit_controls_keep_exact_public_reference_joins() {
     let analysis = book.analyze();
     let chapter = analysis
         .resources()
-        .find_unique_resource_by_id("chapter")
+        .declaration_by_id("chapter")
         .unwrap()
-        .key();
+        .resource()
+        .unwrap()
+        .ordinal();
     let media = analysis
-        .xhtml_media(chapter)
+        .resource(chapter)
         .unwrap()
-        .unwrap()
+        .xhtml_media()
         .collect::<Vec<_>>();
 
     assert_eq!(
@@ -1070,9 +1470,9 @@ fn responsive_media_and_submit_controls_keep_exact_public_reference_joins() {
     );
 
     let forms = analysis
-        .xhtml_forms(chapter)
+        .resource(chapter)
         .unwrap()
-        .unwrap()
+        .xhtml_forms()
         .collect::<Vec<_>>();
     assert_eq!(
         forms
@@ -1092,9 +1492,9 @@ fn responsive_media_and_submit_controls_keep_exact_public_reference_joins() {
     );
 
     let scripts = analysis
-        .xhtml_scripts(chapter)
+        .resource(chapter)
         .unwrap()
-        .unwrap()
+        .xhtml_scripts()
         .collect::<Vec<_>>();
     assert_eq!(
         scripts
@@ -1106,5 +1506,109 @@ fn responsive_media_and_submit_controls_keep_exact_public_reference_joins() {
             })
             .collect::<Vec<_>>(),
         [Some("script-a.js"), None, Some("script-b.js"),]
+    );
+}
+
+#[test]
+fn non_executable_script_sources_stay_in_the_reference_graph() {
+    const PACKAGE: &[u8] = br#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+      <metadata/><manifest>
+        <item id="page" href="page.xhtml" media-type="application/xhtml+xml"/>
+        <item id="figure" href="figure.svg" media-type="image/svg+xml"/>
+        <item id="data" href="data.json" media-type="application/json"/>
+      </manifest><spine><itemref idref="page"/></spine>
+    </package>"#;
+    let page = br#"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+        <script type="application/json" src="data.json"></script>
+    </body></html>"#;
+    let figure =
+        br#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+        <script type="application/json" xlink:href="data.json"></script>
+    </svg>"#;
+    let analysis = publication(
+        PACKAGE,
+        [
+            ("EPUB/page.xhtml", page.to_vec()),
+            ("EPUB/figure.svg", figure.to_vec()),
+            ("EPUB/data.json", b"{}".to_vec()),
+        ],
+    )
+    .analyze();
+    let resource = |id: &str| {
+        analysis
+            .resources()
+            .declaration_by_id(id)
+            .unwrap()
+            .resource()
+            .unwrap()
+            .ordinal()
+    };
+    let data = resource("data");
+
+    for source in [resource("page"), resource("figure")] {
+        let facts = analysis.resource(source).unwrap();
+        assert!(
+            facts.references().any(|reference| {
+                reference.declared().as_str() == "data.json"
+                    && reference.role() == HrefRole::Script
+                    && matches!(reference.target(), HrefTarget::Resource { resource, .. } if *resource == data)
+            }),
+            "a non-executable script source must remain an authored reference"
+        );
+        assert!(facts.dependency_closure().resources().contains(&data));
+    }
+    assert!(
+        analysis
+            .resource(resource("page"))
+            .unwrap()
+            .content()
+            .value()
+            .and_then(ContentFacts::as_xhtml)
+            .is_some_and(|facts| !facts.has_executable_content()),
+        "a data block must not count as executable content"
+    );
+}
+
+#[test]
+fn resources_skipped_by_the_analysis_budget_keep_not_applicable_content() {
+    const PACKAGE: &[u8] = br#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+      <metadata/><manifest>
+        <item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml"/>
+        <item id="cover" href="cover.png" media-type="image/png"/>
+      </manifest><spine><itemref idref="chapter"/></spine>
+    </package>"#;
+    let analysis = publication(
+        PACKAGE,
+        [
+            (
+                "EPUB/chapter.xhtml",
+                b"<html><body><p>Text</p></body></html>".to_vec(),
+            ),
+            ("EPUB/cover.png", b"not a real png".to_vec()),
+        ],
+    )
+    .analyze_with_limits(limits(|limits| {
+        limits.max_analyzed_resources = Some(1);
+    }));
+    let cover = analysis
+        .resources()
+        .declaration_by_id("cover")
+        .unwrap()
+        .resource()
+        .unwrap()
+        .ordinal();
+    let facts = analysis.resource(cover).unwrap();
+
+    assert!(facts.content().is_not_applicable());
+    assert_eq!(
+        facts.inspection().issue(),
+        Some(AnalysisIssue::Limit(AnalysisLimit::AnalyzedResources))
+    );
+    assert!(
+        !analysis
+            .coverage()
+            .content()
+            .iter()
+            .any(|entry| entry.resource == cover)
     );
 }

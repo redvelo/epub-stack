@@ -4,87 +4,38 @@
 //! order. [`EpubPath`] identifies a local resource, while the href APIs resolve relative links
 //! found in EPUB documents.
 
-/// Storage adapters and bounded inventories used when opening a publication.
+pub(crate) mod base;
+mod href;
 pub mod provider;
 
 /// Canonical authored media type representation.
 pub use crate::media_type::MediaType;
-/// A live resource handle obtained from a publication.
-pub use crate::publication::Resource;
+pub use href::{InvalidHref, ResolvedHref, resolve_href, resolve_publication_href};
+pub(crate) use href::{ParsedHref, parse_href, resolve_local_href_from_source};
 
 use crate::package::{
-    Package, RenditionFlow, RenditionLayout, RenditionOrientation, RenditionSpread,
-    manifest::{KnownManifestProperty, ManifestItem, ManifestPropertyToken},
-    metadata::{KnownMetaProperty, Meta},
-    spine::{
-        ItemRef, KnownSpineProperty, Linear, PageProgressionDirection, PageSpread,
-        SpinePropertyToken,
-    },
+    Package, ReadingOrderPresentation,
+    manifest::{KnownManifestProperty, ManifestPropertyToken},
+    normalize_manifest_id,
+    spine::{Linear, SpinePropertyToken},
 };
-use crate::string::EpubString;
-use provider::{ProviderReadError, ResourceProviderIndex};
+use provider::{ProviderIndex, ProviderReadError};
 use std::collections::HashMap;
 use std::fmt;
-use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, thiserror::Error)]
-/// Failure to select exactly one resource or manifest declaration.
-pub enum ResourceLookupError {
-    /// No indexed value matched the selector.
-    #[error("resource selector did not resolve: {0:?}")]
-    NotFound(
-        /// Selector that had no match.
-        ResourceSelector,
-    ),
-    /// More than one declaration or resource matched a selector requiring uniqueness.
-    #[error("resource selector resolved ambiguously: {selector:?}")]
-    Ambiguous {
-        /// Selector that produced multiple matches.
-        selector: ResourceSelector,
-        /// Matching index identities.
-        candidates: Vec<ResourceLookupCandidate>,
-    },
-    /// A uniquely selected manifest declaration has no resolved resource target.
-    #[error("manifest declaration does not resolve to a resource: {0:?}")]
-    UnresolvedDeclaration(
-        /// Unique declaration whose href did not resolve.
-        ManifestKey,
-    ),
-}
-
-#[derive(Debug, thiserror::Error)]
-/// Failure to read bytes or text for a selected resource.
+/// Failure to read bytes or text for a publication resource.
 pub enum ResourceReadError {
-    /// The resource address does not identify provider-local bytes.
-    #[error("resource is not local: {address:?}")]
-    NonLocal {
-        /// Non-local address that was selected.
-        address: ResourceAddress,
-    },
-    /// The provider's stable view does not contain the indexed local path.
-    #[error("resource is missing from the provider: {path}")]
+    /// The path has no current committed bytes in the publication.
+    #[error("resource is missing: {path}")]
     Missing {
         /// Canonical local path that was requested.
         path: EpubPath,
     },
-    /// Filesystem-style I/O failed while reading local bytes.
-    #[error("resource read failed for {path}: {source}")]
-    Io {
-        /// Canonical local path that was requested.
-        path: EpubPath,
-        /// Underlying I/O failure.
-        source: std::io::Error,
-    },
-    /// A non-I/O provider backend failed while reading local bytes.
-    #[error("resource provider backend failed while reading {path}: {source}")]
-    Backend {
-        /// Canonical local path that was requested.
-        path: EpubPath,
-        /// Backend-specific failure.
-        source: Box<dyn std::error::Error>,
-    },
+    /// The provider failed while reading.
+    #[error(transparent)]
+    Provider(ProviderReadError),
     /// The complete resource bytes were not valid UTF-8.
     #[error("resource is not valid UTF-8: {path}")]
     InvalidUtf8 {
@@ -98,69 +49,24 @@ pub enum ResourceReadError {
 impl From<ProviderReadError> for ResourceReadError {
     fn from(error: ProviderReadError) -> Self {
         match error {
-            ProviderReadError::MissingResource { path } => Self::Missing { path },
-            ProviderReadError::IoPath { path, source } => Self::Io { path, source },
-            ProviderReadError::Backend { path, source } => Self::Backend { path, source },
+            ProviderReadError::Missing { path } => Self::Missing { path },
+            error => Self::Provider(error),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-/// A valid manifest XML ID used for lookup.
-///
-/// Construction trims surrounding whitespace, then requires an XML-name-like identifier:
-/// an alphabetic character or `_`, followed by alphanumeric characters, `_`, `-`, or `.`.
-/// Colons are not accepted.
-pub struct ResourceId(String);
-
-impl ResourceId {
-    /// Trims and validates an identifier, returning `None` when it is not accepted.
-    pub fn new(value: impl AsRef<str>) -> Option<Self> {
-        let value = value.as_ref().trim();
-        is_xml_id(value).then(|| Self(value.to_string()))
-    }
-
-    /// Returns the validated, surrounding-whitespace-trimmed identifier.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-fn is_xml_id(value: &str) -> bool {
-    let mut chars = value.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    (first == '_' || first.is_alphabetic())
-        && chars.all(|ch| ch == '_' || ch == '-' || ch == '.' || ch.is_alphanumeric())
-}
-
-impl fmt::Display for ResourceId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl From<ResourceId> for String {
-    fn from(value: ResourceId) -> Self {
-        value.0
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-/// A canonical provider-relative EPUB resource path.
+#[cfg_attr(feature = "serde", derive(serde::Serialize), serde(transparent))]
+#[cfg_attr(feature = "specta", derive(specta::Type), specta(transparent))]
+/// A file's path inside an EPUB, such as `EPUB/text/chapter.xhtml`.
 ///
-/// Identity is exact UTF-8 path spelling. Canonical paths are non-empty and relative, use
-/// `/`, contain no empty, dot, query, fragment, control, or scheme-like first segments, and
-/// are never silently normalized or repaired.
+/// Paths are relative, `/`-separated, and compared exactly. Nothing is cleaned up for you: a
+/// path with `..`, a query, a fragment, or a doubled slash is rejected rather than repaired.
 pub struct EpubPath(String);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 /// Reason a path cannot serve as canonical EPUB resource identity.
 pub enum EpubPathError {
-    /// The platform path cannot be represented as UTF-8.
-    #[error("EPUB path is not valid UTF-8")]
-    NonUtf8,
     /// The path has no bytes.
     #[error("EPUB path is empty")]
     Empty,
@@ -188,16 +94,8 @@ pub enum EpubPathError {
 }
 
 impl EpubPath {
-    /// Creates a canonical EPUB path from a platform path.
-    ///
-    /// This validates exact spelling and does not normalize separators or dot segments.
-    pub fn new(path: impl AsRef<Path>) -> Result<Self, EpubPathError> {
-        let value = path.as_ref().to_str().ok_or(EpubPathError::NonUtf8)?;
-        Self::parse(value)
-    }
-
-    /// Parses a canonical EPUB path from UTF-8 text without repairing it.
-    pub fn parse(value: impl AsRef<str>) -> Result<Self, EpubPathError> {
+    /// Validates exact canonical path text without repairing it.
+    pub fn new(value: impl AsRef<str>) -> Result<Self, EpubPathError> {
         let value = value.as_ref();
         validate_epub_path(value)?;
         Ok(Self(value.to_string()))
@@ -208,9 +106,27 @@ impl EpubPath {
         &self.0
     }
 
-    /// Borrows the canonical value as a platform [`Path`].
-    pub fn as_path(&self) -> &Path {
-        Path::new(self.as_str())
+    /// Returns the text after the last `.` of the final segment, when present.
+    pub fn extension(&self) -> Option<&str> {
+        let name = self.file_name();
+        name.rsplit_once('.')
+            .filter(|(stem, _)| !stem.is_empty())
+            .map(|(_, extension)| extension)
+    }
+
+    /// Reports whether this is the OCF `mimetype` entry or lies below `META-INF/`.
+    pub fn is_ocf_control(&self) -> bool {
+        self.0 == "mimetype" || self.0.starts_with("META-INF/")
+    }
+
+    pub(crate) fn file_name(&self) -> &str {
+        self.0
+            .rsplit_once('/')
+            .map_or(self.as_str(), |(_, name)| name)
+    }
+
+    pub(crate) fn parent_dir(&self) -> &str {
+        self.0.rsplit_once('/').map_or("", |(parent, _)| parent)
     }
 }
 
@@ -218,13 +134,7 @@ impl FromStr for EpubPath {
     type Err = EpubPathError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::parse(value)
-    }
-}
-
-impl AsRef<Path> for EpubPath {
-    fn as_ref(&self) -> &Path {
-        self.as_path()
+        Self::new(value)
     }
 }
 
@@ -234,16 +144,14 @@ impl fmt::Display for EpubPath {
     }
 }
 
-impl From<EpubPath> for PathBuf {
-    fn from(value: EpubPath) -> Self {
-        PathBuf::from(value.0)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-/// Exact authored href text, including empty or malformed values.
-///
-/// This fidelity type performs no trimming, validation, normalization, or repair.
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(transparent)
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type), specta(transparent))]
+/// An href exactly as the book wrote it, including empty or malformed ones.
 pub struct AuthoredHref(String);
 
 impl AuthoredHref {
@@ -281,10 +189,12 @@ pub enum EpubHrefError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-/// A non-empty href with checked lexical syntax.
+#[cfg_attr(feature = "serde", derive(serde::Serialize), serde(transparent))]
+#[cfg_attr(feature = "specta", derive(specta::Type), specta(transparent))]
+/// An href whose syntax is valid.
 ///
-/// This type validates but does not resolve, normalize, percent-decode, or establish resource
-/// existence. Use [`ResourceIndex::resolve_href_from`] for source-relative resolution.
+/// Valid syntax is not a promise that anything is there. [`resolve_href`] turns one into the
+/// address it points at.
 pub struct EpubHref(String);
 
 impl EpubHref {
@@ -294,7 +204,7 @@ impl EpubHref {
         if value.is_empty() {
             return Err(EpubHrefError::Empty);
         }
-        if !valid_href_syntax(value) {
+        if !href::valid_href_syntax(value) {
             return Err(EpubHrefError::Invalid);
         }
         Ok(Self(value.to_string()))
@@ -325,7 +235,13 @@ impl fmt::Display for EpubHref {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-/// Resolved identity class for a declared or provider resource.
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(tag = "kind", content = "value", rename_all = "kebab-case")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+/// Where a resource lives: a path in the container, or a URL the book points out to.
 pub enum ResourceAddress {
     /// A canonical path in the publication provider.
     Local(
@@ -334,7 +250,7 @@ pub enum ResourceAddress {
     ),
     /// An HTTP(S) or scheme-relative URL.
     Remote(
-        /// Exact remote URL text excluding any separately resolved fragment.
+        /// Remote URL text excluding any fragment.
         String,
     ),
     /// A `data:` URL retained as authored.
@@ -344,12 +260,7 @@ pub enum ResourceAddress {
     ),
     /// A syntactically valid URL using another scheme.
     External(
-        /// Exact authored URL using another scheme.
-        String,
-    ),
-    /// Authored text that could not be resolved as an address.
-    Invalid(
-        /// Exact authored text that could not be resolved.
+        /// Authored URL using another scheme, excluding any fragment.
         String,
     ),
 }
@@ -359,15 +270,15 @@ impl ResourceAddress {
     pub fn local_path(&self) -> Option<&EpubPath> {
         match self {
             Self::Local(path) => Some(path),
-            Self::Remote(_) | Self::Data(_) | Self::External(_) | Self::Invalid(_) => None,
+            Self::Remote(_) | Self::Data(_) | Self::External(_) => None,
         }
     }
 
     /// Returns the URL for an HTTP(S) or scheme-relative remote address.
     pub fn remote_url(&self) -> Option<&str> {
         match self {
-            Self::Local(_) | Self::Data(_) | Self::External(_) | Self::Invalid(_) => None,
             Self::Remote(url) => Some(url),
+            Self::Local(_) | Self::Data(_) | Self::External(_) => None,
         }
     }
 
@@ -375,61 +286,93 @@ impl ResourceAddress {
     pub fn display_value(&self) -> &str {
         match self {
             Self::Local(path) => path.as_str(),
-            Self::Remote(value)
-            | Self::Data(value)
-            | Self::External(value)
-            | Self::Invalid(value) => value,
+            Self::Remote(value) | Self::Data(value) | Self::External(value) => value,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct ResourceIndexId(u64);
+/// A resource-index collection whose length cannot be represented by 32-bit ordinals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceIndexCollection {
+    /// Distinct physical resources.
+    Resources,
+    /// Manifest declarations.
+    ManifestDeclarations,
+    /// Reading-order occurrences.
+    ReadingOrderOccurrences,
+}
 
-impl ResourceIndexId {
-    fn fresh() -> Self {
-        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-        Self(NEXT_ID.fetch_add(1, Ordering::Relaxed))
+/// A resource index has a collection that cannot be represented by its public ordinal type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("resource index collection {collection:?} exceeds 32-bit ordinals")]
+pub struct ResourceIndexError {
+    collection: ResourceIndexCollection,
+}
+
+impl ResourceIndexError {
+    /// Returns the collection that exceeded the ordinal range.
+    pub fn collection(self) -> ResourceIndexCollection {
+        self.collection
     }
 }
 
-macro_rules! index_key {
+macro_rules! ordinal {
     ($name:ident, $docs:literal) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[cfg_attr(
+            feature = "serde",
+            derive(serde::Serialize, serde::Deserialize),
+            serde(transparent)
+        )]
+        #[cfg_attr(feature = "specta", derive(specta::Type), specta(transparent))]
         #[doc = $docs]
-        pub struct $name {
-            owner: ResourceIndexId,
-            slot: u32,
+        pub struct $name(u32);
+
+        impl $name {
+            /// Rebuilds a position that travelled outside the crate, such as one read back from
+            /// serialized facts.
+            ///
+            /// A position means nothing on its own: it addresses the index it came from, and
+            /// using it against another selects an unrelated entry or none at all.
+            pub const fn new(position: u32) -> Self {
+                Self(position)
+            }
+
+            pub(crate) fn from_index(index: usize) -> Self {
+                Self(u32::try_from(index).expect("resource index count was checked"))
+            }
+
+            /// The zero-based position.
+            pub fn index(self) -> usize {
+                self.0 as usize
+            }
+
+            /// The position as it serializes.
+            pub const fn as_u32(self) -> u32 {
+                self.0
+            }
         }
     };
 }
 
-index_key!(
-    ResourceKey,
-    "Opaque identity of one resolved resource within a particular [`ResourceIndex`].\n\nCloning an index preserves this identity. Rebuilding an index creates a new owner, so keys must not be persisted across publication edits or mixed between unrelated indexes."
+ordinal!(
+    ResourceOrdinal,
+    "Where a resource sits in a [`ResourceIndex`]."
 );
-index_key!(
-    ManifestKey,
-    "Opaque identity of one manifest declaration within a particular [`ResourceIndex`].\n\nDeclaration identity is distinct from resolved resource identity: duplicate href declarations have different `ManifestKey` values but may share one [`ResourceKey`]. Cloning preserves keys; rebuilding invalidates them."
+ordinal!(
+    ManifestOrdinal,
+    "Where a declaration sits in the package manifest."
 );
-index_key!(
-    ReadingOrderKey,
-    "Opaque identity of one spine occurrence within a particular [`ResourceIndex`].\n\nRepeated `idref` values remain distinct occurrences. Cloning preserves keys; rebuilding an index after an edit creates a new identity."
-);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-/// Failure to use an opaque key with an index-owned query.
-pub enum IndexKeyError {
-    /// The key was created by another or rebuilt index.
-    #[error("key belongs to a different resource index")]
-    ForeignIndex,
-    /// The key has this index owner but its slot does not identify an entry.
-    #[error("key does not identify an entry in this resource index")]
-    UnknownKey,
-}
+ordinal!(ReadingOrderOrdinal, "Where an entry sits in the spine.");
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-/// Exact authored manifest IDREF text, including malformed or unresolved values.
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(transparent)
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type), specta(transparent))]
+/// An IDREF exactly as the book wrote it, including ones that match nothing.
 pub struct AuthoredIdRef(String);
 
 impl AuthoredIdRef {
@@ -444,1541 +387,1019 @@ impl AuthoredIdRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Authored state of a manifest item's `id` attribute.
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(tag = "state", content = "value", rename_all = "kebab-case")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+/// What a manifest item wrote for its `id`, including nothing at all.
 pub enum ManifestIdValue {
-    /// A present ID accepted as [`ResourceId`].
+    /// A present ID accepted as an XML Schema `ID`.
     Valid(
         /// Validated identifier.
-        ResourceId,
+        String,
     ),
     /// No `id` attribute was present.
     Missing,
-    /// A present ID was preserved but did not satisfy [`ResourceId`] syntax.
+    /// A present ID was preserved but did not satisfy XML Schema `ID` syntax.
     Invalid(
         /// Exact malformed authored ID.
         String,
     ),
 }
 
+/// Resolution of one authored manifest IDREF against the declarations of a snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Resolution state of one manifest declaration's `href`.
-pub enum DeclarationTarget {
-    /// The href resolved to canonical resource identity.
-    Resource(
-        /// Resolved resource identity.
-        ResourceKey,
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(tag = "state", content = "value", rename_all = "kebab-case")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub enum IdrefTarget {
+    /// The IDREF named exactly one declaration.
+    Declaration(
+        /// Selected declaration position.
+        ManifestOrdinal,
     ),
+    /// The IDREF is not a well-formed ID.
+    Invalid,
+    /// The IDREF is well-formed but names nothing.
+    Missing,
+    /// The IDREF names more than one declaration, because the manifest reuses an ID.
+    ///
+    /// The candidates are not serialized: one ID shared by many declarations would make the
+    /// encoded index grow with the square of the manifest. Match the authored IDREF against the
+    /// declaration IDs to recover them.
+    Ambiguous(
+        /// Matching declaration positions in manifest order.
+        #[cfg_attr(feature = "serde", serde(skip))]
+        #[cfg_attr(feature = "specta", specta(skip))]
+        Vec<ManifestOrdinal>,
+    ),
+}
+
+impl IdrefTarget {
+    /// Returns the uniquely selected declaration.
+    pub fn declaration(&self) -> Option<ManifestOrdinal> {
+        match self {
+            Self::Declaration(declaration) => Some(*declaration),
+            Self::Invalid | Self::Missing | Self::Ambiguous(_) => None,
+        }
+    }
+
+    /// Returns the declarations an ambiguous IDREF matched, in manifest order.
+    pub fn candidates(&self) -> &[ManifestOrdinal] {
+        match self {
+            Self::Ambiguous(candidates) => candidates,
+            Self::Declaration(_) | Self::Invalid | Self::Missing => &[],
+        }
+    }
+}
+
+/// Resolution state of one manifest declaration in the current snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(
+        tag = "state",
+        rename_all = "kebab-case",
+        rename_all_fields = "camelCase",
+        deny_unknown_fields
+    )
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub enum DeclarationTarget {
+    /// The href resolved to a physical resource.
+    Resource {
+        /// Resolved resource ordinal.
+        resource: ResourceOrdinal,
+    },
     /// The declaration had no `href` attribute.
     MissingHref,
-    /// The exact href was present but could not resolve to an accepted address.
-    InvalidHref(
-        /// Exact authored href that failed resolution.
-        AuthoredHref,
-    ),
+    /// The authored href could not resolve to an accepted address.
+    InvalidHref,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-/// One authored manifest item, kept distinct from its resolved resource.
-///
-/// Multiple declarations may resolve to the same [`ResourceKey`] while retaining their own
-/// IDs, href spelling, media types, properties, and relationships.
-pub struct ManifestDeclaration {
-    key: ManifestKey,
-    id: ManifestIdValue,
-    href: Option<AuthoredHref>,
-    target: DeclarationTarget,
-    media_type: Option<MediaType>,
-    properties: Vec<ManifestPropertyToken>,
-    fallback: Option<AuthoredIdRef>,
-    media_overlay: Option<AuthoredIdRef>,
-}
-
-impl ManifestDeclaration {
-    /// Returns this declaration's index-local identity.
-    pub fn key(&self) -> ManifestKey {
-        self.key
-    }
-    /// Returns the authored ID state.
-    pub fn id(&self) -> &ManifestIdValue {
-        &self.id
-    }
-    /// Returns the exact authored href when the attribute was present.
-    pub fn href(&self) -> Option<&AuthoredHref> {
-        self.href.as_ref()
-    }
-    /// Returns the declaration's resource-resolution state.
-    pub fn target(&self) -> &DeclarationTarget {
-        &self.target
-    }
-    /// Returns the raw-preserving media type declaration when present.
-    ///
-    /// A returned [`MediaType`] may contain malformed MIME syntax; use
-    /// [`MediaType::is_valid`] before relying on parsed MIME facts.
-    pub fn media_type(&self) -> Option<&MediaType> {
-        self.media_type.as_ref()
-    }
-    /// Returns manifest property tokens in authored order.
-    pub fn properties(&self) -> &[ManifestPropertyToken] {
-        &self.properties
-    }
-    /// Returns the exact authored fallback IDREF when present.
-    pub fn fallback(&self) -> Option<&AuthoredIdRef> {
-        self.fallback.as_ref()
-    }
-    /// Returns the exact authored media-overlay IDREF when present.
-    pub fn media_overlay(&self) -> Option<&AuthoredIdRef> {
-        self.media_overlay.as_ref()
+impl DeclarationTarget {
+    /// Returns the resolved resource.
+    pub fn resource(self) -> Option<ResourceOrdinal> {
+        match self {
+            Self::Resource { resource } => Some(resource),
+            Self::MissingHref | Self::InvalidHref => None,
+        }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(
+        tag = "state",
+        rename_all = "kebab-case",
+        rename_all_fields = "camelCase"
+    )
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 /// Whether a resolved resource address has corresponding provider bytes.
 pub enum ProviderPresence {
     /// The local path appeared in the complete provider index.
-    Present,
+    Present {
+        /// Provider-reported byte length, encoded as a decimal string for JSON safety.
+        #[cfg_attr(
+            feature = "serde",
+            serde(
+                serialize_with = "serialize_size_bytes",
+                deserialize_with = "deserialize_size_bytes"
+            )
+        )]
+        #[cfg_attr(feature = "specta", specta(type = Option<String>))]
+        size_bytes: Option<u64>,
+    },
     /// The local path did not appear in the complete provider index.
     Missing,
     /// Provider membership does not apply to a non-local address.
     NotApplicable,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-/// Path and size metadata available without reading resource content.
-///
-/// This does not contain detected format, fingerprints, or content inspection.
-pub struct ResourceMetadata {
-    size_bytes: Option<u64>,
-    file_extension: Option<String>,
+impl ProviderPresence {
+    /// Reports whether provider bytes are present.
+    pub fn is_present(self) -> bool {
+        matches!(self, Self::Present { .. })
+    }
+
+    /// Returns the provider-reported byte length of a present resource, when known.
+    pub fn size_bytes(self) -> Option<u64> {
+        match self {
+            Self::Present { size_bytes } => size_bytes,
+            Self::Missing | Self::NotApplicable => None,
+        }
+    }
 }
 
-impl ResourceMetadata {
-    /// Returns the provider-reported logical byte length, when known.
-    pub fn size_bytes(&self) -> Option<u64> {
-        self.size_bytes
+#[cfg(feature = "serde")]
+#[cfg(feature = "serde")]
+fn deserialize_size_bytes<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    let encoded = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
+    encoded
+        .map(|value| value.parse::<u64>().map_err(serde::de::Error::custom))
+        .transpose()
+}
+
+#[cfg(feature = "serde")]
+fn serialize_size_bytes<S: serde::Serializer>(
+    value: &Option<u64>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::Serialize;
+    value.map(|size| size.to_string()).serialize(serializer)
+}
+
+/// Authored relationship used to select a structural resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "kebab-case")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub enum SelectionSource {
+    /// The package path supplied when opening the rendition.
+    PackagePath,
+    /// The manifest `nav` property.
+    EpubNavProperty,
+    /// The manifest `cover-image` property.
+    CoverImageProperty,
+    /// EPUB 2 `meta name="cover"` metadata.
+    Opf2CoverMetadata,
+    /// The spine `toc` attribute.
+    SpineToc,
+}
+
+/// Explicit structural-resource selection outcome.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(
+        tag = "state",
+        rename_all = "kebab-case",
+        rename_all_fields = "camelCase",
+        deny_unknown_fields
+    )
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub enum ResourceSelection {
+    /// No applicable authored selection evidence exists.
+    #[default]
+    Absent,
+    /// One declaration or direct resource was selected.
+    Selected {
+        /// Relationship responsible for the selection.
+        source: SelectionSource,
+        /// Selected declaration, absent for the directly selected package resource.
+        declaration: Option<ManifestOrdinal>,
+        /// Resolved resource, absent when a selected declaration has no usable href.
+        resource: Option<ResourceOrdinal>,
+    },
+    /// An authored ID relationship matched no declaration.
+    UnresolvedAuthoredId {
+        /// Relationship containing the unresolved ID.
+        source: SelectionSource,
+        /// Exact modeled authored ID text.
+        authored_id: String,
+    },
+    /// More than one declaration satisfies the authored selection relationship.
+    Ambiguous {
+        /// Relationship responsible for the ambiguity.
+        source: SelectionSource,
+        /// Candidate declaration ordinals in manifest order.
+        candidates: Vec<ManifestOrdinal>,
+    },
+}
+
+impl ResourceSelection {
+    /// Returns the selected declaration, absent for the directly selected package resource.
+    pub fn declaration(&self) -> Option<ManifestOrdinal> {
+        match self {
+            Self::Selected { declaration, .. } => *declaration,
+            _ => None,
+        }
     }
-    /// Returns the lowercased local path extension, when present and UTF-8.
-    pub fn file_extension(&self) -> Option<&str> {
-        self.file_extension.as_deref()
+
+    /// Returns the resolved resource, absent when nothing was selected or the selected
+    /// declaration has no usable href.
+    pub fn resource(&self) -> Option<ResourceOrdinal> {
+        match self {
+            Self::Selected { resource, .. } => *resource,
+            _ => None,
+        }
     }
+}
+
+/// Explicit outcomes for publication structural-resource selections.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct ResourceSelections {
+    /// Selected package document.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub package: ResourceSelection,
+    /// Selected cover image.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub cover: ResourceSelection,
+    /// Selected EPUB navigation document declaration.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub epub_nav: ResourceSelection,
+    /// Selected EPUB 2 NCX declaration.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub ncx: ResourceSelection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// One resolved resource identity in a [`ResourceIndex`].
-///
-/// Provider-only resources have no declarations. Duplicate manifest declarations at the
-/// same address share this record, and declaration-derived predicates mean that at least one
-/// associated declaration supplied that classification.
-pub struct ResourceRecord {
-    key: ResourceKey,
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "camelCase", deny_unknown_fields)
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+struct ManifestDeclaration {
+    id: ManifestIdValue,
+    href: Option<AuthoredHref>,
+    target: DeclarationTarget,
+    media_type: Option<MediaType>,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(feature = "specta", specta(skip))]
+    properties: Vec<ManifestPropertyToken>,
+    fallback: Option<AuthoredIdRef>,
+    fallback_target: Option<IdrefTarget>,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(feature = "specta", specta(skip))]
+    media_overlay: Option<AuthoredIdRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "camelCase", deny_unknown_fields)
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+struct ResourceRecord {
     address: ResourceAddress,
-    declarations: Vec<ManifestKey>,
     presence: ProviderPresence,
-    metadata: ResourceMetadata,
-    has_xhtml: bool,
-    has_stylesheet: bool,
-    has_svg: bool,
+    declarations: Vec<ManifestOrdinal>,
+    // Derived from the declarations resolving here. A decoded index recomputes these rather than
+    // trusting them, so a supplied claim cannot disagree with the manifest it came with.
+    has_xhtml_declaration: bool,
+    has_stylesheet_declaration: bool,
+    has_svg_declaration: bool,
     scripted: bool,
 }
 
-impl ResourceRecord {
-    /// Returns this resource's index-local identity.
-    pub fn key(&self) -> ResourceKey {
-        self.key
-    }
-    /// Returns the canonical resolved address.
-    pub fn address(&self) -> &ResourceAddress {
-        &self.address
-    }
-    /// Returns the provider path when this is local.
-    pub fn local_path(&self) -> Option<&EpubPath> {
-        self.address.local_path()
-    }
-    /// Returns the URL when this is an HTTP(S) or scheme-relative remote resource.
-    pub fn remote_url(&self) -> Option<&str> {
-        self.address.remote_url()
-    }
-    /// Returns every manifest declaration resolving to this resource, in manifest order.
-    pub fn declarations(&self) -> &[ManifestKey] {
-        &self.declarations
-    }
-    /// Returns provider membership for this address.
-    pub fn presence(&self) -> ProviderPresence {
-        self.presence
-    }
-    /// Returns path and provider metadata available without reading content.
-    pub fn metadata(&self) -> &ResourceMetadata {
-        &self.metadata
-    }
-    /// Reports whether any declaration has valid XHTML MIME essence.
-    pub fn has_xhtml_declaration(&self) -> bool {
-        self.has_xhtml
-    }
-    /// Reports whether any declaration has valid CSS MIME essence.
-    pub fn has_stylesheet_declaration(&self) -> bool {
-        self.has_stylesheet
-    }
-    /// Reports whether any declaration has valid SVG MIME essence.
-    pub fn has_svg_declaration(&self) -> bool {
-        self.has_svg
-    }
-    /// Reports whether any declaration has the manifest `scripted` property.
-    pub fn is_scripted(&self) -> bool {
-        self.scripted
-    }
-    /// Reports whether at least one manifest declaration resolves to this resource.
-    pub fn is_manifest_resource(&self) -> bool {
-        !self.declarations.is_empty()
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Resolution state of one reading-order occurrence.
-pub enum ReadingOrderTarget {
-    /// The IDREF uniquely selected a declaration.
-    Declaration {
-        /// Selected manifest declaration.
-        declaration: ManifestKey,
-        /// Its resolved resource, absent when that declaration has no usable href.
-        resource: Option<ResourceKey>,
-    },
-    /// The spine itemref had no `idref` attribute.
-    MissingIdref,
-    /// The authored IDREF matched no valid manifest ID.
-    MissingManifestId,
-    /// The authored IDREF matched multiple manifest declarations.
-    AmbiguousManifestId {
-        /// Matching declarations in manifest order.
-        candidates: Vec<ManifestKey>,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-/// The authored source of a rendition presentation candidate.
-pub enum RenditionValueSource {
-    /// The candidate came from an unrefined package metadata `meta` element.
-    PackageMetadata,
-    /// The candidate came from a spine `itemref` property token.
-    ItemRefProperty,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-/// One authored rendition value and its optional recognized semantic projection.
-///
-/// Package metadata can omit content, so [`Self::authored_value`] and [`Self::value`] are
-/// independent. Itemref candidates retain the complete property token spelling as their authored
-/// value.
-pub struct RenditionCandidate<T> {
-    source: RenditionValueSource,
-    authored_value: Option<EpubString>,
-    value: Option<T>,
-}
-
-impl<T> RenditionCandidate<T> {
-    /// Returns where this candidate was authored.
-    pub fn source(&self) -> RenditionValueSource {
-        self.source
-    }
-
-    /// Borrows the authored metadata content or complete itemref property token.
-    pub fn authored_value(&self) -> Option<&EpubString> {
-        self.authored_value.as_ref()
-    }
-
-    /// Borrows the recognized typed value, if the authored value was recognized.
-    pub fn value(&self) -> Option<&T> {
-        self.value.as_ref()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-/// Authored state of one rendition presentation setting.
-///
-/// Candidate count is retained without deduplication: repeated declarations are ambiguous even
-/// when they project to the same typed value. No reading-system defaults are synthesized.
-pub enum RenditionSetting<T> {
-    /// No applicable itemref property or package metadata was authored.
-    Unspecified,
-    /// Exactly one applicable candidate was authored.
-    Specified(
-        /// The unique authored candidate.
-        RenditionCandidate<T>,
-    ),
-    /// More than one applicable candidate was authored, in source order.
-    Ambiguous(
-        /// All authored candidates responsible for the ambiguity.
-        Vec<RenditionCandidate<T>>,
-    ),
-}
-
-impl<T> RenditionSetting<T> {
-    /// Returns the recognized value only when exactly one candidate was authored and recognized.
-    pub fn value(&self) -> Option<&T> {
-        self.candidate().and_then(RenditionCandidate::value)
-    }
-
-    /// Returns the unique candidate, or `None` when unspecified or ambiguous.
-    pub fn candidate(&self) -> Option<&RenditionCandidate<T>> {
-        match self {
-            Self::Specified(candidate) => Some(candidate),
-            Self::Unspecified | Self::Ambiguous(_) => None,
-        }
-    }
-
-    /// Borrows all authored candidates in source order.
-    pub fn candidates(&self) -> &[RenditionCandidate<T>] {
-        match self {
-            Self::Unspecified => &[],
-            Self::Specified(candidate) => std::slice::from_ref(candidate),
-            Self::Ambiguous(candidates) => candidates,
-        }
-    }
-
-    /// Reports whether no applicable source value was authored.
-    pub fn is_unspecified(&self) -> bool {
-        matches!(self, Self::Unspecified)
-    }
-
-    fn from_candidates(candidates: Vec<RenditionCandidate<T>>) -> Self {
-        match candidates.len() {
-            0 => Self::Unspecified,
-            1 => Self::Specified(candidates.into_iter().next().expect("one candidate")),
-            _ => Self::Ambiguous(candidates),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-/// Occurrence-owned authored presentation state for one reading-order entry.
-///
-/// Rendition settings retain provenance, ambiguity, malformed source values, and itemref
-/// precedence. Page progression is copied from the spine and preserves an authored `default`;
-/// absent values and reading-system defaults remain absent.
-pub struct ReadingOrderPresentation {
-    layout: RenditionSetting<RenditionLayout>,
-    flow: RenditionSetting<RenditionFlow>,
-    orientation: RenditionSetting<RenditionOrientation>,
-    spread: RenditionSetting<RenditionSpread>,
-    page_spread: RenditionSetting<PageSpread>,
-    page_progression_direction: Option<PageProgressionDirection>,
-}
-
-impl ReadingOrderPresentation {
-    /// Returns the authored rendition layout state.
-    pub fn layout(&self) -> &RenditionSetting<RenditionLayout> {
-        &self.layout
-    }
-
-    /// Returns the authored historical rendition flow state.
-    pub fn flow(&self) -> &RenditionSetting<RenditionFlow> {
-        &self.flow
-    }
-
-    /// Returns the authored historical rendition orientation state.
-    pub fn orientation(&self) -> &RenditionSetting<RenditionOrientation> {
-        &self.orientation
-    }
-
-    /// Returns the authored historical rendition spread state.
-    pub fn spread(&self) -> &RenditionSetting<RenditionSpread> {
-        &self.spread
-    }
-
-    /// Returns the itemref-only synthetic page-spread placement state.
-    pub fn page_spread(&self) -> &RenditionSetting<PageSpread> {
-        &self.page_spread
-    }
-
-    /// Returns the spine-wide authored page progression direction, preserving `default`.
-    pub fn page_progression_direction(&self) -> Option<PageProgressionDirection> {
-        self.page_progression_direction
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-/// One occurrence in authored spine order.
-///
-/// Occurrences remain distinct even when they repeat the same IDREF or resource.
-pub struct ReadingOrderEntry {
-    key: ReadingOrderKey,
-    index: usize,
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "camelCase", deny_unknown_fields)
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+struct ReadingOrderOccurrence {
     idref: Option<AuthoredIdRef>,
-    target: ReadingOrderTarget,
+    target: Option<IdrefTarget>,
+    resource: Option<ResourceOrdinal>,
     linear: Linear,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(feature = "specta", specta(skip))]
     properties: Vec<SpinePropertyToken>,
     presentation: ReadingOrderPresentation,
 }
 
-impl ReadingOrderEntry {
-    /// Returns this occurrence's index-local identity.
-    pub fn key(&self) -> ReadingOrderKey {
-        self.key
-    }
-    /// Returns the zero-based authored spine position.
-    pub fn index(&self) -> usize {
-        self.index
-    }
-    /// Returns the exact authored IDREF when present.
-    pub fn idref(&self) -> Option<&AuthoredIdRef> {
-        self.idref.as_ref()
-    }
-    /// Returns the occurrence's declaration/resource resolution state.
-    pub fn target(&self) -> &ReadingOrderTarget {
-        &self.target
-    }
-    /// Returns effective linearity; missing or malformed source defaults to [`Linear::Yes`].
-    pub fn linear(&self) -> Linear {
-        self.linear
-    }
-    /// Returns cloned itemref property tokens in authored order.
-    pub fn properties(&self) -> &[SpinePropertyToken] {
-        &self.properties
-    }
-    /// Returns this occurrence's owned presentation snapshot.
-    pub fn presentation(&self) -> &ReadingOrderPresentation {
-        &self.presentation
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// An identity included in an ambiguous resource lookup result.
-pub enum ResourceLookupCandidate {
-    /// A resolved resource identity.
-    Resource(
-        /// Candidate resource identity.
-        ResourceKey,
-    ),
-    /// A manifest declaration identity.
-    Manifest(
-        /// Candidate manifest declaration identity.
-        ManifestKey,
-    ),
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// The resource inventory and lookup table for one publication state.
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+/// Everything the publication declares and everything the container holds, resolved against
+/// each other.
 ///
-/// Manifest declarations, resolved resources, and reading-order occurrences have separate
-/// identities. Cloning this index, including into publication analysis, preserves its private
-/// owner and all keys. Rebuilding after an edit creates a new owner; old keys then return
-/// [`IndexKeyError::ForeignIndex`]. Keys are therefore snapshot-local handles, not durable
-/// locators. Construction uses complete provider enumeration and performs no broad content
-/// parsing. Use [`crate::Epub::analyze`] when content-derived facts are needed.
+/// Two declarations of the same file are one resource.
 pub struct ResourceIndex {
-    id: ResourceIndexId,
-    declarations: Vec<ManifestDeclaration>,
+    package_path: EpubPath,
+    cover_path: Option<EpubPath>,
     resources: Vec<ResourceRecord>,
-    reading_order: Vec<ReadingOrderEntry>,
-    by_id: HashMap<String, Vec<ManifestKey>>,
-    by_address: HashMap<ResourceAddress, ResourceKey>,
-    package: ResourceKey,
-    epub_nav: Option<ResourceKey>,
-    ncx: Option<ResourceKey>,
-    cover_image: Option<ResourceKey>,
+    declarations: Vec<ManifestDeclaration>,
+    reading_order: Vec<ReadingOrderOccurrence>,
+    selections: ResourceSelections,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(feature = "specta", specta(skip))]
+    by_id: HashMap<String, Vec<ManifestOrdinal>>,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(feature = "specta", specta(skip))]
+    by_address: HashMap<ResourceAddress, ResourceOrdinal>,
+}
+
+/// One resource: where it lives, whether the container holds it, and what declares it.
+#[derive(Clone, Copy)]
+pub struct ResourceRef<'a> {
+    index: &'a ResourceIndex,
+    ordinal: ResourceOrdinal,
+}
+
+impl fmt::Debug for ResourceRef<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResourceRef")
+            .field("ordinal", &self.ordinal)
+            .field("address", self.address())
+            .finish()
+    }
+}
+
+impl PartialEq for ResourceRef<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.index, other.index) && self.ordinal == other.ordinal
+    }
+}
+
+impl Eq for ResourceRef<'_> {}
+
+impl<'a> ResourceRef<'a> {
+    fn record(self) -> &'a ResourceRecord {
+        &self.index.resources[self.ordinal.index()]
+    }
+
+    /// Returns this resource's position in the snapshot.
+    pub fn ordinal(self) -> ResourceOrdinal {
+        self.ordinal
+    }
+
+    /// Returns the canonical resolved address.
+    pub fn address(self) -> &'a ResourceAddress {
+        &self.record().address
+    }
+
+    /// Returns the provider path when this resource is local.
+    pub fn local_path(self) -> Option<&'a EpubPath> {
+        self.address().local_path()
+    }
+
+    /// Returns the URL when this is an HTTP(S) or scheme-relative resource.
+    pub fn remote_url(self) -> Option<&'a str> {
+        self.address().remote_url()
+    }
+
+    /// Iterates manifest declarations resolving to this resource in manifest order.
+    ///
+    /// Provider-only resources have none. Duplicate declarations at one address share this
+    /// resource.
+    pub fn declarations(self) -> impl ExactSizeIterator<Item = ManifestDeclarationRef<'a>> + 'a {
+        self.record()
+            .declarations
+            .iter()
+            .map(move |ordinal| ManifestDeclarationRef {
+                index: self.index,
+                ordinal: *ordinal,
+            })
+    }
+
+    /// Returns provider membership and size for this address.
+    pub fn presence(self) -> ProviderPresence {
+        self.record().presence
+    }
+
+    pub(crate) fn declares(self, media_type: impl Fn(&MediaType) -> bool) -> bool {
+        self.declarations()
+            .any(|declaration| declaration.media_type().is_some_and(&media_type))
+    }
+
+    /// Reports whether any declaration resolving here identifies XHTML.
+    ///
+    /// Duplicate declarations may disagree; this reports that at least one supplied the
+    /// classification.
+    pub fn has_xhtml_declaration(self) -> bool {
+        self.record().has_xhtml_declaration
+    }
+
+    /// Reports whether any declaration resolving here identifies CSS.
+    pub fn has_stylesheet_declaration(self) -> bool {
+        self.record().has_stylesheet_declaration
+    }
+
+    /// Reports whether any declaration resolving here identifies SVG.
+    pub fn has_svg_declaration(self) -> bool {
+        self.record().has_svg_declaration
+    }
+
+    /// Reports whether any declaration resolving here carries the manifest `scripted` property.
+    pub fn is_scripted(self) -> bool {
+        self.record().scripted
+    }
+}
+
+/// One `item` in the package manifest, and the resource it resolves to.
+#[derive(Clone, Copy)]
+pub struct ManifestDeclarationRef<'a> {
+    index: &'a ResourceIndex,
+    ordinal: ManifestOrdinal,
+}
+
+impl fmt::Debug for ManifestDeclarationRef<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManifestDeclarationRef")
+            .field("ordinal", &self.ordinal)
+            .field("id", self.id())
+            .finish()
+    }
+}
+
+impl PartialEq for ManifestDeclarationRef<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.index, other.index) && self.ordinal == other.ordinal
+    }
+}
+
+impl Eq for ManifestDeclarationRef<'_> {}
+
+impl<'a> ManifestDeclarationRef<'a> {
+    fn record(self) -> &'a ManifestDeclaration {
+        &self.index.declarations[self.ordinal.index()]
+    }
+
+    /// Returns this declaration's position in the snapshot.
+    pub fn ordinal(self) -> ManifestOrdinal {
+        self.ordinal
+    }
+
+    /// Returns the authored ID state.
+    pub fn id(self) -> &'a ManifestIdValue {
+        &self.record().id
+    }
+
+    /// Returns the exact authored href when present.
+    pub fn href(self) -> Option<&'a AuthoredHref> {
+        self.record().href.as_ref()
+    }
+
+    /// Returns this declaration's resolution state.
+    pub fn target(self) -> DeclarationTarget {
+        self.record().target
+    }
+
+    /// Returns the resolved physical resource, when available.
+    pub fn resource(self) -> Option<ResourceRef<'a>> {
+        self.target().resource().map(|ordinal| ResourceRef {
+            index: self.index,
+            ordinal,
+        })
+    }
+
+    /// Returns the declared media type when present.
+    ///
+    /// A returned [`MediaType`] may contain malformed MIME syntax; use
+    /// [`MediaType::is_valid`] before relying on parsed MIME facts.
+    pub fn media_type(self) -> Option<&'a MediaType> {
+        self.record().media_type.as_ref()
+    }
+
+    /// Returns manifest property tokens in authored order.
+    pub fn properties(self) -> &'a [ManifestPropertyToken] {
+        &self.record().properties
+    }
+
+    /// Returns the exact authored fallback IDREF when present.
+    pub fn fallback(self) -> Option<&'a AuthoredIdRef> {
+        self.record().fallback.as_ref()
+    }
+
+    /// Returns the resolution of the authored fallback IDREF when present.
+    pub fn fallback_target(self) -> Option<&'a IdrefTarget> {
+        self.record().fallback_target.as_ref()
+    }
+
+    /// Returns the exact authored media-overlay IDREF when present.
+    pub fn media_overlay(self) -> Option<&'a AuthoredIdRef> {
+        self.record().media_overlay.as_ref()
+    }
+}
+
+/// One entry in the spine.
+///
+/// A book that reads the same chapter twice has two entries here, not one.
+#[derive(Clone, Copy)]
+pub struct ReadingOrderOccurrenceRef<'a> {
+    index: &'a ResourceIndex,
+    ordinal: ReadingOrderOrdinal,
+}
+
+impl fmt::Debug for ReadingOrderOccurrenceRef<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReadingOrderOccurrenceRef")
+            .field("ordinal", &self.ordinal)
+            .field("idref", &self.idref())
+            .finish()
+    }
+}
+
+impl PartialEq for ReadingOrderOccurrenceRef<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.index, other.index) && self.ordinal == other.ordinal
+    }
+}
+
+impl Eq for ReadingOrderOccurrenceRef<'_> {}
+
+impl<'a> ReadingOrderOccurrenceRef<'a> {
+    fn record(self) -> &'a ReadingOrderOccurrence {
+        &self.index.reading_order[self.ordinal.index()]
+    }
+
+    /// Returns this occurrence's position in authored spine order.
+    pub fn ordinal(self) -> ReadingOrderOrdinal {
+        self.ordinal
+    }
+
+    /// Returns the exact authored IDREF when present.
+    pub fn idref(self) -> Option<&'a AuthoredIdRef> {
+        self.record().idref.as_ref()
+    }
+
+    /// Returns the IDREF resolution, or `None` when the itemref had no `idref`.
+    pub fn target(self) -> Option<&'a IdrefTarget> {
+        self.record().target.as_ref()
+    }
+
+    /// Returns the uniquely selected declaration, when available.
+    pub fn declaration(self) -> Option<ManifestDeclarationRef<'a>> {
+        self.target()
+            .and_then(IdrefTarget::declaration)
+            .map(|ordinal| ManifestDeclarationRef {
+                index: self.index,
+                ordinal,
+            })
+    }
+
+    /// Returns the resolved physical resource, when available.
+    pub fn resource(self) -> Option<ResourceRef<'a>> {
+        self.record().resource.map(|ordinal| ResourceRef {
+            index: self.index,
+            ordinal,
+        })
+    }
+
+    /// Returns effective linearity; missing or malformed source defaults to [`Linear::Yes`].
+    pub fn linear(self) -> Linear {
+        self.record().linear
+    }
+
+    /// Returns itemref property tokens in authored order.
+    pub fn properties(self) -> &'a [SpinePropertyToken] {
+        &self.record().properties
+    }
+
+    /// Returns this occurrence's presentation snapshot.
+    pub fn presentation(self) -> &'a ReadingOrderPresentation {
+        &self.record().presentation
+    }
 }
 
 impl ResourceIndex {
     pub(crate) fn new(
         package: &Package,
-        package_path: impl AsRef<Path>,
-        provider_index: &ResourceProviderIndex,
-    ) -> Self {
-        let id = ResourceIndexId::fresh();
-        let package_path = EpubPath::new(package_path).expect("package path is canonical");
-        let package_address = ResourceAddress::Local(package_path.clone());
-        let package_key = ResourceKey { owner: id, slot: 0 };
-        let package_entry = provider_index.get(&package_path);
-        let mut resources = vec![ResourceRecord {
-            key: package_key,
-            address: package_address.clone(),
-            declarations: Vec::new(),
-            presence: if package_entry.is_some() {
-                ProviderPresence::Present
-            } else {
-                ProviderPresence::Missing
-            },
-            metadata: metadata_for_address(
-                &package_address,
-                package_entry.and_then(|entry| entry.size_bytes()),
-            ),
-            has_xhtml: false,
-            has_stylesheet: false,
-            has_svg: false,
-            scripted: false,
-        }];
-        let mut by_address = HashMap::from([(package_address, package_key)]);
-        let mut declarations = Vec::with_capacity(package.manifest().items().len());
-        let mut by_id = HashMap::<String, Vec<ManifestKey>>::new();
+        package_path: &EpubPath,
+        provider_index: &ProviderIndex,
+    ) -> Result<Self, ResourceIndexError> {
+        let items = package.manifest().items();
+        let itemrefs = package.spine().itemrefs();
+        ensure_ordinal_count(items.len(), ResourceIndexCollection::ManifestDeclarations)?;
+        ensure_ordinal_count(
+            itemrefs.len(),
+            ResourceIndexCollection::ReadingOrderOccurrences,
+        )?;
 
-        for item in package.manifest().items() {
-            let key = ManifestKey {
-                owner: id,
-                slot: declarations.len() as u32,
-            };
-            let id_value = match item.id() {
-                Some(value) => ResourceId::new(value.as_str())
-                    .map(ManifestIdValue::Valid)
-                    .unwrap_or_else(|| ManifestIdValue::Invalid(value.as_str().to_string())),
+        let mut index = Self {
+            package_path: package_path.clone(),
+            cover_path: None,
+            resources: Vec::new(),
+            declarations: Vec::with_capacity(items.len()),
+            reading_order: Vec::with_capacity(itemrefs.len()),
+            selections: ResourceSelections {
+                package: ResourceSelection::Absent,
+                cover: ResourceSelection::Absent,
+                epub_nav: ResourceSelection::Absent,
+                ncx: ResourceSelection::Absent,
+            },
+            by_id: HashMap::new(),
+            by_address: HashMap::new(),
+        };
+        let package_ordinal =
+            index.insert_resource(ResourceAddress::Local(package_path.clone()), provider_index)?;
+        index.selections.package = ResourceSelection::Selected {
+            source: SelectionSource::PackagePath,
+            declaration: None,
+            resource: Some(package_ordinal),
+        };
+
+        for (position, item) in items.iter().enumerate() {
+            let ordinal = ManifestOrdinal::from_index(position);
+            let id = match item.id() {
+                Some(value) => match normalize_manifest_id(value) {
+                    Ok(value) => ManifestIdValue::Valid(value.to_string()),
+                    Err(_) => ManifestIdValue::Invalid(value.to_string()),
+                },
                 None => ManifestIdValue::Missing,
             };
-            if let ManifestIdValue::Valid(value) = &id_value {
-                by_id
-                    .entry(value.as_str().to_string())
-                    .or_default()
-                    .push(key);
+            if let ManifestIdValue::Valid(value) = &id {
+                index.by_id.entry(value.clone()).or_default().push(ordinal);
             }
             let href = item.authored_href().cloned();
-            let target = match href.as_ref() {
+            let target = match &href {
                 None => DeclarationTarget::MissingHref,
-                Some(href) => {
-                    match address_for_parsed_href(&parse_href(href.clone()), &package_path) {
-                        Some(address) if !matches!(address, ResourceAddress::Invalid(_)) => {
-                            let resource_key = if let Some(key) = by_address.get(&address).copied()
-                            {
-                                key
-                            } else {
-                                let key = ResourceKey {
-                                    owner: id,
-                                    slot: resources.len() as u32,
-                                };
-                                let provider_entry = address
-                                    .local_path()
-                                    .and_then(|path| provider_index.get(path));
-                                let presence = match &address {
-                                    ResourceAddress::Local(_) => {
-                                        if provider_entry.is_some() {
-                                            ProviderPresence::Present
-                                        } else {
-                                            ProviderPresence::Missing
-                                        }
-                                    }
-                                    ResourceAddress::Remote(_)
-                                    | ResourceAddress::Data(_)
-                                    | ResourceAddress::External(_) => {
-                                        ProviderPresence::NotApplicable
-                                    }
-                                    ResourceAddress::Invalid(_) => unreachable!(),
-                                };
-                                resources.push(ResourceRecord {
-                                    key,
-                                    address: address.clone(),
-                                    declarations: Vec::new(),
-                                    presence,
-                                    metadata: metadata_for_address(
-                                        &address,
-                                        provider_entry.and_then(|entry| entry.size_bytes()),
-                                    ),
-                                    has_xhtml: false,
-                                    has_stylesheet: false,
-                                    has_svg: false,
-                                    scripted: false,
-                                });
-                                by_address.insert(address, key);
-                                key
-                            };
-                            DeclarationTarget::Resource(resource_key)
-                        }
-                        _ => DeclarationTarget::InvalidHref(href.clone()),
+                Some(href) => match resolve_href(href, package_path) {
+                    Ok(resolved) => {
+                        let resource = index.insert_resource(resolved.address, provider_index)?;
+                        let record = &mut index.resources[resource.index()];
+                        record.declarations.push(ordinal);
+                        record.has_xhtml_declaration |=
+                            item.media_type().is_some_and(MediaType::is_xhtml);
+                        record.has_stylesheet_declaration |=
+                            item.media_type().is_some_and(MediaType::is_css);
+                        record.has_svg_declaration |=
+                            item.media_type().is_some_and(MediaType::is_svg);
+                        record.scripted |= item.has_property(KnownManifestProperty::Scripted);
+                        DeclarationTarget::Resource { resource }
                     }
-                }
+                    Err(_) => DeclarationTarget::InvalidHref,
+                },
             };
-            if let DeclarationTarget::Resource(resource_key) = target {
-                let record = &mut resources[resource_key.slot as usize];
-                record.declarations.push(key);
-                record.has_xhtml |= item.media_type().is_some_and(MediaType::is_xhtml);
-                record.has_stylesheet |= item.media_type().is_some_and(MediaType::is_css);
-                record.has_svg |= item.media_type().is_some_and(MediaType::is_svg);
-                record.scripted |= item.has_property(KnownManifestProperty::Scripted);
-            }
-            declarations.push(ManifestDeclaration {
-                key,
-                id: id_value,
+            index.declarations.push(ManifestDeclaration {
+                id,
                 href,
                 target,
                 media_type: item.media_type().cloned(),
                 properties: item.properties().to_vec(),
-                fallback: item
-                    .fallback()
-                    .map(|value| AuthoredIdRef::new(value.as_str())),
-                media_overlay: item
-                    .media_overlay()
-                    .map(|value| AuthoredIdRef::new(value.as_str())),
+                fallback: item.fallback().map(AuthoredIdRef::new),
+                fallback_target: None,
+                media_overlay: item.media_overlay().map(AuthoredIdRef::new),
             });
+        }
+        for position in 0..index.declarations.len() {
+            let target = index.declarations[position]
+                .fallback
+                .as_ref()
+                .map(|fallback| index.resolve_idref(fallback.as_str()));
+            index.declarations[position].fallback_target = target;
         }
 
         for entry in provider_index.publication_entries() {
-            let address = ResourceAddress::Local(entry.path().clone());
-            if by_address.contains_key(&address) {
-                continue;
-            }
-            let key = ResourceKey {
-                owner: id,
-                slot: resources.len() as u32,
-            };
-            resources.push(ResourceRecord {
-                key,
-                address: address.clone(),
-                declarations: Vec::new(),
-                presence: ProviderPresence::Present,
-                metadata: metadata_for_address(&address, entry.size_bytes()),
-                has_xhtml: false,
-                has_stylesheet: false,
-                has_svg: false,
-                scripted: false,
-            });
-            by_address.insert(address, key);
+            index.insert_resource(ResourceAddress::Local(entry.path.clone()), provider_index)?;
         }
 
-        let reading_order = package
-            .spine()
-            .itemrefs()
+        index.reading_order = itemrefs
             .iter()
-            .enumerate()
-            .map(|(index, itemref)| {
-                let key = ReadingOrderKey {
-                    owner: id,
-                    slot: index as u32,
-                };
-                let idref = itemref
-                    .idref()
-                    .map(|value| AuthoredIdRef::new(value.as_str()));
-                let target = match idref.as_ref().and_then(|value| by_id.get(value.as_str())) {
-                    None if idref.is_none() => ReadingOrderTarget::MissingIdref,
-                    None => ReadingOrderTarget::MissingManifestId,
-                    Some(keys) if keys.len() > 1 => ReadingOrderTarget::AmbiguousManifestId {
-                        candidates: keys.clone(),
-                    },
-                    Some(keys) => {
-                        let declaration = keys[0];
-                        let resource = match declarations[declaration.slot as usize].target {
-                            DeclarationTarget::Resource(key) => Some(key),
-                            DeclarationTarget::MissingHref | DeclarationTarget::InvalidHref(_) => {
-                                None
-                            }
-                        };
-                        ReadingOrderTarget::Declaration {
-                            declaration,
-                            resource,
-                        }
-                    }
-                };
-                ReadingOrderEntry {
-                    key,
-                    index,
-                    idref,
+            .map(|itemref| {
+                let idref = itemref.idref().map(AuthoredIdRef::new);
+                let target = idref
+                    .as_ref()
+                    .map(|idref| index.resolve_idref(idref.as_str()));
+                ReadingOrderOccurrence {
+                    resource: target.as_ref().and_then(IdrefTarget::declaration).and_then(
+                        |declaration| index.declarations[declaration.index()].target.resource(),
+                    ),
                     target,
+                    idref,
                     linear: itemref.linear(),
                     properties: itemref.properties().to_vec(),
-                    presentation: reading_order_presentation(package, itemref),
+                    presentation: ReadingOrderPresentation::of(package, itemref),
                 }
             })
             .collect();
 
-        let key_for_item = |selected: Option<&ManifestItem>| {
-            selected.and_then(|selected| {
-                package
-                    .manifest()
-                    .items()
-                    .iter()
-                    .position(|item| std::ptr::eq(item, selected))
-                    .and_then(|slot| match declarations[slot].target {
-                        DeclarationTarget::Resource(key) => Some(key),
-                        _ => None,
-                    })
-            })
+        let (cover, epub_nav, ncx) = package.resource_selections();
+        let resolve = |selection: ResourceSelection| match selection {
+            ResourceSelection::Selected {
+                source,
+                declaration: Some(declaration),
+                ..
+            } => ResourceSelection::Selected {
+                source,
+                declaration: Some(declaration),
+                resource: index.declarations[declaration.index()].target.resource(),
+            },
+            selection => selection,
         };
-        let epub_nav = key_for_item(package.nav_item());
-        let ncx = key_for_item(package.ncx_item());
-        let cover_image = key_for_item(package.cover_image_item());
-        Self {
-            id,
-            declarations,
-            resources,
-            reading_order,
-            by_id,
-            by_address,
-            package: package_key,
-            epub_nav,
-            ncx,
-            cover_image,
+        index.selections.cover = resolve(cover);
+        index.selections.epub_nav = resolve(epub_nav);
+        index.selections.ncx = resolve(ncx);
+        index.cover_path = index
+            .cover_image()
+            .filter(|resource| resource.presence().is_present())
+            .and_then(|resource| resource.local_path().cloned());
+        Ok(index)
+    }
+
+    fn insert_resource(
+        &mut self,
+        address: ResourceAddress,
+        provider_index: &ProviderIndex,
+    ) -> Result<ResourceOrdinal, ResourceIndexError> {
+        if let Some(ordinal) = self.by_address.get(&address) {
+            return Ok(*ordinal);
+        }
+        ensure_ordinal_count(self.resources.len() + 1, ResourceIndexCollection::Resources)?;
+        let ordinal = ResourceOrdinal::from_index(self.resources.len());
+        let presence = match address.local_path() {
+            Some(path) => provider_index
+                .get(path)
+                .map_or(ProviderPresence::Missing, |entry| {
+                    ProviderPresence::Present {
+                        size_bytes: entry.size_bytes,
+                    }
+                }),
+            None => ProviderPresence::NotApplicable,
+        };
+        self.resources.push(ResourceRecord {
+            address: address.clone(),
+            presence,
+            declarations: Vec::new(),
+            has_xhtml_declaration: false,
+            has_stylesheet_declaration: false,
+            has_svg_declaration: false,
+            scripted: false,
+        });
+        self.by_address.insert(address, ordinal);
+        Ok(ordinal)
+    }
+
+    pub(crate) fn resolve_idref(&self, value: &str) -> IdrefTarget {
+        let Ok(value) = normalize_manifest_id(value) else {
+            return IdrefTarget::Invalid;
+        };
+        match self.by_id.get(value).map(Vec::as_slice).unwrap_or_default() {
+            [] => IdrefTarget::Missing,
+            [ordinal] => IdrefTarget::Declaration(*ordinal),
+            candidates => IdrefTarget::Ambiguous(candidates.to_vec()),
         }
     }
 
-    /// Returns the number of distinct resolved resources.
+    /// Every `item` in the package manifest, in authored order.
+    pub fn declarations(&self) -> impl ExactSizeIterator<Item = ManifestDeclarationRef<'_>> {
+        (0..self.declarations.len()).map(|position| ManifestDeclarationRef {
+            index: self,
+            ordinal: ManifestOrdinal::from_index(position),
+        })
+    }
+
+    /// Every distinct resource in the publication, one per address.
     ///
-    /// This includes the package document, manifest resources, and provider-only publication
-    /// resources; duplicate declarations at one address count once.
-    pub fn len(&self) -> usize {
-        self.resources.len()
+    /// `mimetype` and `META-INF` are container files, not resources. Declared targets that are
+    /// remote, or that the container doesn't hold, are.
+    pub fn resources(&self) -> impl ExactSizeIterator<Item = ResourceRef<'_>> {
+        (0..self.resources.len()).map(|position| ResourceRef {
+            index: self,
+            ordinal: ResourceOrdinal::from_index(position),
+        })
     }
-    /// Reports whether the resource inventory is empty.
+
+    /// Every entry in the spine, in reading order.
     ///
-    /// A normally constructed publication index contains at least its package resource.
-    pub fn is_empty(&self) -> bool {
-        self.resources.is_empty()
+    /// An entry whose `idref` names nothing, or names more than one declaration, still appears
+    /// here with no resource.
+    pub fn reading_order(&self) -> impl ExactSizeIterator<Item = ReadingOrderOccurrenceRef<'_>> {
+        (0..self.reading_order.len()).map(|position| ReadingOrderOccurrenceRef {
+            index: self,
+            ordinal: ReadingOrderOrdinal::from_index(position),
+        })
     }
-    /// Returns all manifest declarations in authored order.
-    pub fn declarations(&self) -> &[ManifestDeclaration] {
-        &self.declarations
+
+    /// Only the resources the manifest declares, skipping files the container merely holds.
+    pub fn manifest_resources(&self) -> impl Iterator<Item = ResourceRef<'_>> {
+        self.resources()
+            .filter(|resource| resource.declarations().len() > 0)
     }
-    /// Returns all distinct resource records in deterministic index order.
-    pub fn resources(&self) -> &[ResourceRecord] {
-        &self.resources
+
+    /// The resource at this position, or `None` if the position is past the end.
+    ///
+    /// Positions belong to the index that produced them. One from a different index points at a
+    /// different resource, or at nothing.
+    pub fn resource(&self, ordinal: ResourceOrdinal) -> Option<ResourceRef<'_>> {
+        (ordinal.index() < self.resources.len()).then_some(ResourceRef {
+            index: self,
+            ordinal,
+        })
     }
-    /// Iterates every authored spine occurrence in order.
-    pub fn reading_order(&self) -> impl Iterator<Item = &ReadingOrderEntry> {
-        self.reading_order.iter()
+
+    /// The declaration at this position, or `None` if the position is past the end.
+    ///
+    /// Positions belong to the index that produced them.
+    pub fn declaration(&self, ordinal: ManifestOrdinal) -> Option<ManifestDeclarationRef<'_>> {
+        (ordinal.index() < self.declarations.len()).then_some(ManifestDeclarationRef {
+            index: self,
+            ordinal,
+        })
     }
-    /// Iterates resources having at least one manifest declaration.
-    pub fn manifest_resources(&self) -> impl Iterator<Item = &ResourceRecord> {
-        self.resources
-            .iter()
-            .filter(|record| record.is_manifest_resource())
-    }
-    /// Resolves a resource key owned by this index snapshot.
-    pub fn resource(&self, key: ResourceKey) -> Result<&ResourceRecord, IndexKeyError> {
-        self.check_owner(key.owner)?;
-        self.resources
-            .get(key.slot as usize)
-            .ok_or(IndexKeyError::UnknownKey)
-    }
-    /// Resolves a manifest key owned by this index snapshot.
-    pub fn declaration(&self, key: ManifestKey) -> Result<&ManifestDeclaration, IndexKeyError> {
-        self.check_owner(key.owner)?;
-        self.declarations
-            .get(key.slot as usize)
-            .ok_or(IndexKeyError::UnknownKey)
-    }
-    /// Resolves a reading-order key owned by this index snapshot.
-    pub fn reading_order_entry(
+
+    /// The spine entry at this position, or `None` if the position is past the end.
+    ///
+    /// Positions belong to the index that produced them.
+    pub fn occurrence(
         &self,
-        key: ReadingOrderKey,
-    ) -> Result<&ReadingOrderEntry, IndexKeyError> {
-        self.check_owner(key.owner)?;
-        self.reading_order
-            .get(key.slot as usize)
-            .ok_or(IndexKeyError::UnknownKey)
+        ordinal: ReadingOrderOrdinal,
+    ) -> Option<ReadingOrderOccurrenceRef<'_>> {
+        (ordinal.index() < self.reading_order.len()).then_some(ReadingOrderOccurrenceRef {
+            index: self,
+            ordinal,
+        })
     }
+
+    /// Returns the resource at an exact resolved address.
+    pub fn resource_at(&self, address: &ResourceAddress) -> Option<ResourceRef<'_>> {
+        self.by_address.get(address).map(|ordinal| ResourceRef {
+            index: self,
+            ordinal: *ordinal,
+        })
+    }
+
+    /// Returns the local resource at an exact canonical path.
+    pub fn resource_by_path(&self, path: &EpubPath) -> Option<ResourceRef<'_>> {
+        self.resource_at(&ResourceAddress::Local(path.clone()))
+    }
+
     /// Iterates declarations whose valid manifest ID exactly equals `value`.
     ///
     /// Invalid authored IDs are preserved on declarations but are not indexed by this query.
     pub fn declarations_with_id<'a>(
         &'a self,
-        value: &'a str,
-    ) -> impl Iterator<Item = &'a ManifestDeclaration> + 'a {
-        self.by_id
+        value: &str,
+    ) -> Result<
+        impl Iterator<Item = ManifestDeclarationRef<'a>> + 'a,
+        crate::package::InvalidManifestId,
+    > {
+        let value = normalize_manifest_id(value)?;
+        Ok(self
+            .by_id
             .get(value)
             .into_iter()
             .flatten()
-            .filter_map(|key| self.declarations.get(key.slot as usize))
+            .map(|ordinal| ManifestDeclarationRef {
+                index: self,
+                ordinal: *ordinal,
+            }))
     }
-    /// Iterates the resource at an exact resolved address.
+
+    /// Selects the one declaration with this manifest ID.
     ///
-    /// Address identity is unique, so this iterator yields zero or one record; duplicate
-    /// declarations remain available through [`ResourceRecord::declarations`].
-    pub fn resources_at<'a>(
-        &'a self,
-        address: &ResourceAddress,
-    ) -> impl Iterator<Item = &'a ResourceRecord> + 'a {
-        self.by_address
-            .get(address)
-            .and_then(|key| self.resources.get(key.slot as usize))
-            .into_iter()
-    }
-    /// Selects exactly one declaration by valid manifest ID.
-    ///
-    /// The lookup reports duplicate IDs as ambiguity and does not require the declaration's
-    /// href to resolve to a resource.
-    pub fn find_unique_by_id(
-        &self,
-        value: &str,
-    ) -> Result<&ManifestDeclaration, ResourceLookupError> {
-        let selector = ResourceSelector::Id(
-            ResourceId::new(value).unwrap_or_else(|| ResourceId(value.to_string())),
-        );
-        let keys = self.by_id.get(value).map(Vec::as_slice).unwrap_or_default();
-        match keys {
-            [] => Err(ResourceLookupError::NotFound(selector)),
-            [key] => Ok(&self.declarations[key.slot as usize]),
-            keys => Err(ResourceLookupError::Ambiguous {
-                selector,
-                candidates: keys
-                    .iter()
-                    .copied()
-                    .map(ResourceLookupCandidate::Manifest)
-                    .collect(),
+    /// Returns `None` for invalid ID syntax, no match, and duplicate IDs alike.
+    /// [`Self::declarations_with_id`] tells those apart: it reports invalid syntax as an error,
+    /// no match as an empty iterator, and ambiguity as more than one candidate. The declaration's
+    /// href need not resolve to a resource.
+    pub fn declaration_by_id(&self, value: &str) -> Option<ManifestDeclarationRef<'_>> {
+        let id = normalize_manifest_id(value).ok()?;
+        match self.resolve_idref(id) {
+            IdrefTarget::Declaration(ordinal) => Some(ManifestDeclarationRef {
+                index: self,
+                ordinal,
             }),
+            IdrefTarget::Ambiguous(_) | IdrefTarget::Invalid | IdrefTarget::Missing => None,
         }
     }
-    /// Selects exactly one declaration by ID and returns its resolved resource.
-    ///
-    /// A unique declaration with a missing or invalid href produces
-    /// [`ResourceLookupError::UnresolvedDeclaration`].
-    pub fn find_unique_resource_by_id(
-        &self,
-        value: &str,
-    ) -> Result<&ResourceRecord, ResourceLookupError> {
-        let declaration = self.find_unique_by_id(value)?;
-        match declaration.target {
-            DeclarationTarget::Resource(key) => Ok(&self.resources[key.slot as usize]),
-            DeclarationTarget::MissingHref | DeclarationTarget::InvalidHref(_) => {
-                Err(ResourceLookupError::UnresolvedDeclaration(declaration.key))
-            }
-        }
-    }
+
     /// Returns the loaded package document resource.
-    pub fn package(&self) -> &ResourceRecord {
-        &self.resources[self.package.slot as usize]
+    pub fn package(&self) -> ResourceRef<'_> {
+        ResourceRef {
+            index: self,
+            ordinal: self
+                .selections
+                .package
+                .resource()
+                .expect("package resource is always selected"),
+        }
     }
+
+    /// The cover image's path, ready to read.
+    ///
+    /// `None` when the book declares no cover, or declares one that is remote, unresolved, or
+    /// absent from the container. [`Self::selections`] says which of those it was.
+    pub fn cover_path(&self) -> Option<&EpubPath> {
+        self.cover_path.as_ref()
+    }
+
+    /// The path of the package document this rendition was opened from.
+    pub fn package_path(&self) -> &EpubPath {
+        &self.package_path
+    }
+
     /// Returns the package-selected EPUB navigation resource, when one resolved.
-    pub fn epub_nav(&self) -> Option<&ResourceRecord> {
-        self.epub_nav
-            .and_then(|key| self.resources.get(key.slot as usize))
+    pub fn epub_nav(&self) -> Option<ResourceRef<'_>> {
+        self.selected_resource(&self.selections.epub_nav)
     }
+
     /// Returns the package-selected NCX resource, when one resolved.
-    pub fn ncx(&self) -> Option<&ResourceRecord> {
-        self.ncx
-            .and_then(|key| self.resources.get(key.slot as usize))
+    pub fn ncx(&self) -> Option<ResourceRef<'_>> {
+        self.selected_resource(&self.selections.ncx)
     }
+
     /// Returns the package-selected cover image resource, when one resolved.
-    pub fn cover_image(&self) -> Option<&ResourceRecord> {
-        self.cover_image
-            .and_then(|key| self.resources.get(key.slot as usize))
+    pub fn cover_image(&self) -> Option<ResourceRef<'_>> {
+        self.selected_resource(&self.selections.cover)
     }
-    /// Resolves authored href text relative to the package document.
-    ///
-    /// Resolution classifies syntax and canonical address identity but does not read bytes or
-    /// establish resource or fragment existence.
-    pub fn resolve_manifest_href(&self, href: impl AsRef<str>) -> ResolvedHref {
-        self.resolve_href_from(href, self.package().local_path().expect("package is local"))
+
+    /// Returns structural selection outcomes, including unresolved and ambiguous selections.
+    pub fn selections(&self) -> &ResourceSelections {
+        &self.selections
     }
-    /// Resolves a link found in `source` to the address an application should target.
-    ///
-    /// The resolver percent-decodes local paths, removes relative dot segments during
-    /// source-relative resolution, and never repairs malformed authored syntax. Fragment
-    /// existence remains unknown because resolution does not parse target content.
-    pub fn resolve_href_from(&self, href: impl AsRef<str>, source: &EpubPath) -> ResolvedHref {
-        target_for_href(&AuthoredHref::new(href.as_ref()), source)
+
+    pub(crate) fn epub_nav_declaration(&self) -> Option<ManifestOrdinal> {
+        self.selections.epub_nav.declaration()
     }
-    /// Selects one indexed resource using a typed selector.
+
+    pub(crate) fn ncx_declaration(&self) -> Option<ManifestOrdinal> {
+        self.selections.ncx.declaration()
+    }
+
+    /// Resolves an href written in the package document to the address it points at.
     ///
-    /// Href selectors first resolve against their stated base. Syntactically valid addresses
-    /// that are absent from the inventory return [`ResourceLookupError::NotFound`].
-    pub fn select(
+    /// The address need not exist; nothing is read to check.
+    pub fn resolve_manifest_href(
         &self,
-        selector: &ResourceSelector,
-    ) -> Result<&ResourceRecord, ResourceLookupError> {
-        let key = match selector {
-            ResourceSelector::Id(id) => return self.find_unique_resource_by_id(id.as_str()),
-            ResourceSelector::Path(path) => {
-                self.by_address.get(&ResourceAddress::Local(path.clone()))
-            }
-            ResourceSelector::Address(address) => self.by_address.get(address),
-            ResourceSelector::ManifestHref(href) => {
-                return self.select_resolved(selector, self.resolve_manifest_href(href.as_str()));
-            }
-            ResourceSelector::HrefFrom { href, source } => {
-                return self
-                    .select_resolved(selector, self.resolve_href_from(href.as_str(), source));
-            }
-            ResourceSelector::Package => Some(&self.package),
-            ResourceSelector::EpubNav => self.epub_nav.as_ref(),
-            ResourceSelector::CoverImage => self.cover_image.as_ref(),
-        };
-        key.and_then(|key| self.resources.get(key.slot as usize))
-            .ok_or_else(|| ResourceLookupError::NotFound(selector.clone()))
-    }
-    fn select_resolved(
-        &self,
-        selector: &ResourceSelector,
-        resolved: ResolvedHref,
-    ) -> Result<&ResourceRecord, ResourceLookupError> {
-        let address = match resolved {
-            ResolvedHref::Resource(address)
-            | ResolvedHref::Fragment {
-                resource: address, ..
-            } => address,
-            ResolvedHref::RemoteUrl(value) => ResourceAddress::Remote(value),
-            ResolvedHref::Data(value) => ResourceAddress::Data(value),
-            ResolvedHref::External(value) => ResourceAddress::External(value),
-            ResolvedHref::Invalid(_)
-            | ResolvedHref::MissingPath(_)
-            | ResolvedHref::MissingManifestId(_)
-            | ResolvedHref::AmbiguousAddress { .. } => {
-                return Err(ResourceLookupError::NotFound(selector.clone()));
-            }
-        };
-        self.by_address
-            .get(&address)
-            .and_then(|key| self.resources.get(key.slot as usize))
-            .ok_or_else(|| ResourceLookupError::NotFound(selector.clone()))
-    }
-    fn check_owner(&self, owner: ResourceIndexId) -> Result<(), IndexKeyError> {
-        if owner == self.id {
-            Ok(())
-        } else {
-            Err(IndexKeyError::ForeignIndex)
-        }
-    }
-}
-
-fn reading_order_presentation(package: &Package, itemref: &ItemRef) -> ReadingOrderPresentation {
-    ReadingOrderPresentation {
-        layout: rendition_setting(
-            package,
-            itemref,
-            KnownMetaProperty::RenditionLayout,
-            Meta::rendition_layout,
-            |property| match property {
-                KnownSpineProperty::RenditionLayoutPrePaginated => {
-                    Some(RenditionLayout::PrePaginated)
-                }
-                KnownSpineProperty::RenditionLayoutReflowable => Some(RenditionLayout::Reflowable),
-                _ => None,
-            },
-        ),
-        flow: rendition_setting(
-            package,
-            itemref,
-            KnownMetaProperty::RenditionFlow,
-            Meta::rendition_flow,
-            |property| match property {
-                KnownSpineProperty::RenditionFlowAuto => Some(RenditionFlow::Auto),
-                KnownSpineProperty::RenditionFlowPaginated => Some(RenditionFlow::Paginated),
-                KnownSpineProperty::RenditionFlowScrolledContinuous => {
-                    Some(RenditionFlow::ScrolledContinuous)
-                }
-                KnownSpineProperty::RenditionFlowScrolledDoc => Some(RenditionFlow::ScrolledDoc),
-                _ => None,
-            },
-        ),
-        orientation: rendition_setting(
-            package,
-            itemref,
-            KnownMetaProperty::RenditionOrientation,
-            Meta::rendition_orientation,
-            |property| match property {
-                KnownSpineProperty::RenditionOrientationAuto => Some(RenditionOrientation::Auto),
-                KnownSpineProperty::RenditionOrientationLandscape => {
-                    Some(RenditionOrientation::Landscape)
-                }
-                KnownSpineProperty::RenditionOrientationPortrait => {
-                    Some(RenditionOrientation::Portrait)
-                }
-                _ => None,
-            },
-        ),
-        spread: rendition_setting(
-            package,
-            itemref,
-            KnownMetaProperty::RenditionSpread,
-            Meta::rendition_spread,
-            |property| match property {
-                KnownSpineProperty::RenditionSpreadAuto => Some(RenditionSpread::Auto),
-                KnownSpineProperty::RenditionSpreadBoth => Some(RenditionSpread::Both),
-                KnownSpineProperty::RenditionSpreadLandscape => Some(RenditionSpread::Landscape),
-                KnownSpineProperty::RenditionSpreadNone => Some(RenditionSpread::None),
-                KnownSpineProperty::RenditionSpreadPortrait => Some(RenditionSpread::Portrait),
-                _ => None,
-            },
-        ),
-        page_spread: RenditionSetting::from_candidates(itemref_candidates(
-            itemref,
-            |property| match property {
-                KnownSpineProperty::PageSpreadLeft => Some(PageSpread::Left),
-                KnownSpineProperty::PageSpreadRight => Some(PageSpread::Right),
-                KnownSpineProperty::PageSpreadCenter => Some(PageSpread::Center),
-                KnownSpineProperty::UnprefixedPageSpreadLeft => Some(PageSpread::Left),
-                KnownSpineProperty::UnprefixedPageSpreadRight => Some(PageSpread::Right),
-                _ => None,
-            },
-            &["rendition:page-spread-", "page-spread-"],
-        )),
-        page_progression_direction: package.spine().page_progression_direction(),
-    }
-}
-
-fn rendition_setting<T>(
-    package: &Package,
-    itemref: &ItemRef,
-    property: KnownMetaProperty,
-    meta_value: impl Fn(&Meta) -> Option<T>,
-    itemref_value: impl Fn(KnownSpineProperty) -> Option<T>,
-) -> RenditionSetting<T> {
-    let family = format!("{property}-");
-    let itemref_candidates = itemref_candidates(itemref, itemref_value, &[family.as_str()]);
-    if !itemref_candidates.is_empty() {
-        return RenditionSetting::from_candidates(itemref_candidates);
+        href: impl AsRef<str>,
+    ) -> Result<ResolvedHref, InvalidHref> {
+        resolve_href(&AuthoredHref::new(href.as_ref()), self.package_path())
     }
 
-    RenditionSetting::from_candidates(
-        package
-            .metadata()
-            .meta()
-            .iter()
-            .filter(|meta| {
-                meta.refines().is_none()
-                    && meta.property().and_then(|token| token.known_value()) == Some(property)
-            })
-            .map(|meta| RenditionCandidate {
-                source: RenditionValueSource::PackageMetadata,
-                authored_value: meta.content().cloned(),
-                value: meta_value(meta),
-            })
-            .collect(),
-    )
-}
-
-fn itemref_candidates<T>(
-    itemref: &ItemRef,
-    value: impl Fn(KnownSpineProperty) -> Option<T>,
-    families: &[&str],
-) -> Vec<RenditionCandidate<T>> {
-    itemref
-        .properties()
-        .iter()
-        .filter_map(|token| {
-            let value = token.known_value().and_then(&value);
-            if value.is_none()
-                && !families
-                    .iter()
-                    .any(|family| starts_ascii_case_insensitive(token.as_str(), family))
-            {
-                return None;
-            }
-            Some(RenditionCandidate {
-                source: RenditionValueSource::ItemRefProperty,
-                authored_value: Some(token.raw_value().clone()),
-                value,
-            })
-        })
-        .collect()
-}
-
-fn starts_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
-    value
-        .get(..prefix.len())
-        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
-}
-
-fn metadata_for_address(address: &ResourceAddress, size_bytes: Option<u64>) -> ResourceMetadata {
-    let file_extension = address
-        .local_path()
-        .and_then(|path| path.as_path().extension())
-        .and_then(|value| value.to_str())
-        .map(|value| value.to_ascii_lowercase());
-    ResourceMetadata {
-        size_bytes,
-        file_extension,
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-/// Syntactic classification of exact authored href text.
-///
-/// Parsing does not establish resource existence. Every variant retains the original text;
-/// valid targets retain checked href syntax and fragments are percent-decoded as UTF-8.
-pub enum ParsedHref {
-    /// A source-relative local reference.
-    Local {
-        /// Exact authored href.
-        original: AuthoredHref,
-        /// Checked target text, including any query but excluding the fragment.
-        target: EpubHref,
-        /// Percent-decoded fragment, including an explicitly empty fragment.
-        fragment: Option<String>,
-    },
-    /// An HTTP(S) or scheme-relative URL.
-    Remote {
-        /// Exact authored href.
-        original: AuthoredHref,
-        /// Checked remote target excluding the fragment.
-        target: EpubHref,
-        /// Percent-decoded fragment, including an explicitly empty fragment.
-        fragment: Option<String>,
-    },
-    /// A `data:` URL.
-    Data {
-        /// Exact authored data URL.
-        original: AuthoredHref,
-        /// Percent-decoded fragment, including an explicitly empty fragment.
-        fragment: Option<String>,
-    },
-    /// A valid non-HTTP, non-data URI with a scheme.
-    ExternalScheme {
-        /// Exact authored href.
-        original: AuthoredHref,
-        /// Checked target excluding the fragment.
-        target: EpubHref,
-        /// Percent-decoded fragment, including an explicitly empty fragment.
-        fragment: Option<String>,
-    },
-    /// A fragment reference to the source document itself.
-    SameDocument {
-        /// Exact authored href.
-        original: AuthoredHref,
-        /// Percent-decoded fragment, which may be empty for `#`.
-        fragment: String,
-    },
-    /// An exactly empty authored value.
-    Empty {
-        /// Empty authored href retained for source fidelity.
-        original: AuthoredHref,
-    },
-    /// Non-empty authored text with rejected lexical or URL/path syntax.
-    Invalid {
-        /// Exact malformed authored href.
-        original: AuthoredHref,
-    },
-}
-
-impl ParsedHref {
-    /// Returns the exact authored href retained by every variant.
-    pub fn original(&self) -> &AuthoredHref {
-        match self {
-            Self::Local { original, .. }
-            | Self::Remote { original, .. }
-            | Self::Data { original, .. }
-            | Self::ExternalScheme { original, .. }
-            | Self::SameDocument { original, .. }
-            | Self::Empty { original }
-            | Self::Invalid { original } => original,
-        }
-    }
-
-    /// Returns a non-empty percent-decoded fragment when one exists.
-    ///
-    /// This intentionally maps an explicitly empty fragment such as `#` to `None`.
-    pub fn fragment(&self) -> Option<&str> {
-        match self {
-            Self::Local { fragment, .. }
-            | Self::Remote { fragment, .. }
-            | Self::ExternalScheme { fragment, .. } => {
-                fragment.as_deref().filter(|fragment| !fragment.is_empty())
-            }
-            Self::SameDocument { fragment, .. } => {
-                (!fragment.is_empty()).then_some(fragment.as_str())
-            }
-            Self::Data { fragment, .. } => {
-                fragment.as_deref().filter(|fragment| !fragment.is_empty())
-            }
-            Self::Empty { .. } | Self::Invalid { .. } => None,
-        }
-    }
-
-    /// Revalidates and returns the complete original href when it has valid lexical syntax.
-    ///
-    /// This can return a value for semantic classifications such as [`Self::Empty`] only when
-    /// the original itself satisfies [`EpubHref`] syntax; empty and invalid originals return
-    /// `None`.
-    pub fn original_valid_href(&self) -> Option<EpubHref> {
-        self.original().to_epub_href()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-/// Result of resolving authored href text relative to a canonical source path.
-///
-/// This is syntactic/address resolution, not a byte read. Cheap resolution does not establish
-/// target or fragment existence, so fragment `exists` is normally `None` here. Missing and
-/// ambiguity variants are also used by higher-level resolution workflows.
-pub enum ResolvedHref {
-    /// A local or declared remote resource address without a fragment.
-    Resource(
-        /// Resolved local or remote address.
-        ResourceAddress,
-    ),
-    /// A resource address plus a non-empty decoded fragment.
-    Fragment {
-        /// Resolved resource address.
-        resource: ResourceAddress,
-        /// Percent-decoded non-empty fragment.
-        fragment: String,
-        /// Known fragment existence, or `None` when target content was not inspected.
-        exists: Option<bool>,
-    },
-    /// An HTTP(S) or scheme-relative URL not represented as a resource result.
-    RemoteUrl(
-        /// Resolved remote URL.
-        String,
-    ),
-    /// A retained `data:` URL.
-    Data(
-        /// Exact authored data URL.
-        String,
-    ),
-    /// A retained URL using another scheme.
-    External(
-        /// Exact authored URL using another scheme.
-        String,
-    ),
-    /// A canonical local target absent from complete resource inventory.
-    MissingPath(
-        /// Canonical local target that was absent.
-        EpubPath,
-    ),
-    /// An authored manifest IDREF with no matching declaration.
-    MissingManifestId(
-        /// Exact authored IDREF with no match.
-        String,
-    ),
-    /// An address associated with multiple candidate manifest IDs.
-    AmbiguousAddress {
-        /// Resolved address shared by the candidates.
-        address: ResourceAddress,
-        /// Candidate manifest IDs.
-        candidates: Vec<ResourceId>,
-    },
-    /// Exact authored text that could not be resolved.
-    Invalid(
-        /// Exact authored text that failed resolution.
-        String,
-    ),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-/// A typed request to select one resource from a [`ResourceIndex`].
-pub enum ResourceSelector {
-    /// Select by unique valid manifest ID.
-    Id(
-        /// Valid manifest ID to select uniquely.
-        ResourceId,
-    ),
-    /// Select by exact canonical local path.
-    Path(
-        /// Exact canonical local path.
-        EpubPath,
-    ),
-    /// Select by exact resolved address.
-    Address(
-        /// Exact resolved address.
-        ResourceAddress,
-    ),
-    /// Resolve a valid href relative to the package document, then select its address.
-    ManifestHref(
-        /// Checked href to resolve from the package document.
-        EpubHref,
-    ),
-    /// Resolve a valid href relative to a canonical source document, then select its address.
-    HrefFrom {
-        /// Checked authored href.
-        href: EpubHref,
-        /// Canonical source document path used as the resolution base.
-        source: EpubPath,
-    },
-    /// Select the loaded package document.
-    Package,
-    /// Select the package-selected EPUB navigation document.
-    EpubNav,
-    /// Select the package-selected cover image.
-    CoverImage,
-}
-
-impl From<ResourceId> for ResourceSelector {
-    fn from(value: ResourceId) -> Self {
-        Self::Id(value)
-    }
-}
-
-impl From<EpubPath> for ResourceSelector {
-    fn from(value: EpubPath) -> Self {
-        Self::Path(value)
-    }
-}
-
-impl From<ResourceAddress> for ResourceSelector {
-    fn from(value: ResourceAddress) -> Self {
-        Self::Address(value)
-    }
-}
-
-impl ResourceSelector {
-    /// Creates an ID selector after trimming and validating the identifier.
-    pub fn id(value: impl AsRef<str>) -> Option<Self> {
-        ResourceId::new(value).map(Self::Id)
-    }
-
-    /// Creates an exact canonical local-path selector.
-    pub fn path(value: impl AsRef<Path>) -> Option<Self> {
-        EpubPath::new(value).ok().map(Self::Path)
-    }
-
-    /// Creates a package-relative href selector after lexical validation.
-    pub fn manifest_href(value: impl AsRef<str>) -> Option<Self> {
-        EpubHref::try_new(value).ok().map(Self::ManifestHref)
-    }
-
-    /// Creates a source-relative href selector after validating both values.
-    pub fn href_from(href: impl AsRef<str>, source: impl AsRef<Path>) -> Option<Self> {
-        Some(Self::HrefFrom {
-            href: EpubHref::try_new(href).ok()?,
-            source: EpubPath::new(source).ok()?,
+    fn selected_resource(&self, selection: &ResourceSelection) -> Option<ResourceRef<'_>> {
+        selection.resource().map(|ordinal| ResourceRef {
+            index: self,
+            ordinal,
         })
     }
 }
 
-/// Classifies exact authored href text without establishing target existence.
-///
-/// Local path and fragment percent escapes must decode as UTF-8. Encoded path separators,
-/// malformed escapes, whitespace, controls, backslashes, absolute local paths, and local
-/// scheme-like first segments are rejected rather than repaired.
-pub fn parse_href(href: AuthoredHref) -> ParsedHref {
-    let original = href.clone();
-    let value = href.as_str();
-    if value.is_empty() {
-        return ParsedHref::Empty { original };
-    }
-    if !valid_href_syntax(value) {
-        return ParsedHref::Invalid { original };
-    }
-    let (target, raw_fragment) = value
-        .split_once('#')
-        .map(|(target, fragment)| (target, Some(fragment)))
-        .unwrap_or((value, None));
-    let fragment = match raw_fragment {
-        Some(fragment) => {
-            let Ok(fragment) = percent_encoding::percent_decode_str(fragment).decode_utf8() else {
-                return ParsedHref::Invalid { original };
-            };
-            Some(fragment.into_owned())
-        }
-        None => None,
-    };
-    let path = target.split_once('?').map_or(target, |(path, _)| path);
-    if value.starts_with('#') {
-        ParsedHref::SameDocument {
-            original,
-            fragment: fragment.unwrap_or_default(),
-        }
-    } else if target.starts_with('?') {
-        ParsedHref::Local {
-            original,
-            target: EpubHref::try_new(target).expect("href syntax was checked"),
-            fragment,
-        }
-    } else if target.starts_with("//")
-        || starts_with_ascii_case_insensitive(target, "http://")
-        || starts_with_ascii_case_insensitive(target, "https://")
+fn ensure_ordinal_count(
+    count: usize,
+    collection: ResourceIndexCollection,
+) -> Result<(), ResourceIndexError> {
+    if count
+        .checked_sub(1)
+        .is_none_or(|last| u32::try_from(last).is_ok())
     {
-        match valid_remote_url(target)
-            .then(|| EpubHref::try_new(target))
-            .transpose()
-        {
-            Ok(Some(target)) => ParsedHref::Remote {
-                original,
-                target,
-                fragment,
-            },
-            Ok(None) | Err(_) => ParsedHref::Invalid { original },
-        }
-    } else if starts_with_ascii_case_insensitive(target, "data:") {
-        ParsedHref::Data { original, fragment }
-    } else if has_scheme(target) {
-        match EpubHref::try_new(target) {
-            Ok(target) => ParsedHref::ExternalScheme {
-                original,
-                target,
-                fragment,
-            },
-            Err(_) => ParsedHref::Invalid { original },
-        }
-    } else if path.starts_with('/')
-        || path
-            .split('/')
-            .next()
-            .is_some_and(|segment| segment.contains(':'))
-        || contains_encoded_separator(path)
-        || decoded_local_path(path).is_none()
-    {
-        ParsedHref::Invalid { original }
+        Ok(())
     } else {
-        match EpubHref::try_new(target) {
-            Ok(target) => ParsedHref::Local {
-                original,
-                target,
-                fragment,
-            },
-            Err(_) => ParsedHref::Invalid { original },
-        }
+        Err(ResourceIndexError { collection })
     }
-}
-
-fn target_for_href(href: &AuthoredHref, source: &EpubPath) -> ResolvedHref {
-    let parsed = parse_href(href.clone());
-    let address = address_for_parsed_href(&parsed, source);
-    let invalid_value = value_for_invalid_href(&parsed);
-    match (address, parsed.fragment().map(str::to_string)) {
-        (Some(ResourceAddress::Local(path)), Some(fragment)) => ResolvedHref::Fragment {
-            resource: ResourceAddress::Local(path),
-            fragment,
-            exists: None,
-        },
-        (Some(ResourceAddress::Remote(url)), Some(fragment)) => ResolvedHref::Fragment {
-            resource: ResourceAddress::Remote(url),
-            fragment,
-            exists: None,
-        },
-        (Some(ResourceAddress::Local(path)), None) => {
-            ResolvedHref::Resource(ResourceAddress::Local(path))
-        }
-        (Some(ResourceAddress::Remote(url)), None) => {
-            ResolvedHref::Resource(ResourceAddress::Remote(url))
-        }
-        (Some(ResourceAddress::Data(value)), _) => ResolvedHref::Data(value),
-        (Some(ResourceAddress::External(value)), _) => ResolvedHref::External(value),
-        (Some(ResourceAddress::Invalid(value)), _) => ResolvedHref::Invalid(value),
-        (None, _) => ResolvedHref::Invalid(invalid_value),
-    }
-}
-
-fn value_for_invalid_href(parsed: &ParsedHref) -> String {
-    parsed.original().as_str().to_string()
-}
-
-fn address_for_parsed_href(parsed: &ParsedHref, source: &EpubPath) -> Option<ResourceAddress> {
-    let root_dir = source_dir(source);
-    match parsed {
-        ParsedHref::Remote { target, .. } => {
-            Some(ResourceAddress::Remote(target.as_str().to_string()))
-        }
-        ParsedHref::Data { original, .. } => {
-            Some(ResourceAddress::Data(original.as_str().to_string()))
-        }
-        ParsedHref::ExternalScheme { target, .. } => {
-            Some(ResourceAddress::External(target.as_str().to_string()))
-        }
-        ParsedHref::Local { target, .. } => {
-            local_path_for_target(target, &root_dir, source).map(ResourceAddress::Local)
-        }
-        ParsedHref::SameDocument { .. } => Some(ResourceAddress::Local(source.clone())),
-        ParsedHref::Empty { original } | ParsedHref::Invalid { original } => {
-            Some(ResourceAddress::Invalid(original.as_str().to_string()))
-        }
-    }
-}
-
-pub(crate) fn resolve_local_href_from_source(
-    href: &AuthoredHref,
-    source: &EpubPath,
-) -> Option<(EpubPath, Option<String>)> {
-    let ParsedHref::Local {
-        target, fragment, ..
-    } = parse_href(href.clone())
-    else {
-        return None;
-    };
-    let base = source_dir(source);
-    local_path_for_target(&target, &base, source).map(|path| (path, fragment))
-}
-
-fn local_path_for_target(target: &EpubHref, base: &Path, source: &EpubPath) -> Option<EpubPath> {
-    let authored_path = target
-        .as_str()
-        .split_once('?')
-        .map_or(target.as_str(), |(path, _)| path);
-    if authored_path.is_empty() {
-        return Some(source.clone());
-    }
-    let decoded = decoded_local_path(authored_path)?;
-    resolve_relative_epub_path(base, decoded.as_ref())
-}
-
-fn resolve_relative_epub_path(base: &Path, relative: &str) -> Option<EpubPath> {
-    let mut parts = base
-        .components()
-        .map(|component| match component {
-            Component::Normal(value) => value.to_str().map(str::to_string),
-            Component::CurDir => Some(String::new()),
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => None,
-        })
-        .collect::<Option<Vec<_>>>()?;
-    parts.retain(|part| !part.is_empty());
-    for component in Path::new(relative).components() {
-        match component {
-            Component::Normal(value) => parts.push(value.to_str()?.to_string()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                parts.pop()?;
-            }
-            Component::RootDir | Component::Prefix(_) => return None,
-        }
-    }
-    EpubPath::new(parts.join("/")).ok()
-}
-
-fn source_dir(source: &EpubPath) -> PathBuf {
-    source
-        .as_path()
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_default()
-}
-
-fn has_scheme(value: &str) -> bool {
-    value.split_once(':').is_some_and(|(scheme, _)| {
-        scheme
-            .as_bytes()
-            .first()
-            .is_some_and(|ch| ch.is_ascii_alphabetic())
-            && scheme
-                .chars()
-                .skip(1)
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
-    })
-}
-
-fn starts_with_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
-    value
-        .get(..prefix.len())
-        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
-}
-
-fn valid_remote_url(value: &str) -> bool {
-    if value.starts_with("//") {
-        url::Url::parse(&format!("https:{value}")).is_ok()
-    } else {
-        url::Url::parse(value).is_ok()
-    }
-}
-
-fn valid_href_syntax(value: &str) -> bool {
-    if value.trim() != value
-        || value.contains('\\')
-        || value.chars().any(char::is_control)
-        || value.chars().any(char::is_whitespace)
-    {
-        return false;
-    }
-
-    let bytes = value.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] != b'%' {
-            index += 1;
-            continue;
-        }
-        let Some(_) = bytes
-            .get(index + 1..index + 3)
-            .and_then(|digits| u8::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok())
-        else {
-            return false;
-        };
-        index += 3;
-    }
-    true
-}
-
-fn contains_encoded_separator(value: &str) -> bool {
-    value.as_bytes().windows(3).any(|escape| {
-        escape[0] == b'%'
-            && u8::from_str_radix(std::str::from_utf8(&escape[1..]).unwrap_or_default(), 16)
-                .is_ok_and(|decoded| matches!(decoded, b'/' | b'\\'))
-    })
-}
-
-fn decoded_local_path(value: &str) -> Option<std::borrow::Cow<'_, str>> {
-    percent_encoding::percent_decode_str(value)
-        .decode_utf8()
-        .ok()
 }
 
 fn validate_epub_path(value: &str) -> Result<(), EpubPathError> {
@@ -2012,26 +1433,349 @@ fn validate_epub_path(value: &str) -> Result<(), EpubPathError> {
     Ok(())
 }
 
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for EpubPath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for EpubHref {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::try_new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for ResourceIndex {
+    /// Rebuilds the lookup tables, which are derived from the inventory rather than encoded.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Encoded {
+            package_path: EpubPath,
+            // Accepted and ignored: the cover path is recomputed from the selection below.
+            #[serde(default)]
+            #[allow(dead_code)]
+            cover_path: Option<EpubPath>,
+            resources: Vec<ResourceRecord>,
+            declarations: Vec<ManifestDeclaration>,
+            reading_order: Vec<ReadingOrderOccurrence>,
+            // Selections are authored evidence: an omitted one is absent, not invalid.
+            #[serde(default)]
+            selections: ResourceSelections,
+        }
+
+        let mut encoded = Encoded::deserialize(deserializer)?;
+        for record in &mut encoded.resources {
+            let declares = |select: fn(&ManifestDeclaration) -> bool| {
+                record.declarations.iter().any(|ordinal| {
+                    encoded
+                        .declarations
+                        .get(ordinal.index())
+                        .is_some_and(select)
+                })
+            };
+            record.has_xhtml_declaration = declares(|declaration| {
+                declaration
+                    .media_type
+                    .as_ref()
+                    .is_some_and(MediaType::is_xhtml)
+            });
+            record.has_stylesheet_declaration = declares(|declaration| {
+                declaration
+                    .media_type
+                    .as_ref()
+                    .is_some_and(MediaType::is_css)
+            });
+            record.has_svg_declaration = declares(|declaration| {
+                declaration
+                    .media_type
+                    .as_ref()
+                    .is_some_and(MediaType::is_svg)
+            });
+            record.scripted = declares(|declaration| {
+                declaration
+                    .properties
+                    .iter()
+                    .any(|property| property.known_value() == Some(KnownManifestProperty::Scripted))
+            });
+        }
+        // Ordinals address this index. A decoded one that points outside it would panic the
+        // borrowed views, so the index a payload describes has to exist before it is built.
+        let declaration_count = encoded.declarations.len();
+        let resource_count = encoded.resources.len();
+        let declaration_exists = |ordinal: &ManifestOrdinal| ordinal.index() < declaration_count;
+        let resource_exists = |ordinal: &ResourceOrdinal| ordinal.index() < resource_count;
+        let idref_declaration_exists = |target: &IdrefTarget| match target {
+            IdrefTarget::Declaration(declaration) => declaration_exists(declaration),
+            IdrefTarget::Invalid | IdrefTarget::Missing | IdrefTarget::Ambiguous(_) => true,
+        };
+        let in_range = encoded
+            .resources
+            .iter()
+            .all(|record| record.declarations.iter().all(declaration_exists))
+            && encoded.declarations.iter().all(|declaration| {
+                (match &declaration.target {
+                    DeclarationTarget::Resource { resource } => resource_exists(resource),
+                    DeclarationTarget::MissingHref | DeclarationTarget::InvalidHref => true,
+                }) && declaration
+                    .fallback_target
+                    .as_ref()
+                    .is_none_or(idref_declaration_exists)
+            })
+            && encoded.reading_order.iter().all(|occurrence| {
+                occurrence
+                    .target
+                    .as_ref()
+                    .is_none_or(idref_declaration_exists)
+                    && occurrence.resource.as_ref().is_none_or(resource_exists)
+            })
+            && [
+                &encoded.selections.package,
+                &encoded.selections.cover,
+                &encoded.selections.epub_nav,
+                &encoded.selections.ncx,
+            ]
+            .iter()
+            .all(|selection| {
+                selection
+                    .declaration()
+                    .as_ref()
+                    .is_none_or(declaration_exists)
+                    && selection.resource().as_ref().is_none_or(resource_exists)
+            });
+        if !in_range {
+            return Err(serde::de::Error::custom(
+                "resource index ordinal is outside the inventory it addresses",
+            ));
+        }
+
+        let mut by_id = HashMap::<String, Vec<ManifestOrdinal>>::new();
+        for (position, declaration) in encoded.declarations.iter().enumerate() {
+            if let ManifestIdValue::Valid(value) = &declaration.id {
+                by_id
+                    .entry(value.clone())
+                    .or_default()
+                    .push(ManifestOrdinal::from_index(position));
+            }
+        }
+        let by_address = encoded
+            .resources
+            .iter()
+            .enumerate()
+            .map(|(position, record)| {
+                (
+                    record.address.clone(),
+                    ResourceOrdinal::from_index(position),
+                )
+            })
+            .collect();
+
+        let cover_path = encoded
+            .selections
+            .cover
+            .resource()
+            .and_then(|ordinal| encoded.resources.get(ordinal.index()))
+            .filter(|record| record.presence.is_present())
+            .and_then(|record| record.address.local_path().cloned());
+
+        Ok(Self {
+            package_path: encoded.package_path,
+            cover_path,
+            resources: encoded.resources,
+            declarations: encoded.declarations,
+            reading_order: encoded.reading_order,
+            selections: encoded.selections,
+            by_id,
+            by_address,
+        })
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for IdrefTarget {
+    /// Accepts an ambiguous outcome without candidates, which is how the index encodes it.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(
+            tag = "state",
+            content = "value",
+            rename_all = "kebab-case",
+            deny_unknown_fields
+        )]
+        enum Encoded {
+            Declaration(ManifestOrdinal),
+            Invalid,
+            Missing,
+            Ambiguous,
+        }
+
+        Ok(match Encoded::deserialize(deserializer)? {
+            Encoded::Declaration(declaration) => Self::Declaration(declaration),
+            Encoded::Invalid => Self::Invalid,
+            Encoded::Missing => Self::Missing,
+            Encoded::Ambiguous => Self::Ambiguous(Vec::new()),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource::provider::{ResourceProviderEntry, ResourceProviderIndexLimits};
+    use crate::package::{
+        RenditionCandidate, RenditionLayout, RenditionOrientation, RenditionSetting,
+        RenditionSpread, RenditionValueSource,
+        metadata::{KnownMetaProperty, Meta},
+        spine::{PageProgressionDirection, PageSpread},
+    };
+    use crate::publication::EpubOpenLimits;
+    use crate::string::EpubString;
 
     fn parse_package(xml: &str) -> Package {
         Package::parse(xml).unwrap()
     }
 
-    fn provider_index(
-        entries: impl IntoIterator<Item = impl Into<String>>,
-    ) -> ResourceProviderIndex {
-        ResourceProviderIndex::try_from_entries(
-            entries.into_iter().map(|path| {
-                let path = path.into();
-                ResourceProviderEntry::new(EpubPath::new(path).unwrap(), None)
-            }),
-            &ResourceProviderIndexLimits::default(),
+    fn provider_index(entries: impl IntoIterator<Item = &'static str>) -> ProviderIndex {
+        ProviderIndex::build(
+            entries
+                .into_iter()
+                .map(|path| (EpubPath::new(path).unwrap(), None)),
+            &EpubOpenLimits::default(),
         )
         .unwrap()
+    }
+
+    fn index(package: &Package, provider: &ProviderIndex) -> ResourceIndex {
+        ResourceIndex::new(
+            package,
+            &EpubPath::new("EPUB/package.opf").unwrap(),
+            provider,
+        )
+        .unwrap()
+    }
+
+    fn resource_by_id<'a>(index: &'a ResourceIndex, id: &str) -> ResourceRef<'a> {
+        index.declaration_by_id(id).unwrap().resource().unwrap()
+    }
+
+    #[test]
+    fn declaration_predicates_report_any_declaring_media_type_or_property() {
+        let package = parse_package(
+            r#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+            <metadata />
+            <manifest>
+                <item id="a" href="chapter.xhtml" media-type="application/xhtml+xml" properties="scripted" />
+                <item id="b" href="./chapter.xhtml" media-type="image/svg+xml" />
+                <item id="style" href="style.css" media-type="text/css" />
+                <item id="image" href="cover.png" media-type="image/png" />
+            </manifest>
+            <spine />
+        </package>"#,
+        );
+        let provider = provider_index([
+            "EPUB/package.opf",
+            "EPUB/chapter.xhtml",
+            "EPUB/style.css",
+            "EPUB/cover.png",
+        ]);
+        let index = index(&package, &provider);
+
+        let chapter = resource_by_id(&index, "a");
+        assert!(chapter.has_xhtml_declaration());
+        assert!(chapter.has_svg_declaration());
+        assert!(!chapter.has_stylesheet_declaration());
+        assert!(chapter.is_scripted());
+
+        let style = resource_by_id(&index, "style");
+        assert!(style.has_stylesheet_declaration());
+        assert!(!style.has_xhtml_declaration());
+        assert!(!style.is_scripted());
+
+        let image = resource_by_id(&index, "image");
+        assert!(!image.has_xhtml_declaration());
+        assert!(!image.has_svg_declaration());
+        assert!(!image.has_stylesheet_declaration());
+        assert!(!image.is_scripted());
+    }
+
+    #[test]
+    fn ordinals_recover_from_positions_carried_outside_the_crate() {
+        let package = parse_package(
+            r#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+            <metadata />
+            <manifest>
+                <item id="a" href="chapter.xhtml" media-type="application/xhtml+xml" />
+            </manifest>
+            <spine><itemref idref="a" /></spine>
+        </package>"#,
+        );
+        let provider = provider_index(["EPUB/package.opf", "EPUB/chapter.xhtml"]);
+        let index = index(&package, &provider);
+
+        let declaration = index.declaration_by_id("a").unwrap();
+        let recovered = ManifestOrdinal::new(declaration.ordinal().index() as u32);
+        assert_eq!(index.declaration(recovered), Some(declaration));
+
+        let resource = declaration.resource().unwrap();
+        let recovered = ResourceOrdinal::new(resource.ordinal().index() as u32);
+        assert_eq!(index.resource(recovered), Some(resource));
+
+        let occurrence = index.reading_order().next().unwrap();
+        let recovered = ReadingOrderOrdinal::new(occurrence.ordinal().index() as u32);
+        assert_eq!(index.occurrence(recovered), Some(occurrence));
+    }
+
+    #[test]
+    fn standalone_href_resolution_matches_the_index_resolver() {
+        let package = parse_package(
+            r#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+            <metadata />
+            <manifest>
+                <item id="a" href="text/chapter.xhtml" media-type="application/xhtml+xml" />
+            </manifest>
+            <spine />
+        </package>"#,
+        );
+        let provider = provider_index(["EPUB/package.opf", "EPUB/text/chapter.xhtml"]);
+        let index = index(&package, &provider);
+        let package_path = EpubPath::new("EPUB/package.opf").unwrap();
+
+        let free = resolve_href(&AuthoredHref::new("text/chapter.xhtml"), &package_path).unwrap();
+        assert_eq!(index.resolve_manifest_href("text/chapter.xhtml"), Ok(free));
+
+        let fragment =
+            resolve_href(&AuthoredHref::new("text/chapter.xhtml#p1"), &package_path).unwrap();
+        assert_eq!(
+            fragment.address,
+            ResourceAddress::Local(EpubPath::new("EPUB/text/chapter.xhtml").unwrap())
+        );
+        assert_eq!(fragment.fragment.as_deref(), Some("p1"));
+
+        let source = EpubPath::new("EPUB/text/chapter.xhtml").unwrap();
+        let sibling = resolve_href(&AuthoredHref::new("../images/cover.png"), &source).unwrap();
+        assert_eq!(
+            sibling.address,
+            ResourceAddress::Local(EpubPath::new("EPUB/images/cover.png").unwrap())
+        );
+
+        assert!(resolve_href(&AuthoredHref::new(""), &package_path).is_err());
+        assert!(resolve_href(&AuthoredHref::new("../../escape.xhtml"), &package_path).is_err());
     }
 
     #[test]
@@ -2053,55 +1797,57 @@ mod tests {
         );
         let provider =
             provider_index(["EPUB/package.opf", "EPUB/chapter.xhtml", "EPUB/orphan.bin"]);
-        let index = ResourceIndex::new(&package, "EPUB/package.opf", &provider);
+        let index = index(&package, &provider);
 
         assert_eq!(index.declarations().len(), 3);
-        let first = index.find_unique_resource_by_id("a").unwrap();
-        let second = index.find_unique_resource_by_id("b").unwrap();
-        assert_eq!(first.key(), second.key());
+        let first = resource_by_id(&index, "a");
+        let second = resource_by_id(&index, "b");
+        assert_eq!(first.ordinal(), second.ordinal());
         assert_eq!(first.declarations().len(), 2);
-        assert!(first.has_xhtml_declaration());
-        assert!(first.has_svg_declaration());
-        assert!(first.is_scripted());
-        assert!(matches!(
-            index.find_unique_by_id("missing").unwrap().target(),
+        assert_eq!(first.declarations().next().unwrap().resource(), Some(first));
+        assert!(first.declares(MediaType::is_xhtml));
+        assert!(first.declares(MediaType::is_svg));
+        assert_eq!(
+            index.declaration_by_id("missing").unwrap().target(),
             DeclarationTarget::MissingHref
-        ));
+        );
 
         let order = index.reading_order().collect::<Vec<_>>();
         assert_eq!(order.len(), 3);
         assert_eq!(order[0].linear(), Linear::No);
         assert_eq!(order[1].linear(), Linear::Yes);
-        assert!(matches!(
-            order[2].target(),
-            ReadingOrderTarget::MissingManifestId
-        ));
-        assert!(index.resources().iter().any(|record| {
+        assert_eq!(order[0].declaration().unwrap().ordinal().index(), 0);
+        assert_eq!(order[0].resource(), Some(first));
+        assert_eq!(order[2].target(), Some(&IdrefTarget::Missing));
+        assert!(index.resources().any(|record| {
             record
                 .local_path()
                 .is_some_and(|path| path.as_str() == "EPUB/orphan.bin")
-                && !record.is_manifest_resource()
+                && record.declarations().len() == 0
         }));
     }
 
     #[test]
-    fn resource_index_clones_retain_keys_and_rebuilds_replace_them() {
+    fn resource_ordinals_are_index_positions() {
         let package = parse_package(
             r#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
             <metadata /><manifest><item id="a" href="a.xhtml" media-type="application/xhtml+xml" /></manifest><spine />
         </package>"#,
         );
         let provider = provider_index(["EPUB/package.opf", "EPUB/a.xhtml"]);
-        let first = ResourceIndex::new(&package, "EPUB/package.opf", &provider);
+        let first = index(&package, &provider);
         let clone = first.clone();
-        let rebuilt = ResourceIndex::new(&package, "EPUB/package.opf", &provider);
-        let key = first.find_unique_resource_by_id("a").unwrap().key();
+        let rebuilt = index(&package, &provider);
+        let ordinal = resource_by_id(&first, "a").ordinal();
 
         assert_eq!(
-            clone.resource(key).unwrap().address(),
-            first.resource(key).unwrap().address()
+            clone.resource(ordinal).unwrap().address(),
+            first.resource(ordinal).unwrap().address()
         );
-        assert_eq!(rebuilt.resource(key), Err(IndexKeyError::ForeignIndex));
+        assert_eq!(
+            rebuilt.resource(ordinal).unwrap().address(),
+            first.resource(ordinal).unwrap().address()
+        );
     }
 
     #[test]
@@ -2116,26 +1862,20 @@ mod tests {
         </package>"#,
         );
         let provider = provider_index(["EPUB/package.opf"]);
-        let index = ResourceIndex::new(&package, "EPUB/package.opf", &provider);
+        let index = index(&package, &provider);
 
         assert_eq!(
-            index
-                .find_unique_resource_by_id("local")
-                .unwrap()
-                .presence(),
+            resource_by_id(&index, "local").presence(),
             ProviderPresence::Missing
         );
         assert_eq!(
-            index
-                .find_unique_resource_by_id("remote")
-                .unwrap()
-                .presence(),
+            resource_by_id(&index, "remote").presence(),
             ProviderPresence::NotApplicable
         );
-        assert!(matches!(
-            index.find_unique_by_id("invalid").unwrap().target(),
-            DeclarationTarget::InvalidHref(_)
-        ));
+        assert_eq!(
+            index.declaration_by_id("invalid").unwrap().target(),
+            DeclarationTarget::InvalidHref
+        );
     }
 
     #[test]
@@ -2144,19 +1884,94 @@ mod tests {
             r#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
             <metadata /><manifest>
                 <item id="1chapter" href="chapter.xhtml" media-type="application/xhtml+xml" />
+                <item id="chapter:name" href="colon.xhtml" media-type="application/xhtml+xml" />
+                <item id="章节·一" href="unicode.xhtml" media-type="application/xhtml+xml" />
+                <item id="  spaced  " href="spaced.xhtml" media-type="application/xhtml+xml" />
+                <item id="chapter name" href="internal-space.xhtml" media-type="application/xhtml+xml" />
             </manifest><spine><itemref idref="1chapter" /></spine>
         </package>"#,
         );
+        assert_eq!(package.manifest().items()[4].id(), Some("chapter name"));
         let provider = provider_index(["EPUB/package.opf", "EPUB/chapter.xhtml"]);
-        let index = ResourceIndex::new(&package, "EPUB/package.opf", &provider);
+        let index = index(&package, &provider);
 
+        let declarations = index.declarations().collect::<Vec<_>>();
         assert!(matches!(
-            index.declarations()[0].id(),
+            declarations[0].id(),
             ManifestIdValue::Invalid(value) if value == "1chapter"
         ));
         assert!(matches!(
+            declarations[1].id(),
+            ManifestIdValue::Invalid(value) if value == "chapter:name"
+        ));
+        assert!(matches!(
+            declarations[2].id(),
+            ManifestIdValue::Valid(value) if value.as_str() == "章节·一"
+        ));
+        assert!(matches!(
+            declarations[3].id(),
+            ManifestIdValue::Valid(value) if value.as_str() == "spaced"
+        ));
+        assert!(matches!(
+            declarations[4].id(),
+            ManifestIdValue::Invalid(value) if value == "chapter name"
+        ));
+        assert_eq!(
             index.reading_order().next().unwrap().target(),
-            ReadingOrderTarget::MissingManifestId
+            Some(&IdrefTarget::Invalid)
+        );
+    }
+
+    #[test]
+    fn duplicate_ids_are_ambiguous_declaration_lookups() {
+        let same = parse_package(
+            r#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0"><metadata/><manifest>
+            <item id="dup" href="same.xhtml" media-type="application/xhtml+xml"/>
+            <item id="dup" href="./same.xhtml" media-type="application/xhtml+xml"/>
+            </manifest><spine/></package>"#,
+        );
+        let different = parse_package(
+            r#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0"><metadata/><manifest>
+            <item id="dup" href="one.xhtml" media-type="application/xhtml+xml"/>
+            <item id="dup" href="two.xhtml" media-type="application/xhtml+xml"/>
+            </manifest><spine/></package>"#,
+        );
+        let provider = provider_index([
+            "EPUB/package.opf",
+            "EPUB/same.xhtml",
+            "EPUB/one.xhtml",
+            "EPUB/two.xhtml",
+        ]);
+        let same = index(&same, &provider);
+        let different = index(&different, &provider);
+
+        assert!(same.declaration_by_id("dup").is_none());
+        assert_eq!(
+            same.declarations_with_id("dup")
+                .unwrap()
+                .map(|declaration| declaration.resource().unwrap().ordinal())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            1
+        );
+        assert!(different.declaration_by_id("dup").is_none());
+    }
+
+    #[test]
+    fn multiple_cover_image_declarations_are_explicitly_ambiguous() {
+        let package = parse_package(
+            r#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0"><metadata/><manifest>
+            <item id="one" href="one.jpg" media-type="image/jpeg" properties="cover-image"/>
+            <item id="two" href="two.jpg" media-type="image/jpeg" properties="cover-image"/>
+            </manifest><spine/></package>"#,
+        );
+        let provider = provider_index(["EPUB/package.opf", "EPUB/one.jpg", "EPUB/two.jpg"]);
+        let index = index(&package, &provider);
+
+        assert!(index.cover_image().is_none());
+        assert!(matches!(
+            index.selections().cover,
+            ResourceSelection::Ambiguous { ref candidates, .. } if candidates.len() == 2
         ));
     }
 
@@ -2184,7 +1999,7 @@ mod tests {
         </package>"##,
         );
         let provider = provider_index(["EPUB/package.opf", "EPUB/chapter.xhtml"]);
-        let index = ResourceIndex::new(&package, "EPUB/package.opf", &provider);
+        let index = index(&package, &provider);
         let entries = index.reading_order().collect::<Vec<_>>();
 
         assert_eq!(
@@ -2212,15 +2027,12 @@ mod tests {
         );
         assert_eq!(overridden[0].value(), Some(&RenditionLayout::PrePaginated));
         assert_eq!(entries[0].presentation().layout().value(), None);
-        let malformed_override = entries[0].presentation().flow().candidate().unwrap();
-        assert_eq!(
-            malformed_override.source(),
-            RenditionValueSource::ItemRefProperty
-        );
-        assert_eq!(malformed_override.value(), None);
-        assert_eq!(
-            malformed_override.authored_value().map(EpubString::as_str),
-            Some("rendition:flow-sideways")
+        let unrecognized_family = entries[0].presentation().flow().candidates();
+        assert_eq!(unrecognized_family.len(), 2);
+        assert!(
+            unrecognized_family
+                .iter()
+                .all(|candidate| candidate.source() == RenditionValueSource::PackageMetadata)
         );
 
         let inherited = entries[1].presentation();
@@ -2247,16 +2059,16 @@ mod tests {
             Some(&RenditionOrientation::Portrait)
         );
         assert_eq!(inherited.spread().value(), Some(&RenditionSpread::None));
-        assert!(inherited.page_spread().is_unspecified());
+        assert!(matches!(
+            inherited.page_spread(),
+            RenditionSetting::Unspecified
+        ));
         assert_eq!(
             inherited.page_progression_direction(),
             Some(PageProgressionDirection::Default)
         );
 
-        assert!(matches!(
-            entries[2].target(),
-            ReadingOrderTarget::MissingManifestId
-        ));
+        assert_eq!(entries[2].target(), Some(&IdrefTarget::Missing));
         assert_eq!(
             entries[2].presentation().layout().value(),
             Some(&RenditionLayout::Roll)
@@ -2264,6 +2076,67 @@ mod tests {
         assert_eq!(
             entries[2].presentation().page_spread().value(),
             Some(&PageSpread::Right)
+        );
+    }
+
+    #[test]
+    fn unrecognized_itemref_tokens_do_not_override_publication_rendition_metadata() {
+        let package = parse_package(
+            r##"<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+            <metadata>
+                <meta property="rendition:layout">pre-paginated</meta>
+                <meta property="rendition:spread">both</meta>
+            </metadata>
+            <manifest>
+                <item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml" />
+            </manifest>
+            <spine>
+                <itemref idref="chapter" properties="rendition:layout-prepaginated" />
+                <itemref idref="chapter" properties="rendition:layout-reflowable" />
+                <itemref idref="chapter" properties="rendition:spread-none rendition:spread-portrait" />
+                <itemref idref="chapter" properties="rendition:page-spread-centre" />
+            </spine>
+        </package>"##,
+        );
+        let provider = provider_index(["EPUB/package.opf", "EPUB/chapter.xhtml"]);
+        let index = index(&package, &provider);
+        let entries = index.reading_order().collect::<Vec<_>>();
+
+        let typo = entries[0].presentation().layout();
+        assert_eq!(typo.value(), Some(&RenditionLayout::PrePaginated));
+        assert_eq!(
+            typo.candidate().map(RenditionCandidate::source),
+            Some(RenditionValueSource::PackageMetadata)
+        );
+        assert_eq!(
+            entries[0]
+                .properties()
+                .iter()
+                .map(SpinePropertyToken::as_str)
+                .collect::<Vec<_>>(),
+            vec!["rendition:layout-prepaginated"]
+        );
+
+        let recognized = entries[1].presentation().layout();
+        assert_eq!(recognized.value(), Some(&RenditionLayout::Reflowable));
+        assert_eq!(
+            recognized.candidate().map(RenditionCandidate::source),
+            Some(RenditionValueSource::ItemRefProperty)
+        );
+
+        assert!(matches!(
+            entries[2].presentation().spread(),
+            RenditionSetting::Ambiguous(candidates) if candidates.len() == 2
+        ));
+
+        let page_spread = entries[3].presentation().page_spread();
+        assert_eq!(page_spread.value(), None);
+        assert_eq!(
+            page_spread
+                .candidate()
+                .and_then(RenditionCandidate::authored_value)
+                .map(EpubString::as_str),
+            Some("rendition:page-spread-centre")
         );
     }
 
@@ -2277,14 +2150,14 @@ mod tests {
         </package>"#,
         );
         let provider = provider_index(["EPUB/package.opf", "EPUB/chapter.xhtml"]);
-        let original = ResourceIndex::new(&package, "EPUB/package.opf", &provider);
+        let original = index(&package, &provider);
         let detached_clone = original.clone();
 
         package.metadata_mut().add_meta(Meta::new(
-            crate::package::metadata::MetaPropertyToken::known(KnownMetaProperty::RenditionLayout),
+            crate::package::metadata::MetaPropertyToken::from(KnownMetaProperty::RenditionLayout),
             EpubString::new("pre-paginated").unwrap(),
         ));
-        let rebuilt = ResourceIndex::new(&package, "EPUB/package.opf", &provider);
+        let rebuilt = index(&package, &provider);
 
         assert_eq!(
             original
@@ -2318,17 +2191,121 @@ mod tests {
     }
 
     #[test]
-    fn resource_id_normalizes_only_surrounding_whitespace() {
-        let id = ResourceId::new("  Chapter-One  ").unwrap();
-
-        assert_eq!(id.as_str(), "Chapter-One");
-        assert_eq!(ResourceId::new(" \t\n "), None);
-        assert_eq!(ResourceId::new("1chapter"), None);
-        assert_eq!(ResourceId::new("chapter:name"), None);
+    fn manifest_id_validation_normalizes_only_xml_whitespace() {
+        assert_eq!(
+            normalize_manifest_id("  Chapter-One  ").unwrap(),
+            "Chapter-One"
+        );
+        assert_eq!(normalize_manifest_id("\t章节·一\r").unwrap(), "章节·一");
+        assert!(normalize_manifest_id("a\u{301}").is_ok());
+        assert!(normalize_manifest_id(" \t\n ").is_err());
+        assert!(normalize_manifest_id("1chapter").is_err());
+        assert!(normalize_manifest_id("chapter:name").is_err());
+        assert!(normalize_manifest_id("chapter name").is_err());
+        assert!(normalize_manifest_id("chapter\tname").is_err());
+        assert!(normalize_manifest_id("\u{A0}chapter").is_err());
     }
 
     #[test]
-    fn canonical_href_corpus_preserves_authored_text_and_never_repairs() {
+    fn relationship_ids_preserve_source_and_use_only_xml_whitespace() {
+        let package = parse_package(
+            "<package xmlns=\"http://www.idpf.org/2007/opf\" version=\"2.0\"><metadata>\
+             <meta name=\"cover\" content=\" cover \"/></metadata><manifest>\
+             <item id=\" chapter \" href=\"chapter.xhtml\" media-type=\"application/xhtml+xml\" fallback=\" fallback \" media-overlay=\" overlay \"/>\
+             <item id=\"fallback\" href=\"fallback.xhtml\" media-type=\"application/xhtml+xml\"/>\
+             <item id=\"overlay\" href=\"overlay.smil\" media-type=\"application/smil+xml\"/>\
+             <item id=\"cover\" href=\"cover.jpg\" media-type=\"image/jpeg\"/>\
+             <item id=\"ncx\" href=\"toc.ncx\" media-type=\"application/x-dtbncx+xml\"/>\
+             <item id=\"\u{a0}bad\" href=\"bad.xhtml\" media-type=\"application/xhtml+xml\" fallback=\"\u{a0}fallback\" media-overlay=\"\u{a0}overlay\"/>\
+             </manifest><spine toc=\" ncx \"><itemref idref=\" chapter \"/><itemref idref=\"\u{a0}chapter\"/></spine></package>",
+        );
+        let item = &package.manifest().items()[0];
+        assert_eq!(item.id(), Some(" chapter "));
+        assert_eq!(item.fallback(), Some(" fallback "));
+        assert_eq!(item.media_overlay(), Some(" overlay "));
+        assert_eq!(package.spine().toc(), Some(" ncx "));
+        assert_eq!(package.metadata().opf2_cover_id(), Some(" cover "));
+        assert_eq!(package.manifest().items()[5].id(), Some("\u{a0}bad"));
+
+        let index = index(&package, &provider_index(["EPUB/package.opf"]));
+        assert!(matches!(
+            index.reading_order().next().unwrap().target(),
+            Some(IdrefTarget::Declaration(_))
+        ));
+        assert_eq!(
+            index.reading_order().nth(1).unwrap().target(),
+            Some(&IdrefTarget::Invalid)
+        );
+        assert!(matches!(
+            index.selections().cover,
+            ResourceSelection::Selected { .. }
+        ));
+        assert!(matches!(
+            index.selections().ncx,
+            ResourceSelection::Selected { .. }
+        ));
+    }
+
+    #[test]
+    fn duplicate_cover_properties_are_ambiguous_in_package_and_index() {
+        let package = parse_package(
+            r#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0"><metadata/><manifest>
+            <item id="one" href="one.jpg" media-type="image/jpeg" properties="cover-image"/>
+            <item id="two" href="two.jpg" media-type="image/jpeg" properties="cover-image"/>
+            </manifest><spine/></package>"#,
+        );
+        assert!(matches!(
+            package.resource_selections().0,
+            ResourceSelection::Ambiguous { ref candidates, .. }
+                if candidates.iter().map(|ordinal| ordinal.index()).eq([0, 1])
+        ));
+        let index = index(&package, &provider_index(["EPUB/package.opf"]));
+        assert!(matches!(
+            index.selections().cover,
+            ResourceSelection::Ambiguous { ref candidates, .. } if candidates.len() == 2
+        ));
+    }
+
+    #[test]
+    fn ordinal_lookups_return_linked_borrowed_views() {
+        let package = parse_package(
+            r#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+            <metadata/><manifest><item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml"/></manifest>
+            <spine><itemref idref="chapter"/></spine></package>"#,
+        );
+        let provider = provider_index(["EPUB/package.opf", "EPUB/chapter.xhtml"]);
+        let index = index(&package, &provider);
+
+        let declaration = index.declaration(ManifestOrdinal::from_index(0)).unwrap();
+        let resource = declaration.resource().unwrap();
+        let occurrence = index
+            .occurrence(ReadingOrderOrdinal::from_index(0))
+            .unwrap();
+        assert_eq!(index.resource(resource.ordinal()).unwrap(), resource);
+        assert_eq!(resource.declarations().next(), Some(declaration));
+        assert_eq!(occurrence.declaration(), Some(declaration));
+        assert_eq!(occurrence.resource(), Some(resource));
+        assert!(index.resource(ResourceOrdinal(u32::MAX)).is_none());
+        assert!(index.declaration(ManifestOrdinal(u32::MAX)).is_none());
+        assert!(index.occurrence(ReadingOrderOrdinal(u32::MAX)).is_none());
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn resource_index_rejects_indices_beyond_public_ordinals() {
+        assert!(
+            ensure_ordinal_count(u32::MAX as usize + 1, ResourceIndexCollection::Resources).is_ok()
+        );
+        assert_eq!(
+            ensure_ordinal_count(u32::MAX as usize + 2, ResourceIndexCollection::Resources)
+                .unwrap_err()
+                .collection(),
+            ResourceIndexCollection::Resources
+        );
+    }
+
+    #[test]
+    fn canonical_href_corpus_preserves_authored_text_and_only_encodes_interior_spaces() {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         enum Kind {
             Empty,
@@ -2353,6 +2330,8 @@ mod tests {
             ("/chapter.xhtml", Kind::Invalid),
             ("chapter.xhtml", Kind::Local),
             ("chapter%20one.xhtml", Kind::Local),
+            ("chapter one [1].xhtml", Kind::Local),
+            ("chapter\tone.xhtml", Kind::Invalid),
             ("chapter.xhtml?view=full", Kind::Local),
             ("?view=full", Kind::Local),
             ("#part", Kind::SameDocument),
@@ -2375,7 +2354,12 @@ mod tests {
                 ParsedHref::ExternalScheme { .. } => Kind::External,
             };
             assert_eq!(actual, expected, "authored href: {authored:?}");
-            assert_eq!(parsed.original().as_str(), authored);
+            if authored == "chapter one [1].xhtml" {
+                let ParsedHref::Local { target, .. } = &parsed else {
+                    panic!("expected a local href");
+                };
+                assert_eq!(target.as_str(), "chapter%20one%20[1].xhtml");
+            }
         }
 
         assert!(AuthoredHref::new(" chapter.xhtml").to_epub_href().is_none());
@@ -2411,50 +2395,25 @@ mod tests {
         ];
 
         for (authored, expected_path, expected_fragment) in cases {
-            let resolved = target_for_href(&AuthoredHref::new(authored), &source);
-            match (resolved, expected_fragment) {
-                (ResolvedHref::Resource(ResourceAddress::Local(path)), None) => {
-                    assert_eq!(path.as_str(), expected_path, "authored href: {authored:?}");
-                }
-                (
-                    ResolvedHref::Fragment {
-                        resource: ResourceAddress::Local(path),
-                        fragment,
-                        ..
-                    },
-                    Some(expected_fragment),
-                ) => {
-                    assert_eq!(path.as_str(), expected_path, "authored href: {authored:?}");
-                    assert_eq!(fragment, expected_fragment);
-                }
-                (actual, _) => panic!("unexpected resolution for {authored:?}: {actual:?}"),
-            }
+            let resolved = href::resolve_href(&AuthoredHref::new(authored), &source).unwrap();
+            assert_eq!(
+                resolved.address,
+                ResourceAddress::Local(EpubPath::new(expected_path).unwrap()),
+                "authored href: {authored:?}"
+            );
+            assert_eq!(resolved.fragment.as_deref(), expected_fragment);
         }
 
         for authored in [
             "../../../outside.xhtml",
             "%2e%2e/%2e%2e/%2e%2e/outside.xhtml",
         ] {
-            let resolved = target_for_href(&AuthoredHref::new(authored), &source);
+            let resolved = href::resolve_href(&AuthoredHref::new(authored), &source);
             assert!(
-                matches!(
-                    resolved,
-                    ResolvedHref::Invalid(ref value) if value == authored
-                ),
+                matches!(resolved, Err(ref error) if error.authored().as_str() == authored),
                 "authored href {authored:?} resolved as {resolved:?}"
             );
         }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn epub_path_rejects_non_unicode_native_paths() {
-        use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt;
-
-        let path = PathBuf::from(OsString::from_vec(b"EPUB/chapter-\xff.xhtml".to_vec()));
-
-        assert_eq!(EpubPath::new(path), Err(EpubPathError::NonUtf8));
     }
 
     #[test]
@@ -2494,5 +2453,61 @@ mod tests {
             EpubPath::new("EPUB/custom:chapter.xhtml").unwrap().as_str(),
             "EPUB/custom:chapter.xhtml"
         );
+    }
+
+    #[test]
+    fn strict_publication_href_rejects_what_link_resolution_repairs() {
+        let package_path = EpubPath::new("EPUB/package.opf").unwrap();
+        let accepted = [
+            ("text/chapter.xhtml", "EPUB/text/chapter.xhtml"),
+            ("text/chapter%20one.xhtml", "EPUB/text/chapter one.xhtml"),
+            ("text/chapter.xhtml?view=full", "EPUB/text/chapter.xhtml"),
+            ("../EPUB/chapter.xhtml", "EPUB/chapter.xhtml"),
+        ];
+        for (authored, expected) in accepted {
+            assert_eq!(
+                resolve_publication_href(&AuthoredHref::new(authored), &package_path),
+                Some(EpubPath::new(expected).unwrap()),
+                "authored href: {authored:?}"
+            );
+        }
+
+        let rejected = [
+            "chapter.xhtml#part",
+            "chapter.xhtml/",
+            "text//chapter.xhtml",
+            "text/%2E%2E",
+            "text/.",
+            "https://example.com/chapter.xhtml",
+            "data:text/plain,hello",
+            "#part",
+            "",
+        ];
+        for authored in rejected {
+            let href = AuthoredHref::new(authored);
+            assert_eq!(
+                resolve_publication_href(&href, &package_path),
+                None,
+                "authored href: {authored:?}"
+            );
+        }
+
+        for authored in ["chapter.xhtml/", "text//chapter.xhtml"] {
+            assert!(
+                resolve_href(&AuthoredHref::new(authored), &package_path).is_ok(),
+                "link resolution should stay lenient for {authored:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinals_round_trip_the_position_they_serialize() {
+        let ordinals = [
+            ResourceOrdinal::new(3).as_u32(),
+            ManifestOrdinal::new(3).as_u32(),
+            ReadingOrderOrdinal::new(3).as_u32(),
+        ];
+        assert_eq!(ordinals, [3, 3, 3]);
+        assert_eq!(ManifestOrdinal::new(3).index(), 3);
     }
 }

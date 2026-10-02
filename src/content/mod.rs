@@ -1,17 +1,17 @@
-//! Searchable text, fragments, viewport metadata, structure, media, forms, and scripts extracted
-//! from content.
+//! Source text, fragments, structure, media, forms, and scripts extracted from content.
 //!
 //! [`XhtmlFacts`] provides source-order text plus authored viewport metadata, headings, page
 //! breaks, figures, tables, media, forms, and scripts. [`SvgFacts`] provides standalone SVG text,
 //! fragment targets, scripts, and nested XHTML facts from `foreignObject`, while
 //! [`crate::media_overlay::SmilFacts`] provides synchronized playback nodes.
+//! Structural semantics use [`crate::semantics::SemanticToken`].
+//! Use [`XhtmlFacts::text_stream`] for document text, overlapping [spans](text::TextSpanRef),
+//! and separate [attribute text](text::SupplementaryText). Applications choose how to index
+//! these observations for search or narration.
 //!
-//! These values describe normalized source content, not browser-rendered layout or text. They
-//! belong to an analysis snapshot and continue to describe that analyzed version after an edit.
-//! Extraction coverage is available from [`crate::analysis::coverage::Coverage::content`]. The
-//! models are not mutable or lossless XHTML, SVG, or CSS syntax trees. Use
-//! [`crate::Epub::resource`] and [`crate::resource::Resource::bytes`] when exact source bytes are
-//! required.
+//! These models describe source content, not browser-rendered text. Check
+//! [`crate::analysis::coverage::Coverage::content`] for extraction coverage, or use
+//! [`crate::Epub::bytes`] to read the original source.
 
 mod documents;
 pub(crate) mod facts;
@@ -19,11 +19,14 @@ pub mod text;
 
 pub(crate) mod extraction;
 
-pub use documents::{ContentFacts, SvgFacts, SvgForeignObjectFact, SvgTextFact, XhtmlFacts};
+pub use documents::{
+    ContentFacts, DocumentActivities, DocumentActivity, SvgFacts, SvgForeignObjectFact,
+    SvgTextFact, XhtmlFacts,
+};
 pub use facts::{
-    FormFact, FragmentAttribute, FragmentFact, HtmlStructuralElement, MediaFact,
-    MediaSourceContext, ScriptFact, SemanticSource, SemanticToken, StructureFact,
-    ViewportDirective, ViewportDirectiveFact, ViewportFact,
+    FormFact, FragmentAttribute, FragmentFact, MediaFact, MediaSourceContext, ScriptFact,
+    StructureFact, StructureRole, TrackKind, ViewportDirective, ViewportDirectiveFact,
+    ViewportFact,
 };
 
 pub(crate) use extraction::{

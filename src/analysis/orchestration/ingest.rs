@@ -4,17 +4,16 @@ use super::*;
 
 pub(super) fn ingest_analysis_resource<R: ResourceProvider>(
     publication: &Epub<R>,
-    record: &ResourceRecord,
+    record: ResourceRef<'_>,
     resources: &ResourceIndex,
     secondary_ncx: Option<EpubPath>,
     limits: &AnalysisLimits,
     analyzed_bytes: u64,
     fingerprint_bytes: u64,
 ) -> ResourceIngest {
-    let classification =
-        ResourceClassification::from_formats(semantic_formats_for(record, resources));
+    let classification = ResourceClassification::from_formats(semantic_formats_for(record));
     let css_candidate = css_candidate(record);
-    if record.presence() != ProviderPresence::Present {
+    if !record.presence().is_present() {
         let classification = classification_failure(classification, AnalysisIssue::Missing);
         return ResourceIngest {
             extractions: unavailable_extractions(
@@ -32,15 +31,15 @@ pub(super) fn ingest_analysis_resource<R: ResourceProvider>(
     }
 
     let fingerprint_remaining = limits
-        .max_total_fingerprint_bytes()
+        .max_total_fingerprint_bytes
         .map(|limit| limit.saturating_sub(fingerprint_bytes));
-    let fingerprint_preflight = match (record.metadata().size_bytes(), fingerprint_remaining) {
+    let fingerprint_preflight = match (record.presence().size_bytes(), fingerprint_remaining) {
         (Some(size), Some(remaining)) if size > remaining => {
-            Some(AnalysisIssue::TotalFingerprintLimit)
+            Some(AnalysisIssue::Limit(AnalysisLimit::TotalFingerprintBytes))
         }
         _ => None,
     };
-    let size = record.metadata().size_bytes();
+    let size = record.presence().size_bytes();
     let inspection_hint = inspection_hint_for(record, resources).or_else(|| {
         (css_candidate
             || matches!(
@@ -54,21 +53,22 @@ pub(super) fn ingest_analysis_resource<R: ResourceProvider>(
     let (semantic_limit, semantic_limit_issue) = analysis_read_limit(limits, analyzed_bytes);
     let semantic_preflight = size.and_then(|size| {
         if limits
-            .max_resource_analysis_bytes()
+            .max_resource_analysis_bytes
             .is_some_and(|limit| size > limit)
         {
-            Some(AnalysisIssue::PerResourceAnalysisLimit)
+            Some(AnalysisIssue::Limit(AnalysisLimit::ResourceAnalysisBytes))
         } else if limits
-            .max_total_analysis_bytes()
+            .max_total_analysis_bytes
             .is_some_and(|limit| analyzed_bytes.saturating_add(size) > limit)
         {
-            Some(AnalysisIssue::TotalAnalysisLimit)
+            Some(AnalysisIssue::Limit(AnalysisLimit::TotalAnalysisBytes))
         } else {
             None
         }
     });
-    let result = publication.read_resource_for_analysis(record.address(), |reader| {
-        Ok(ingest_resource_reader(
+    let path = record.local_path().expect("present resources are local");
+    let result = publication.read_committed(path, |reader| {
+        ingest_resource_reader_with_smil_limits(
             reader,
             IngestPlan {
                 inspection_hint,
@@ -84,14 +84,18 @@ pub(super) fn ingest_analysis_resource<R: ResourceProvider>(
                 fingerprint_budget: StreamBudget {
                     limit: fingerprint_remaining,
                     preflight: fingerprint_preflight,
-                    exceeded: AnalysisIssue::TotalFingerprintLimit,
+                    exceeded: AnalysisIssue::Limit(AnalysisLimit::TotalFingerprintBytes),
                 },
             },
-        ))
+            crate::media_overlay::smil::SmilParseLimits::new(
+                limits.max_smil_nodes.unwrap_or(usize::MAX),
+                limits.max_smil_nesting.unwrap_or(usize::MAX),
+            ),
+        )
     });
     result.unwrap_or_else(|_| {
         let classification = classification_failure(
-            ResourceClassification::from_formats(semantic_formats_for(record, resources)),
+            ResourceClassification::from_formats(semantic_formats_for(record)),
             AnalysisIssue::Unreadable,
         );
         ResourceIngest {
@@ -110,14 +114,10 @@ pub(super) fn ingest_analysis_resource<R: ResourceProvider>(
     })
 }
 
-pub(super) fn semantic_formats_for(
-    record: &ResourceRecord,
-    resources: &ResourceIndex,
-) -> Vec<SemanticFormat> {
+pub(super) fn semantic_formats_for(record: ResourceRef<'_>) -> Vec<SemanticFormat> {
     record
         .declarations()
-        .iter()
-        .filter_map(|key| resources.declaration(*key).ok()?.media_type())
+        .filter_map(|declaration| declaration.media_type())
         .filter_map(|media_type| {
             if media_type.is_xhtml() {
                 Some(SemanticFormat::Xhtml)
@@ -134,28 +134,24 @@ pub(super) fn semantic_formats_for(
         .collect()
 }
 
-pub(super) fn css_candidate(record: &ResourceRecord) -> bool {
-    record.declarations().is_empty()
+pub(super) fn css_candidate(record: ResourceRef<'_>) -> bool {
+    record.declarations().next().is_none()
         && record
-            .metadata()
-            .file_extension()
+            .local_path()
+            .and_then(EpubPath::extension)
             .is_some_and(|extension| extension.eq_ignore_ascii_case("css"))
 }
 
 fn inspection_hint_for(
-    record: &ResourceRecord,
+    record: ResourceRef<'_>,
     resources: &ResourceIndex,
 ) -> Option<MediaTypeClassification> {
-    if resources.package().key() == record.key() {
+    if resources.package() == record {
         return Some(MediaTypeClassification::GenericText);
     }
-    let mut hints = record.declarations().iter().filter_map(|key| {
-        resources
-            .declaration(*key)
-            .ok()?
-            .media_type()?
-            .classification()
-    });
+    let mut hints = record
+        .declarations()
+        .filter_map(|declaration| declaration.media_type()?.classification());
     let first = hints.next()?;
     hints.all(|hint| hint == first).then_some(first)
 }
@@ -207,7 +203,20 @@ pub(crate) struct IngestPlan {
     pub(crate) fingerprint_budget: StreamBudget,
 }
 
+#[cfg(test)]
 pub(crate) fn ingest_resource_reader(reader: &mut dyn Read, plan: IngestPlan) -> ResourceIngest {
+    ingest_resource_reader_with_smil_limits(
+        reader,
+        plan,
+        crate::media_overlay::smil::SmilParseLimits::default(),
+    )
+}
+
+fn ingest_resource_reader_with_smil_limits(
+    reader: &mut dyn Read,
+    plan: IngestPlan,
+    smil_limits: crate::media_overlay::smil::SmilParseLimits,
+) -> ResourceIngest {
     const PROBE_BYTES: u64 = 64 * 1024;
 
     let IngestPlan {
@@ -331,12 +340,13 @@ pub(crate) fn ingest_resource_reader(reader: &mut dyn Read, plan: IngestPlan) ->
                 let mut decoded = XmlUtf8Reader::new(BufReader::new(&mut semantic));
                 let result = parse_xhtml_document_from_reader_counted(&mut decoded)
                     .map(|(facts, _)| Box::new(facts))
-                    .map_err(|_| AnalysisIssue::ParserFailure);
+                    .map_err(|_| AnalysisIssue::Malformed);
                 extractions.push(ExtractionOutcome::Xhtml(result));
             }
             Some(SemanticFormat::Smil) => {
                 let result = crate::media_overlay::smil::extract_smil_facts_from_reader(
                     BufReader::new(&mut semantic),
+                    smil_limits,
                 )
                 .map_err(smil_analysis_issue);
                 extractions.push(ExtractionOutcome::Smil(result));
@@ -417,7 +427,7 @@ pub(crate) fn ingest_resource_reader(reader: &mut dyn Read, plan: IngestPlan) ->
             secondary_ncx,
             parse_blocker
                 .or(probe_failed)
-                .unwrap_or(AnalysisIssue::ParserFailure),
+                .unwrap_or(AnalysisIssue::Malformed),
         );
     }
     if inspection_bytes.is_empty() {
@@ -454,12 +464,12 @@ pub(crate) fn ingest_resource_reader(reader: &mut dyn Read, plan: IngestPlan) ->
             .or_else(|| semantic_crossed.then_some(semantic_budget.exceeded))
             .or_else(|| semantic_failed.then_some(AnalysisIssue::Unreadable))
             .or(inspected.issue);
-        match inspection_issue {
-            Some(issue) => AnalysisOutcome::Partial {
-                value: inspected.facts,
-                issue,
-            },
-            None => AnalysisOutcome::Complete(inspected.facts),
+        match (inspected.facts, inspection_issue) {
+            (Some(value), Some(issue)) => AnalysisOutcome::Partial { value, issue },
+            (Some(value), None) => AnalysisOutcome::Complete(value),
+            (None, issue) => {
+                AnalysisOutcome::Unavailable(issue.unwrap_or(AnalysisIssue::Unreadable))
+            }
         }
     };
 
@@ -542,9 +552,8 @@ fn smil_analysis_issue(error: SmilError) -> AnalysisIssue {
             AnalysisIssue::Malformed
         }
         SmilError::Io { .. } => AnalysisIssue::Unreadable,
-        SmilError::NodeLimitExceeded { .. } | SmilError::NestingLimitExceeded { .. } => {
-            AnalysisIssue::Unsupported
-        }
+        SmilError::NodeLimitExceeded { .. } => AnalysisIssue::Limit(AnalysisLimit::SmilNodes),
+        SmilError::NestingLimitExceeded { .. } => AnalysisIssue::Limit(AnalysisLimit::SmilNesting),
         _ => AnalysisIssue::Malformed,
     }
 }
@@ -560,24 +569,5 @@ pub(super) fn classification_failure(
             issue,
         },
         ResourceClassification::Unknown => AnalysisOutcome::Unavailable(issue),
-    }
-}
-
-pub(super) fn record_coverage<T>(
-    key: ResourceKey,
-    outcome: &AnalysisOutcome<T>,
-    completed: &mut Vec<ResourceKey>,
-    partial: &mut Vec<IncompleteResource>,
-    unavailable: &mut Vec<IncompleteResource>,
-) {
-    match outcome {
-        AnalysisOutcome::Complete(_) => completed.push(key),
-        AnalysisOutcome::Partial { issue, .. } => {
-            partial.push(IncompleteResource::new(key, *issue))
-        }
-        AnalysisOutcome::Unavailable(issue) => {
-            unavailable.push(IncompleteResource::new(key, *issue))
-        }
-        AnalysisOutcome::NotApplicable => {}
     }
 }

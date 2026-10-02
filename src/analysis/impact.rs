@@ -4,45 +4,39 @@
 //! navigation structures an application may need to update. They do not perform the edit.
 //! Incomplete relationship coverage means additional consequences may exist.
 
-use super::PublicationAnalysis;
-use super::coverage::{CoverageState, RelationshipSource};
+use super::ResourceAnalysisRef;
 use super::reference::{
-    AuthoredReference, HrefTarget, ManifestReference, ManifestRole, ManifestTarget,
-    ReferenceContext, ReferenceSource,
+    AuthoredReference, HrefReference, HrefRole, ManifestReference, ManifestRole, ManifestTarget,
 };
 use crate::resource::{
-    AuthoredHref, EpubPath, IndexKeyError, ManifestDeclaration, ManifestKey, ParsedHref,
-    ProviderPresence, ReadingOrderEntry, ReadingOrderKey, ReadingOrderTarget, ResourceKey,
-    ResourceRecord, parse_href,
+    AuthoredHref, EpubPath, IdrefTarget, ManifestOrdinal, ParsedHref, ReadingOrderOccurrenceRef,
+    ReadingOrderOrdinal, ResourceOrdinal, ResourceRef, parse_href,
 };
 use std::collections::HashSet;
 
 /// Links and publication structures potentially affected by removing or moving a resource.
 ///
-/// This value does not execute an edit and can become stale after any committed change.
+/// Any document whose relationships were not fully extracted can hide an incoming reference, so
+/// impact is complete only when relationship coverage is. Unlike
+/// [`Closure::incomplete_sources`](super::dependency::Closure::incomplete_sources), which reports
+/// the producers actually reached from a root, that set is publication-wide: read it from
+/// [`Coverage::incomplete_relationships`](super::coverage::Coverage::incomplete_relationships).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Impact {
-    pub(crate) resource: ResourceKey,
+    pub(crate) resource: ResourceOrdinal,
     pub(crate) incoming: Vec<AuthoredReference>,
     pub(crate) outgoing_rebased: Vec<AuthoredReference>,
     pub(crate) structural_changes: Vec<StructuralChange>,
-    pub(crate) incomplete_sources: Vec<ReferenceSource>,
 }
 
-/// Failure to derive resource impact from a requested snapshot key.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum ImpactError {
-    /// The key does not belong to this analysis snapshot.
-    #[error(transparent)]
-    Index(#[from] IndexKeyError),
-    /// Package-document changes require package-aware edit planning.
-    #[error("package document impact is not represented by resource impact")]
-    PackageDocument(ResourceKey),
-}
+/// Package-document changes require package-aware edit planning rather than resource impact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("package document impact is not represented by resource impact")]
+pub struct ImpactError;
 
 impl Impact {
-    /// Returns the affected snapshot-local resource key.
-    pub fn resource(&self) -> ResourceKey {
+    /// Which resource this is about.
+    pub fn resource(&self) -> ResourceOrdinal {
         self.resource
     }
 
@@ -60,25 +54,15 @@ impl Impact {
     pub fn structural_changes(&self) -> &[StructuralChange] {
         &self.structural_changes
     }
-
-    /// Returns relationship producers that could hide additional impact.
-    pub fn incomplete_sources(&self) -> &[ReferenceSource] {
-        &self.incomplete_sources
-    }
-
-    /// Returns whether every relevant relationship producer completed.
-    pub fn is_complete(&self) -> bool {
-        self.incomplete_sources.is_empty()
-    }
 }
 
 /// A package or navigation structure potentially affected by a resource edit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StructuralChange {
     /// A manifest declaration for the resource.
-    ManifestDeclaration(ManifestKey),
+    ManifestDeclaration(ManifestOrdinal),
     /// A reading-order occurrence resolving to the resource.
-    ReadingOrderOccurrence(ReadingOrderKey),
+    ReadingOrderOccurrence(ReadingOrderOrdinal),
     /// An authored navigation href targeting the resource.
     NavigationReference(AuthoredReference),
     /// A manifest fallback relationship targeting the resource.
@@ -87,62 +71,58 @@ pub enum StructuralChange {
     MediaOverlayReference(AuthoredReference),
 }
 
-impl PublicationAnalysis {
-    /// Derives advisory consequences of removing a snapshot resource.
-    pub fn impact_of_removal(&self, key: ResourceKey) -> Result<Impact, ImpactError> {
-        let record = self.resources().resource(key)?;
-        if key == self.resources().package().key() {
-            return Err(ImpactError::PackageDocument(key));
+impl<'a> ResourceAnalysisRef<'a> {
+    /// Derives advisory consequences of removing this resource.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ImpactError`] for the package document.
+    pub fn impact_of_removal(self) -> Result<Impact, ImpactError> {
+        let record = self.resource();
+        let analysis = self.analysis;
+        if record == analysis.resources().package() {
+            return Err(ImpactError);
         }
+        let key = record.ordinal();
         let declarations = record
             .declarations()
-            .iter()
-            .copied()
+            .map(|declaration| declaration.ordinal())
             .collect::<HashSet<_>>();
-        let incoming = self
-            .references()
-            .filter(|reference| {
-                reference_targets_resource(reference, key)
-                    || matches!(reference, AuthoredReference::Manifest(idref) if manifest_id_targets(idref, key, &declarations))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut slots = self.reference_index().to.clone();
+        slots.extend(
+            analysis
+                .references
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, reference)| {
+                    matches!(reference, AuthoredReference::Manifest(idref)
+                if matches!(idref.target(), ManifestTarget::Ambiguous { candidates }
+                    if candidates.iter().any(|key| declarations.contains(key))))
+                    .then_some(slot)
+                }),
+        );
+        slots.sort_unstable();
+        slots.dedup();
+        let incoming = analysis.references_at(&slots).cloned().collect::<Vec<_>>();
         let mut structural_changes = record
             .declarations()
-            .iter()
-            .copied()
-            .map(StructuralChange::ManifestDeclaration)
+            .map(|declaration| StructuralChange::ManifestDeclaration(declaration.ordinal()))
             .collect::<Vec<_>>();
-
-        structural_changes.extend(self.resources().reading_order().filter_map(|entry| {
+        structural_changes.extend(analysis.resources().reading_order().filter_map(|entry| {
             reading_order_targets(entry, key, &declarations)
-                .then_some(StructuralChange::ReadingOrderOccurrence(entry.key()))
+                .then_some(StructuralChange::ReadingOrderOccurrence(entry.ordinal()))
         }));
-        structural_changes.extend(incoming.iter().filter_map(|reference| match reference {
-            AuthoredReference::Href(reference)
-                if matches!(reference.context(), ReferenceContext::Navigation(_)) =>
-            {
-                Some(StructuralChange::NavigationReference(
-                    AuthoredReference::Href(reference.clone()),
-                ))
-            }
-            _ => None,
-        }));
-        structural_changes.extend(self.references().filter_map(|reference| {
+        structural_changes.extend(navigation_changes(&incoming));
+        structural_changes.extend(incoming.iter().filter_map(|reference| {
             let AuthoredReference::Manifest(idref) = reference else {
                 return None;
             };
-            if !manifest_id_targets(idref, key, &declarations) {
-                return None;
-            }
-            match idref.role() {
-                ManifestRole::Fallback => {
-                    Some(StructuralChange::FallbackReference(reference.clone()))
-                }
+            manifest_id_targets(idref, key, &declarations).then(|| match idref.role() {
+                ManifestRole::Fallback => StructuralChange::FallbackReference(reference.clone()),
                 ManifestRole::MediaOverlay => {
-                    Some(StructuralChange::MediaOverlayReference(reference.clone()))
+                    StructuralChange::MediaOverlayReference(reference.clone())
                 }
-            }
+            })
         }));
 
         Ok(Impact {
@@ -150,37 +130,34 @@ impl PublicationAnalysis {
             incoming,
             outgoing_rebased: Vec::new(),
             structural_changes,
-            incomplete_sources: self.incomplete_relationship_sources(),
         })
     }
 
-    /// Derives advisory consequences of moving a snapshot resource to `destination`.
-    pub fn impact_of_move(
-        &self,
-        key: ResourceKey,
-        destination: &EpubPath,
-    ) -> Result<Impact, ImpactError> {
-        let record = self.resources().resource(key)?;
-        if key == self.resources().package().key() {
-            return Err(ImpactError::PackageDocument(key));
+    /// Derives advisory consequences of moving this resource to `destination`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ImpactError`] for the package document.
+    pub fn impact_of_move(self, destination: &EpubPath) -> Result<Impact, ImpactError> {
+        let record = self.resource();
+        let analysis = self.analysis;
+        if record == analysis.resources().package() {
+            return Err(ImpactError);
         }
+        let key = record.ordinal();
         if record.local_path() == Some(destination) {
             return Ok(Impact {
                 resource: key,
                 incoming: Vec::new(),
                 outgoing_rebased: Vec::new(),
                 structural_changes: Vec::new(),
-                incomplete_sources: self.incomplete_relationship_sources(),
             });
         }
 
         let incoming = self
-            .references()
-            .filter(|reference| match reference {
-                AuthoredReference::Href(href) => {
-                    reference_targets_resource(reference, key) && href.source() != key
-                }
-                AuthoredReference::Manifest(_) => false,
+            .incoming_references()
+            .filter(|reference| {
+                matches!(reference, AuthoredReference::Href(href) if href.source() != key)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -188,137 +165,63 @@ impl PublicationAnalysis {
         // reference is a candidate, including fragment-only and query-only values.
         let outgoing_rebased = self
             .references()
-            .filter(|reference| match reference {
-                AuthoredReference::Href(href) => {
-                    href.source() == key && is_relative_reference(href.declared())
-                }
-                AuthoredReference::Manifest(_) => false,
-            })
-            .cloned()
+            .filter(|href| is_relative_reference(href.declared()))
+            .map(|href| AuthoredReference::Href(href.clone()))
             .collect::<Vec<_>>();
         let mut structural_changes = record
             .declarations()
-            .iter()
-            .copied()
-            .map(StructuralChange::ManifestDeclaration)
+            .map(|declaration| StructuralChange::ManifestDeclaration(declaration.ordinal()))
             .collect::<Vec<_>>();
-        structural_changes.extend(incoming.iter().filter_map(|reference| match reference {
-            AuthoredReference::Href(reference)
-                if matches!(reference.context(), ReferenceContext::Navigation(_)) =>
-            {
-                Some(StructuralChange::NavigationReference(
-                    AuthoredReference::Href(reference.clone()),
-                ))
-            }
-            _ => None,
-        }));
+        structural_changes.extend(navigation_changes(&incoming));
 
         Ok(Impact {
             resource: key,
             incoming,
             outgoing_rebased,
             structural_changes,
-            incomplete_sources: self.incomplete_relationship_sources(),
         })
-    }
-
-    fn incomplete_relationship_sources(&self) -> Vec<ReferenceSource> {
-        let mut sources = Vec::new();
-        let mut seen = HashSet::new();
-        for coverage in self
-            .coverage()
-            .relationships()
-            .iter()
-            .filter(|coverage| !matches!(coverage.state(), CoverageState::Complete))
-        {
-            let source = match coverage.source() {
-                RelationshipSource::Package => {
-                    ReferenceSource::Resource(self.resources().package().key())
-                }
-                RelationshipSource::Navigation(resource)
-                | RelationshipSource::Ncx(resource)
-                | RelationshipSource::Smil(resource)
-                | RelationshipSource::Xhtml(resource)
-                | RelationshipSource::Css(resource)
-                | RelationshipSource::Svg(resource) => ReferenceSource::Resource(*resource),
-            };
-            push_unique(&mut sources, &mut seen, source);
-        }
-        for record in self
-            .resources()
-            .resources()
-            .iter()
-            .filter(|record| self.remote_relationships_unknown(record))
-        {
-            push_unique(
-                &mut sources,
-                &mut seen,
-                ReferenceSource::Resource(record.key()),
-            );
-        }
-        sources
-    }
-
-    fn remote_relationships_unknown(&self, record: &ResourceRecord) -> bool {
-        record.presence() == ProviderPresence::NotApplicable
-            && record.declarations().iter().any(|key| {
-                self.resources()
-                    .declaration(*key)
-                    .ok()
-                    .and_then(ManifestDeclaration::media_type)
-                    .is_some_and(|media_type| {
-                        media_type.is_xhtml()
-                            || media_type.is_css()
-                            || media_type.is_svg()
-                            || media_type.is_smil()
-                            || media_type.is_ncx()
-                    })
-            })
     }
 }
 
-fn reference_targets_resource(reference: &AuthoredReference, target: ResourceKey) -> bool {
-    match reference {
-        AuthoredReference::Href(reference) => match reference.target() {
-            HrefTarget::Resource { resource, .. } | HrefTarget::Fragment { resource, .. } => {
-                *resource == target
-            }
-            HrefTarget::Remote {
-                declared_resource, ..
-            } => *declared_resource == Some(target),
-            HrefTarget::Data(_)
-            | HrefTarget::External(_)
-            | HrefTarget::MissingLocal(_)
-            | HrefTarget::Invalid(_) => false,
-        },
-        AuthoredReference::Manifest(reference) => matches!(
-            reference.target(),
-            ManifestTarget::Declaration { resource: Some(resource), .. } if *resource == target
-        ),
-    }
+fn navigation_changes(
+    incoming: &[AuthoredReference],
+) -> impl Iterator<Item = StructuralChange> + '_ {
+    incoming.iter().filter_map(|reference| match reference {
+        AuthoredReference::Href(href) if is_navigation_reference(href) => {
+            Some(StructuralChange::NavigationReference(reference.clone()))
+        }
+        _ => None,
+    })
+}
+
+fn is_navigation_reference(href: &HrefReference) -> bool {
+    matches!(
+        href.role(),
+        HrefRole::Toc | HrefRole::PageList | HrefRole::Landmark | HrefRole::Ncx
+    )
 }
 
 fn reading_order_targets(
-    entry: &ReadingOrderEntry,
-    resource: ResourceKey,
-    declarations: &HashSet<ManifestKey>,
+    entry: ReadingOrderOccurrenceRef<'_>,
+    resource: ResourceOrdinal,
+    declarations: &HashSet<ManifestOrdinal>,
 ) -> bool {
     match entry.target() {
-        ReadingOrderTarget::Declaration {
-            declaration,
-            resource: target,
-        } => *target == Some(resource) || declarations.contains(declaration),
-        ReadingOrderTarget::AmbiguousManifestId { candidates } => {
+        Some(IdrefTarget::Declaration(declaration)) => {
+            entry.resource().map(ResourceRef::ordinal) == Some(resource)
+                || declarations.contains(declaration)
+        }
+        Some(IdrefTarget::Ambiguous(candidates)) => {
             candidates.iter().any(|key| declarations.contains(key))
         }
-        ReadingOrderTarget::MissingIdref | ReadingOrderTarget::MissingManifestId => false,
+        Some(IdrefTarget::Invalid | IdrefTarget::Missing) | None => false,
     }
 }
 
 fn manifest_id_targets(
     reference: &ManifestReference,
-    resource: ResourceKey,
-    declarations: &HashSet<ManifestKey>,
+    resource: ResourceOrdinal,
+    declarations: &HashSet<ManifestOrdinal>,
 ) -> bool {
     match reference.target() {
         ManifestTarget::Declaration {
@@ -328,7 +231,7 @@ fn manifest_id_targets(
         ManifestTarget::Ambiguous { candidates } => {
             candidates.iter().any(|key| declarations.contains(key))
         }
-        ManifestTarget::Missing => false,
+        ManifestTarget::InvalidManifestIdref | ManifestTarget::Missing => false,
     }
 }
 
@@ -337,14 +240,4 @@ fn is_relative_reference(href: &AuthoredHref) -> bool {
         parse_href(href.clone()),
         ParsedHref::Local { .. } | ParsedHref::SameDocument { .. } | ParsedHref::Empty { .. }
     )
-}
-
-fn push_unique<T: Copy + Eq + std::hash::Hash>(
-    values: &mut Vec<T>,
-    seen: &mut HashSet<T>,
-    value: T,
-) {
-    if seen.insert(value) {
-        values.push(value);
-    }
 }

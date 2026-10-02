@@ -1,20 +1,18 @@
 //! Parse, build, exchange, and resolve EPUB Annotations 1.0 data.
 //!
-//! Use [`AnnotationSet::parse_json`] to import annotation JSON, the builders to create annotations,
-//! [`AnnotationBundle`] to exchange a set with audiovisual body resources, and
+//! Use [`AnnotationSet::parse_json`] or [`AnnotationTarget::parse_json`] to import annotation JSON,
+//! the builders to create annotations, [`AnnotationBundle`] to exchange a set with audiovisual
+//! body resources, and
 //! [`PublicationAnalysis::resolve_annotation_target`](crate::analysis::PublicationAnalysis::resolve_annotation_target)
 //! to resolve targets against analyzed publication content.
 //!
-//! Import accepts partial annotation objects after requiring a top-level JSON object. Typed
-//! accessors return recognized values, while `extra()` maps retain many malformed and unknown
-//! members for normalized export. Export does not retain JSON member order, whitespace, malformed
-//! array entries, or every malformed shape. Selector refinements beyond
+//! Import accepts partial objects. Typed accessors expose recognized values; `extra()` retains
+//! unrecognized members where possible. Export normalizes JSON. Selector refinements beyond
 //! [`MAX_SELECTOR_NESTING_DEPTH`] are discarded.
 
-use crate::content::text::TextRange;
 use crate::resource::EpubPath;
 use crate::resource::MediaType;
-use crate::resource::provider::{ProviderReadError, ResourceProviderIndexError};
+use crate::resource::provider::ProviderReadError;
 use crate::resource::{AuthoredHref, ParsedHref, parse_href};
 
 use oxilangtag::LanguageTag;
@@ -32,7 +30,7 @@ pub(crate) use bundle::{
     MAX_ANNOTATIONS_JSON_BYTES, MAX_ARCHIVE_ENTRIES, MAX_ARCHIVE_RESOURCE_BYTES,
     MAX_ARCHIVE_UNCOMPRESSED_BYTES, normalize_annotation_resource_path,
 };
-pub use resolution::{AnnotationResolution, AnnotationSourceState, HostRequirement};
+pub use resolution::{AnnotationSourceError, HostRequirement, ResolvedTarget, SelectorResolution};
 
 /// Stores JSON members that are not represented by typed annotation fields.
 pub type JsonObject = Map<String, Value>;
@@ -84,42 +82,121 @@ pub enum AnnotationError {
         #[from]
         source: serde_json::Error,
     },
-    /// The top-level value was not the required JSON object.
-    #[error("expected a JSON object for {kind}")]
-    ExpectedObject {
-        /// Description of the object that was expected.
-        kind: &'static str,
-    },
-    /// Bundle annotation bytes were not UTF-8.
-    #[error("annotation JSON is not valid UTF-8: {source}")]
-    Utf8 {
-        /// The UTF-8 decoding error.
-        source: std::str::Utf8Error,
-    },
+    /// The top-level value was not a JSON object holding an annotation set.
+    #[error("expected a JSON object for an annotation set")]
+    ExpectedSetObject,
+    /// The top-level value was not a JSON object holding an annotation target.
+    #[error("expected a JSON object for an annotation target")]
+    ExpectedTargetObject,
+}
+
+/// A named field in the annotation model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum AnnotationField {
+    /// The `about date` field.
+    AboutDate,
+    /// The `about format` field.
+    AboutFormat,
+    /// The `body format` field.
+    BodyFormat,
+    /// The `body type` field.
+    BodyType,
+    /// The `value` field.
+    BodyValue,
+    /// The `created` field.
+    Created,
+    /// The `creator id` field.
+    CreatorId,
+    /// The `creator type` field.
+    CreatorType,
+    /// The `CSS selector value` field.
+    CssSelectorValue,
+    /// The `fragment selector value` field.
+    FragmentSelectorValue,
+    /// The `generated` field.
+    Generated,
+    /// The `generator homepage` field.
+    GeneratorHomepage,
+    /// The `generator id` field.
+    GeneratorId,
+    /// The `generator name` field.
+    GeneratorName,
+    /// The `generator type` field.
+    GeneratorType,
+    /// The `id` field.
+    Id,
+    /// The `modified` field.
+    Modified,
+    /// The `refinedBy selector type` field.
+    RefinedBySelectorType,
+    /// The `selector type` field.
+    SelectorType,
+    /// The `set id` field.
+    SetId,
+    /// The `target` field.
+    Target,
+    /// The `target source` field.
+    TargetSource,
+    /// The `text position selector range` field.
+    TextPositionSelectorRange,
+    /// The `type` field.
+    Type,
+}
+
+impl AnnotationField {
+    /// Returns the field name used in messages.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AboutDate => "about date",
+            Self::AboutFormat => "about format",
+            Self::BodyFormat => "body format",
+            Self::BodyType => "body type",
+            Self::BodyValue => "value",
+            Self::Created => "created",
+            Self::CreatorId => "creator id",
+            Self::CreatorType => "creator type",
+            Self::CssSelectorValue => "CSS selector value",
+            Self::FragmentSelectorValue => "fragment selector value",
+            Self::Generated => "generated",
+            Self::GeneratorHomepage => "generator homepage",
+            Self::GeneratorId => "generator id",
+            Self::GeneratorName => "generator name",
+            Self::GeneratorType => "generator type",
+            Self::Id => "id",
+            Self::Modified => "modified",
+            Self::RefinedBySelectorType => "refinedBy selector type",
+            Self::SelectorType => "selector type",
+            Self::SetId => "set id",
+            Self::Target => "target",
+            Self::TargetSource => "target source",
+            Self::TextPositionSelectorRange => "text position selector range",
+            Self::Type => "type",
+        }
+    }
+}
+
+impl std::fmt::Display for AnnotationField {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 /// Reports why typed annotation data could not be built or changed.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum AnnotationModelError {
     /// A required non-whitespace field was empty.
     #[error("annotation {field} must not be empty")]
     EmptyField {
-        /// Model field name.
-        field: &'static str,
+        /// Model field.
+        field: AnnotationField,
     },
     /// A required field was absent or could not be recovered.
     #[error("annotation {field} is required")]
     MissingField {
-        /// Model field name.
-        field: &'static str,
-    },
-    /// A field was supplied for an incompatible model kind.
-    #[error("annotation {field} is not applicable to {context}")]
-    FieldNotApplicable {
-        /// Model field name.
-        field: &'static str,
-        /// Kind for which the field is not applicable.
-        context: &'static str,
+        /// Model field.
+        field: AnnotationField,
     },
     /// A target source was not an unfragmented local publication path.
     #[error("annotation target source must be an unfragmented local publication path: {value}")]
@@ -144,8 +221,8 @@ pub enum AnnotationModelError {
     /// A timestamp could not be formatted as RFC 3339.
     #[error("annotation {field} timestamp cannot be represented as RFC 3339")]
     TimestampNotRepresentable {
-        /// Timestamp field name.
-        field: &'static str,
+        /// Timestamp field.
+        field: AnnotationField,
     },
     /// Two annotations in a set had the same identifier.
     #[error("annotation id is duplicated within the annotation set: {id}")]
@@ -165,11 +242,31 @@ pub enum AnnotationModelError {
         /// Ambiguous identifier.
         id: String,
     },
+    /// An annotation identifier was not an absolute URL.
+    #[error("annotation id is not an absolute URL: {value}")]
+    InvalidId {
+        /// Rejected identifier.
+        value: String,
+    },
+    /// A language tag was not a valid BCP 47 tag.
+    #[error("annotation language tag is invalid: {value}")]
+    InvalidLanguage {
+        /// Rejected language tag.
+        value: String,
+    },
+    /// A text position selector ended before it started.
+    #[error("annotation text position selector ends before it starts: {start}..{end}")]
+    ReversedTextPosition {
+        /// Start offset.
+        start: u64,
+        /// End offset.
+        end: u64,
+    },
     /// A field value violated its typed invariant.
     #[error("annotation {field} has an invalid value: {value}")]
     InvalidField {
-        /// Model field name.
-        field: &'static str,
+        /// Model field.
+        field: AnnotationField,
         /// Rejected value or a description of it.
         value: String,
     },
@@ -188,13 +285,6 @@ pub enum AnnotationModelError {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum EmbeddedAnnotationsError {
-    /// The publication resource inventory could not be built.
-    #[error("could not index resources for embedded annotations: {source}")]
-    ProviderIndex {
-        /// Provider indexing failure.
-        #[source]
-        source: ResourceProviderIndexError,
-    },
     /// An embedded annotation resource could not be read.
     #[error("could not read embedded annotation resource {path}: {source}")]
     ResourceRead {
@@ -220,10 +310,10 @@ pub enum EmbeddedAnnotationsError {
     },
 }
 
-/// Holds annotations for JSON interchange, bundle exchange, and target resolution.
+/// A collection of annotations, as exchanged between reading systems.
 ///
-/// Parsed sets may be partial. Optional accessors expose recovered typed values; use
-/// [`AnnotationSet::extra`] to inspect other retained top-level members.
+/// Anything parsed from a document that this crate does not model is kept in
+/// [`Self::extra`] rather than dropped, so a set survives a round trip.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AnnotationSet {
     context: Option<Value>,
@@ -247,7 +337,7 @@ impl AnnotationSet {
         generator: Option<AnnotationGenerator>,
         generated: Option<OffsetDateTime>,
     ) -> Result<Self, AnnotationModelError> {
-        require_valid_id(&id, "set id")?;
+        require_valid_id(&id, AnnotationField::SetId)?;
         ensure_valid_about(&about)?;
         if let Some(generator) = &generator {
             ensure_valid_generator(generator)?;
@@ -262,7 +352,7 @@ impl AnnotationSet {
             id: Some(id),
             generator,
             generated: generated
-                .map(|value| format_timestamp(value, "generated"))
+                .map(|value| format_timestamp(value, AnnotationField::Generated))
                 .transpose()?,
             about: Some(about),
             items,
@@ -279,9 +369,7 @@ impl AnnotationSet {
     /// Imports a JSON object value for inspection, editing, or normalized export.
     pub fn from_json_value(value: Value) -> Result<Self, AnnotationError> {
         let Value::Object(object) = value else {
-            return Err(AnnotationError::ExpectedObject {
-                kind: "annotation set",
-            });
+            return Err(AnnotationError::ExpectedSetObject);
         };
         Ok(Self::from_object(object))
     }
@@ -399,7 +487,7 @@ impl AnnotationSet {
     fn from_object(mut object: JsonObject) -> Self {
         let context = take_context(&mut object);
         let id = take_string_if(&mut object, ID, |value| {
-            require_valid_id(value, "id").is_ok()
+            require_valid_id(value, AnnotationField::Id).is_ok()
         });
         let type_valid =
             take_string_if(&mut object, TYPE, |value| value == ANNOTATION_SET).is_some();
@@ -452,10 +540,9 @@ impl AnnotationSet {
     }
 }
 
-/// Describes one annotation that can be built, inspected, exchanged, and resolved.
+/// One annotation: what it says, and what part of the book it is attached to.
 ///
-/// Parsed annotations may be partial. A missing typed value can have source evidence in
-/// [`Annotation::extra`].
+/// Members this crate does not model are kept in [`Self::extra`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Annotation {
     context: Option<Value>,
@@ -483,7 +570,7 @@ impl Annotation {
         creator: Option<AnnotationCreator>,
         body: Option<AnnotationBody>,
     ) -> Result<Self, AnnotationModelError> {
-        require_valid_id(&id, "id")?;
+        require_valid_id(&id, AnnotationField::Id)?;
         if modified.is_some_and(|modified| modified < created) {
             return Err(AnnotationModelError::ModifiedBeforeCreated);
         }
@@ -499,9 +586,9 @@ impl Annotation {
             type_valid: true,
             id: Some(id),
             motivation,
-            created: Some(format_timestamp(created, "created")?),
+            created: Some(format_timestamp(created, AnnotationField::Created)?),
             modified: modified
-                .map(|value| format_timestamp(value, "modified"))
+                .map(|value| format_timestamp(value, AnnotationField::Modified))
                 .transpose()?,
             creator,
             target: Some(target),
@@ -561,7 +648,7 @@ impl Annotation {
         };
         let context = take_context(&mut object);
         let id = take_string_if(&mut object, ID, |value| {
-            require_valid_id(value, "id").is_ok()
+            require_valid_id(value, AnnotationField::Id).is_ok()
         });
         let type_valid = take_string_if(&mut object, TYPE, |value| value == ANNOTATION).is_some();
         let motivation_raw = take_string(&mut object, MOTIVATION);
@@ -660,10 +747,7 @@ impl AnnotationMotivation {
 
 /// Selects a publication resource and ordered alternatives within that resource.
 ///
-/// Use [`AnnotationTarget::source_state`] for inventory-only source lookup, or
-/// [`PublicationAnalysis::resolve_annotation_target`](crate::analysis::PublicationAnalysis::resolve_annotation_target)
-/// to resolve selectors against analyzed content. Builders require an unfragmented local source;
-/// parsed targets can be partial.
+/// Builders require an unfragmented local source; parsed targets can be partial.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AnnotationTarget {
     source: Option<String>,
@@ -681,7 +765,7 @@ impl AnnotationTarget {
         #[builder(default)] selectors: Vec<AnnotationSelector>,
         meta: Option<JsonObject>,
     ) -> Result<Self, AnnotationModelError> {
-        require_non_empty(&source, "target source")?;
+        require_non_empty(&source, AnnotationField::TargetSource)?;
         if !matches!(
             parse_href(AuthoredHref::new(source.clone())),
             ParsedHref::Local { fragment: None, .. }
@@ -697,9 +781,24 @@ impl AnnotationTarget {
         })
     }
 
-    /// Returns the recovered source, or an empty string when import could not recover one.
-    pub fn source(&self) -> &str {
-        self.source.as_deref().unwrap_or_default()
+    /// Parses a target-only UTF-8 JSON object for inspection or normalized export.
+    pub fn parse_json(input: &str) -> Result<Self, AnnotationError> {
+        let value: Value = serde_json::from_str(input)?;
+        Self::from_json_value(value)
+    }
+
+    fn from_json_value(value: Value) -> Result<Self, AnnotationError> {
+        Self::from_value(value).ok_or(AnnotationError::ExpectedTargetObject)
+    }
+
+    /// Exports the target as compact, normalized JSON.
+    pub fn to_json_string(&self) -> Result<String, AnnotationError> {
+        Ok(serde_json::to_string(&self.to_value())?)
+    }
+
+    /// Returns the recovered source, or `None` when import could not recover one.
+    pub fn source(&self) -> Option<&str> {
+        self.source.as_deref()
     }
 
     /// Returns selector alternatives in authored order.
@@ -783,12 +882,8 @@ impl AnnotationSelector {
         let Value::Object(mut object) = value else {
             unreachable!()
         };
-        let selector_type = object.get(TYPE).cloned();
         let Some(type_string) = object.get(TYPE).and_then(Value::as_str).map(str::to_string) else {
-            return Self::Unknown(UnknownSelector {
-                selector_type,
-                raw: object,
-            });
+            return Self::Unknown(UnknownSelector { raw: object });
         };
         object.remove(TYPE);
         match type_string.as_str() {
@@ -799,10 +894,7 @@ impl AnnotationSelector {
             }
             _ => {
                 object.insert(TYPE.to_string(), Value::String(type_string));
-                Self::Unknown(UnknownSelector {
-                    selector_type,
-                    raw: object,
-                })
+                Self::Unknown(UnknownSelector { raw: object })
             }
         }
     }
@@ -853,7 +945,8 @@ impl FragmentSelector {
         conforms_to: Option<FragmentConformsTo>,
         #[builder(default)] refined_by: Vec<AnnotationSelector>,
     ) -> Result<Self, AnnotationModelError> {
-        require_non_empty(&value, "fragment selector value")?;
+        require_non_empty(&value, AnnotationField::FragmentSelectorValue)?;
+        require_valid_fragment_value(&value)?;
         ensure_valid_refinements(&refined_by)?;
         Ok(Self {
             value: Some(value),
@@ -863,9 +956,14 @@ impl FragmentSelector {
         })
     }
 
-    /// Returns the fragment value, or an empty string when malformed during import.
-    pub fn value(&self) -> &str {
-        self.value.as_deref().unwrap_or_default()
+    /// Returns the fragment value, or `None` when it was malformed during import.
+    pub fn value(&self) -> Option<&str> {
+        self.value.as_deref()
+    }
+
+    /// Returns the percent-decoded fragment value, when it is present and decodable.
+    pub fn decoded_value(&self) -> Option<String> {
+        resolution::decode_fragment_selector_value(self.value()?)
     }
 
     /// Returns the fragment syntax declaration, including preserved unknown declarations.
@@ -971,7 +1069,7 @@ impl CssSelector {
         value: String,
         #[builder(default)] refined_by: Vec<AnnotationSelector>,
     ) -> Result<Self, AnnotationModelError> {
-        require_non_empty(&value, "CSS selector value")?;
+        require_non_empty(&value, AnnotationField::CssSelectorValue)?;
         ensure_valid_refinements(&refined_by)?;
         Ok(Self {
             value: Some(value),
@@ -980,9 +1078,9 @@ impl CssSelector {
         })
     }
 
-    /// Returns the CSS selector, or an empty string when malformed during import.
-    pub fn value(&self) -> &str {
-        self.value.as_deref().unwrap_or_default()
+    /// Returns the CSS selector, or `None` when it was malformed during import.
+    pub fn value(&self) -> Option<&str> {
+        self.value.as_deref()
     }
 
     /// Returns refinement alternatives in authored order.
@@ -1014,10 +1112,10 @@ impl CssSelector {
     }
 }
 
-/// A half-open Unicode code-point range in the publication text representation.
+/// A point or half-open range in the rendered text representation defined by Web Annotations.
 ///
-/// Detached analysis resolves these offsets against its normalized extracted source-text stream,
-/// not browser layout or UTF-8/UTF-16 units.
+/// Resolution requires a browser host because extracted source text is not authoritative for
+/// rendered-text offsets.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextPositionSelector {
     start: Option<u64>,
@@ -1028,22 +1126,20 @@ pub struct TextPositionSelector {
 
 #[bon::bon]
 impl TextPositionSelector {
-    /// Builds a non-empty half-open text range with bounded valid refinements.
+    /// Builds a text point or half-open range with bounded valid refinements.
     #[builder]
     pub fn new(
-        range: TextRange,
+        start: u64,
+        end: u64,
         #[builder(default)] refined_by: Vec<AnnotationSelector>,
     ) -> Result<Self, AnnotationModelError> {
         ensure_valid_refinements(&refined_by)?;
-        if range.start() >= range.end() {
-            return Err(AnnotationModelError::InvalidField {
-                field: "text position selector range",
-                value: format!("{}..{}", range.start(), range.end()),
-            });
+        if start > end {
+            return Err(AnnotationModelError::ReversedTextPosition { start, end });
         }
         Ok(Self {
-            start: Some(range.start()),
-            end: Some(range.end()),
+            start: Some(start),
+            end: Some(end),
             refined_by,
             extra: JsonObject::new(),
         })
@@ -1101,14 +1197,13 @@ impl TextPositionSelector {
 /// Retains an unknown or malformed selector for inspection and export.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnknownSelector {
-    selector_type: Option<Value>,
     raw: JsonObject,
 }
 
 impl UnknownSelector {
     /// Returns the original `type` member, including non-string malformed values.
     pub fn selector_type(&self) -> Option<&Value> {
-        self.selector_type.as_ref()
+        self.raw.get(TYPE)
     }
 
     /// Returns the complete selector object used for normalized re-serialization.
@@ -1130,7 +1225,6 @@ impl UnknownSelector {
 pub struct AnnotationBody {
     body_type: Option<AnnotationBodyType>,
     format: Option<MediaType>,
-    format_source: Option<String>,
     value: Option<LocalizableText>,
     id: Option<String>,
     color: Option<AnnotationColor>,
@@ -1139,96 +1233,70 @@ pub struct AnnotationBody {
     extra: JsonObject,
 }
 
-#[bon::bon]
 impl AnnotationBody {
-    /// Builds a body and enforces fields and media types appropriate to its body kind.
-    #[builder]
-    pub fn new(
-        body_type: AnnotationBodyType,
-        format: Option<MediaType>,
-        value: Option<LocalizableText>,
-        id: Option<String>,
-        color: Option<AnnotationColor>,
-        highlight: Option<AnnotationHighlight>,
-        #[builder(default)] tags: Vec<String>,
-    ) -> Result<Self, AnnotationModelError> {
-        let (format, value, id) = match body_type {
-            AnnotationBodyType::TextualBody => {
-                let value = value.ok_or(AnnotationModelError::MissingField { field: "value" })?;
-                validate_typed_localizable_text(&value, "body value")?;
-                if id.is_some() {
-                    return Err(AnnotationModelError::FieldNotApplicable {
-                        field: "id",
-                        context: "a textual body",
-                    });
-                }
-                if format.as_ref().is_some_and(|format| {
-                    !format
-                        .essence()
-                        .is_some_and(|value| value.eq_ignore_ascii_case("text/plain"))
-                }) {
-                    return Err(AnnotationModelError::BodyFormatMismatch {
-                        body_type: AnnotationBodyType::TextualBody.as_str(),
-                        format: format
-                            .as_ref()
-                            .expect("checked as present")
-                            .as_str()
-                            .to_string(),
-                    });
-                }
-                (
-                    Some(MediaType::new("text/plain").expect("text/plain is a valid media type")),
-                    Some(value),
-                    None,
-                )
-            }
-            AnnotationBodyType::Image | AnnotationBodyType::Audio | AnnotationBodyType::Video => {
-                if value.is_some() {
-                    return Err(AnnotationModelError::FieldNotApplicable {
-                        field: "value",
-                        context: "an audiovisual body",
-                    });
-                }
-                let id = id.ok_or(AnnotationModelError::MissingField { field: "id" })?;
-                let normalized = normalize_annotation_resource_path(&id).ok_or_else(|| {
-                    AnnotationModelError::InvalidResourcePath { path: id.clone() }
-                })?;
-                if let Some(format) = &format {
-                    let matches = match body_type {
-                        AnnotationBodyType::Image => format.has_top_level_type(mime::IMAGE),
-                        AnnotationBodyType::Audio => format.has_top_level_type(mime::AUDIO),
-                        AnnotationBodyType::Video => format.has_top_level_type(mime::VIDEO),
-                        AnnotationBodyType::TextualBody => unreachable!(),
-                    };
-                    if !matches {
-                        return Err(AnnotationModelError::BodyFormatMismatch {
-                            body_type: body_type.as_str(),
-                            format: format.as_str().to_string(),
-                        });
-                    }
-                }
-                (format, None, Some(normalized))
-            }
-        };
+    /// Builds a plain textual body with canonical `text/plain` format.
+    pub fn text(value: impl Into<LocalizableText>) -> Result<Self, AnnotationModelError> {
+        let value = value.into();
+        validate_typed_localizable_text(&value)?;
         Ok(Self {
-            body_type: Some(body_type),
-            format_source: format.as_ref().map(|value| value.as_str().to_string()),
-            format,
-            value,
-            id,
-            color,
-            highlight,
-            tags,
+            body_type: Some(AnnotationBodyType::TextualBody),
+            format: Some(MediaType::new("text/plain").expect("text/plain is a valid media type")),
+            value: Some(value),
+            id: None,
+            color: None,
+            highlight: None,
+            tags: Vec::new(),
             extra: JsonObject::new(),
         })
     }
 
-    /// Builds a plain textual body with canonical `text/plain` format.
-    pub fn text(value: impl Into<LocalizableText>) -> Result<Self, AnnotationModelError> {
-        Self::builder()
-            .body_type(AnnotationBodyType::TextualBody)
-            .value(value.into())
-            .build()
+    /// Builds an audiovisual body referencing a bundle-relative resource path.
+    ///
+    /// A supplied format must match the media kind.
+    pub fn media(
+        media_type: MediaBodyType,
+        id: impl Into<String>,
+        format: Option<MediaType>,
+    ) -> Result<Self, AnnotationModelError> {
+        let id = id.into();
+        let normalized = normalize_annotation_resource_path(&id)
+            .ok_or(AnnotationModelError::InvalidResourcePath { path: id })?;
+        if let Some(format) = &format
+            && !format.has_top_level_type(media_type.top_level_type())
+        {
+            return Err(AnnotationModelError::BodyFormatMismatch {
+                body_type: AnnotationBodyType::from(media_type).as_str(),
+                format: format.as_str().to_string(),
+            });
+        }
+        Ok(Self {
+            body_type: Some(AnnotationBodyType::from(media_type)),
+            format,
+            value: None,
+            id: Some(normalized),
+            color: None,
+            highlight: None,
+            tags: Vec::new(),
+            extra: JsonObject::new(),
+        })
+    }
+
+    /// Sets the requested presentation color.
+    pub fn with_color(mut self, color: AnnotationColor) -> Self {
+        self.color = Some(color);
+        self
+    }
+
+    /// Sets the requested highlight style.
+    pub fn with_highlight(mut self, highlight: AnnotationHighlight) -> Self {
+        self.highlight = Some(highlight);
+        self
+    }
+
+    /// Sets the body tags in presentation order.
+    pub fn with_tags(mut self, tags: Vec<String>) -> Self {
+        self.tags = tags;
+        self
     }
 
     /// Returns the recovered body kind.
@@ -1236,9 +1304,14 @@ impl AnnotationBody {
         self.body_type.as_ref()
     }
 
-    /// Returns the parsed, valid media type.
-    pub fn format_media_type(&self) -> Option<&MediaType> {
+    /// Returns the authored media type, which may be syntactically invalid.
+    pub fn format(&self) -> Option<&MediaType> {
         self.format.as_ref()
+    }
+
+    /// Returns the authored media type only when it is valid MIME syntax.
+    pub fn format_media_type(&self) -> Option<&MediaType> {
+        self.format.as_ref().filter(|format| format.is_valid())
     }
 
     /// Returns textual body content.
@@ -1289,39 +1362,40 @@ impl AnnotationBody {
         let body_type = body_type_raw
             .as_deref()
             .and_then(AnnotationBodyType::from_raw);
-        let format_raw = take_string(&mut object, FORMAT);
-        let format = format_raw
+        let format = take_string(&mut object, FORMAT)
             .as_deref()
-            .and_then(MediaType::new)
-            .filter(MediaType::is_valid);
-        let mut value = take_parsed(&mut object, VALUE, parse_localizable_text);
-        let mut id = take_string(&mut object, ID);
-        let color_raw = take_string(&mut object, COLOR);
-        let color = color_raw.as_deref().map(AnnotationColor::from_raw);
-        let highlight_raw = take_string(&mut object, HIGHLIGHT);
-        let highlight = highlight_raw.as_deref().map(AnnotationHighlight::from_raw);
-        let tags = take_string_array(&mut object, TAGS);
-        match body_type {
-            Some(AnnotationBodyType::TextualBody) => {
-                id = None;
-            }
-            Some(
-                AnnotationBodyType::Image | AnnotationBodyType::Audio | AnnotationBodyType::Video,
-            ) => {
-                value = None;
-                if id
-                    .as_deref()
-                    .is_some_and(|value| normalize_annotation_resource_path(value).is_none())
-                {
-                    object.insert(ID.to_string(), Value::String(id.take().unwrap()));
-                }
-            }
-            _ => {}
+            .and_then(MediaType::new);
+        let audiovisual = matches!(
+            body_type,
+            Some(AnnotationBodyType::Image | AnnotationBodyType::Audio | AnnotationBodyType::Video)
+        );
+        // Members that do not apply to the recovered kind stay in `extra`, so they survive export.
+        let value = (!audiovisual)
+            .then(|| take_parsed(&mut object, VALUE, parse_localizable_text))
+            .flatten();
+        let mut id = (body_type != Some(AnnotationBodyType::TextualBody))
+            .then(|| take_string(&mut object, ID))
+            .flatten();
+        if audiovisual
+            && id
+                .as_deref()
+                .is_some_and(|value| normalize_annotation_resource_path(value).is_none())
+        {
+            object.insert(
+                ID.to_string(),
+                Value::String(id.take().expect("id present")),
+            );
         }
+        let color = take_string(&mut object, COLOR)
+            .as_deref()
+            .map(AnnotationColor::from_raw);
+        let highlight = take_string(&mut object, HIGHLIGHT)
+            .as_deref()
+            .map(AnnotationHighlight::from_raw);
+        let tags = take_string_array(&mut object, TAGS);
         Some(Self {
             body_type,
             format,
-            format_source: format_raw,
             value,
             id,
             color,
@@ -1339,7 +1413,11 @@ impl AnnotationBody {
                 Value::String(body_type.as_str().to_string()),
             );
         }
-        insert_string(&mut object, FORMAT, self.format_source.as_deref());
+        insert_string(
+            &mut object,
+            FORMAT,
+            self.format.as_ref().map(MediaType::as_str),
+        );
         if let Some(value) = &self.value {
             object.insert(VALUE.to_string(), value.to_value());
         }
@@ -1374,6 +1452,37 @@ pub enum AnnotationBodyType {
     Audio,
     /// Detached video resource.
     Video,
+}
+
+/// Chooses the audiovisual representation of an annotation body.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+pub enum MediaBodyType {
+    /// Detached image resource.
+    Image,
+    /// Detached audio resource.
+    Audio,
+    /// Detached video resource.
+    Video,
+}
+
+impl MediaBodyType {
+    fn top_level_type(self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::Audio => "audio",
+            Self::Video => "video",
+        }
+    }
+}
+
+impl From<MediaBodyType> for AnnotationBodyType {
+    fn from(value: MediaBodyType) -> Self {
+        match value {
+            MediaBodyType::Image => Self::Image,
+            MediaBodyType::Audio => Self::Audio,
+            MediaBodyType::Video => Self::Video,
+        }
+    }
 }
 
 impl AnnotationBodyType {
@@ -1628,9 +1737,9 @@ impl AnnotationCreator {
         creator_type: AnnotationCreatorType,
         name: Option<LocalizableText>,
     ) -> Result<Self, AnnotationModelError> {
-        require_valid_id(&id, "creator id")?;
+        require_valid_id(&id, AnnotationField::CreatorId)?;
         if let Some(name) = &name {
-            validate_typed_localizable_text(name, "creator name")?;
+            validate_typed_localizable_text(name)?;
         }
         Ok(Self {
             id: Some(id),
@@ -1665,7 +1774,7 @@ impl AnnotationCreator {
             return None;
         };
         let id = take_string_if(&mut object, ID, |value| {
-            require_valid_id(value, "id").is_ok()
+            require_valid_id(value, AnnotationField::Id).is_ok()
         });
         let creator_type_raw = take_string_if(&mut object, TYPE, |value| {
             AnnotationCreatorType::from_raw(value).is_some()
@@ -1748,10 +1857,10 @@ impl AnnotationGenerator {
         name: String,
         homepage: Option<String>,
     ) -> Result<Self, AnnotationModelError> {
-        require_valid_id(&id, "generator id")?;
-        require_non_empty(&name, "generator name")?;
+        require_valid_id(&id, AnnotationField::GeneratorId)?;
+        require_non_empty(&name, AnnotationField::GeneratorName)?;
         if let Some(homepage) = &homepage {
-            require_absolute_url(homepage, "generator homepage")?;
+            require_absolute_url(homepage, AnnotationField::GeneratorHomepage)?;
         }
         Ok(Self {
             id: Some(id),
@@ -1792,12 +1901,12 @@ impl AnnotationGenerator {
             return None;
         };
         let id = take_string_if(&mut object, ID, |value| {
-            require_valid_id(value, "id").is_ok()
+            require_valid_id(value, AnnotationField::Id).is_ok()
         });
         let generator_type = take_string_if(&mut object, TYPE, |value| value == "Software");
         let name = take_string(&mut object, NAME);
         let homepage = take_string_if(&mut object, HOMEPAGE, |homepage| {
-            require_absolute_url(homepage, "generator homepage").is_ok()
+            require_absolute_url(homepage, AnnotationField::GeneratorHomepage).is_ok()
         });
         Some(Self {
             id,
@@ -1843,13 +1952,13 @@ impl AnnotationAbout {
         date: Option<String>,
     ) -> Result<Self, AnnotationModelError> {
         if let Some(format) = &format {
-            require_media_type(format, "about format")?;
+            require_media_type(format, AnnotationField::AboutFormat)?;
         }
         if let Some(date) = &date {
-            require_year(date, "about date")?;
+            require_year(date, AnnotationField::AboutDate)?;
         }
         for value in title.iter().chain(publisher.iter()).chain(creators.iter()) {
-            validate_typed_localizable_text(value, "about localized text")?;
+            validate_typed_localizable_text(value)?;
         }
         Ok(Self {
             identifiers,
@@ -2135,7 +2244,7 @@ fn insert_selectors(object: &mut JsonObject, key: &str, values: &[AnnotationSele
     object.insert(key.to_string(), value);
 }
 
-fn require_non_empty(value: &str, field: &'static str) -> Result<(), AnnotationModelError> {
+fn require_non_empty(value: &str, field: AnnotationField) -> Result<(), AnnotationModelError> {
     if value.trim().is_empty() {
         Err(AnnotationModelError::EmptyField { field })
     } else {
@@ -2143,18 +2252,17 @@ fn require_non_empty(value: &str, field: &'static str) -> Result<(), AnnotationM
     }
 }
 
-fn require_valid_id(value: &str, field: &'static str) -> Result<(), AnnotationModelError> {
+fn require_valid_id(value: &str, field: AnnotationField) -> Result<(), AnnotationModelError> {
     require_non_empty(value, field)?;
     if Url::parse(value).is_err() {
-        return Err(AnnotationModelError::InvalidField {
-            field,
+        return Err(AnnotationModelError::InvalidId {
             value: value.to_string(),
         });
     }
     Ok(())
 }
 
-fn require_absolute_url(value: &str, field: &'static str) -> Result<(), AnnotationModelError> {
+fn require_absolute_url(value: &str, field: AnnotationField) -> Result<(), AnnotationModelError> {
     if Url::parse(value).is_err() {
         return Err(AnnotationModelError::InvalidField {
             field,
@@ -2164,7 +2272,7 @@ fn require_absolute_url(value: &str, field: &'static str) -> Result<(), Annotati
     Ok(())
 }
 
-fn require_media_type(value: &str, field: &'static str) -> Result<(), AnnotationModelError> {
+fn require_media_type(value: &str, field: AnnotationField) -> Result<(), AnnotationModelError> {
     if !MediaType::new(value).is_some_and(|media_type| media_type.is_valid()) {
         return Err(AnnotationModelError::InvalidField {
             field,
@@ -2174,7 +2282,7 @@ fn require_media_type(value: &str, field: &'static str) -> Result<(), Annotation
     Ok(())
 }
 
-fn require_year(value: &str, field: &'static str) -> Result<(), AnnotationModelError> {
+fn require_year(value: &str, field: AnnotationField) -> Result<(), AnnotationModelError> {
     if value.len() != 4 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(AnnotationModelError::InvalidField {
             field,
@@ -2188,18 +2296,14 @@ fn is_valid_language_tag(value: &str) -> bool {
     LanguageTag::parse(value).is_ok()
 }
 
-fn validate_typed_localizable_text(
-    value: &LocalizableText,
-    field: &'static str,
-) -> Result<(), AnnotationModelError> {
+fn validate_typed_localizable_text(value: &LocalizableText) -> Result<(), AnnotationModelError> {
     if let LocalizableText::Localized {
         language: Some(language),
         ..
     } = value
         && !is_valid_language_tag(language)
     {
-        return Err(AnnotationModelError::InvalidField {
-            field,
+        return Err(AnnotationModelError::InvalidLanguage {
             value: language.clone(),
         });
     }
@@ -2212,7 +2316,7 @@ fn parse_timestamp(value: &str) -> Option<OffsetDateTime> {
 
 fn format_timestamp(
     value: OffsetDateTime,
-    field: &'static str,
+    field: AnnotationField,
 ) -> Result<String, AnnotationModelError> {
     value
         .format(&Rfc3339)
@@ -2220,22 +2324,24 @@ fn format_timestamp(
 }
 
 fn required_annotation_id(annotation: &Annotation) -> Result<&str, AnnotationModelError> {
-    annotation
-        .id()
-        .ok_or(AnnotationModelError::MissingField { field: "id" })
+    annotation.id().ok_or(AnnotationModelError::MissingField {
+        field: AnnotationField::Id,
+    })
 }
 
 fn ensure_valid_annotation(annotation: &Annotation) -> Result<(), AnnotationModelError> {
     let id = required_annotation_id(annotation)?;
-    require_valid_id(id, "id")?;
+    require_valid_id(id, AnnotationField::Id)?;
     if !annotation.type_valid {
         return Err(AnnotationModelError::InvalidField {
-            field: "type",
+            field: AnnotationField::Type,
             value: "expected Annotation".to_string(),
         });
     }
     if annotation.created.is_none() {
-        return Err(AnnotationModelError::MissingField { field: "created" });
+        return Err(AnnotationModelError::MissingField {
+            field: AnnotationField::Created,
+        });
     }
     if let (Some(created), Some(modified)) = (
         annotation.created.as_deref().and_then(parse_timestamp),
@@ -2247,7 +2353,9 @@ fn ensure_valid_annotation(annotation: &Annotation) -> Result<(), AnnotationMode
     let target = annotation
         .target
         .as_ref()
-        .ok_or(AnnotationModelError::MissingField { field: "target" })?;
+        .ok_or(AnnotationModelError::MissingField {
+            field: AnnotationField::Target,
+        })?;
     ensure_valid_target(target)?;
     if let Some(creator) = &annotation.creator {
         ensure_valid_creator(creator)?;
@@ -2263,9 +2371,9 @@ fn ensure_valid_target(target: &AnnotationTarget) -> Result<(), AnnotationModelE
         .source
         .as_deref()
         .ok_or(AnnotationModelError::MissingField {
-            field: "target source",
+            field: AnnotationField::TargetSource,
         })?;
-    require_non_empty(source, "target source")?;
+    require_non_empty(source, AnnotationField::TargetSource)?;
     if !matches!(
         parse_href(AuthoredHref::new(source.to_string())),
         ParsedHref::Local { fragment: None, .. }
@@ -2283,16 +2391,16 @@ fn ensure_valid_creator(creator: &AnnotationCreator) -> Result<(), AnnotationMod
         .id
         .as_deref()
         .ok_or(AnnotationModelError::MissingField {
-            field: "creator id",
+            field: AnnotationField::CreatorId,
         })?;
-    require_valid_id(id, "creator id")?;
+    require_valid_id(id, AnnotationField::CreatorId)?;
     if creator.creator_type.is_none() {
         return Err(AnnotationModelError::MissingField {
-            field: "creator type",
+            field: AnnotationField::CreatorType,
         });
     }
     if let Some(name) = &creator.name {
-        validate_typed_localizable_text(name, "creator name")?;
+        validate_typed_localizable_text(name)?;
     }
     Ok(())
 }
@@ -2301,11 +2409,15 @@ fn ensure_valid_body(body: &AnnotationBody) -> Result<(), AnnotationModelError> 
     let body_type = body
         .body_type
         .as_ref()
-        .ok_or(AnnotationModelError::MissingField { field: "body type" })?;
-    if body.format_source.is_some() && body.format.is_none() {
+        .ok_or(AnnotationModelError::MissingField {
+            field: AnnotationField::BodyType,
+        })?;
+    if let Some(format) = &body.format
+        && !format.is_valid()
+    {
         return Err(AnnotationModelError::InvalidField {
-            field: "body format",
-            value: body.format_source.clone().unwrap_or_default(),
+            field: AnnotationField::BodyFormat,
+            value: format.as_str().to_string(),
         });
     }
     match body_type {
@@ -2313,14 +2425,10 @@ fn ensure_valid_body(body: &AnnotationBody) -> Result<(), AnnotationModelError> 
             let value = body
                 .value
                 .as_ref()
-                .ok_or(AnnotationModelError::MissingField { field: "value" })?;
-            validate_typed_localizable_text(value, "body value")?;
-            if body.id.is_some() {
-                return Err(AnnotationModelError::FieldNotApplicable {
-                    field: "id",
-                    context: "a textual body",
-                });
-            }
+                .ok_or(AnnotationModelError::MissingField {
+                    field: AnnotationField::BodyValue,
+                })?;
+            validate_typed_localizable_text(value)?;
             if body.format.as_ref().is_some_and(|format| {
                 !format
                     .essence()
@@ -2328,21 +2436,22 @@ fn ensure_valid_body(body: &AnnotationBody) -> Result<(), AnnotationModelError> 
             }) {
                 return Err(AnnotationModelError::BodyFormatMismatch {
                     body_type: body_type.as_str(),
-                    format: body.format_source.clone().unwrap_or_default(),
+                    format: body
+                        .format
+                        .as_ref()
+                        .map(MediaType::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
                 });
             }
         }
         AnnotationBodyType::Image | AnnotationBodyType::Audio | AnnotationBodyType::Video => {
-            if body.value.is_some() {
-                return Err(AnnotationModelError::FieldNotApplicable {
-                    field: "value",
-                    context: "an audiovisual body",
-                });
-            }
             let id = body
                 .id
                 .as_deref()
-                .ok_or(AnnotationModelError::MissingField { field: "id" })?;
+                .ok_or(AnnotationModelError::MissingField {
+                    field: AnnotationField::Id,
+                })?;
             if normalize_annotation_resource_path(id).is_none() {
                 return Err(AnnotationModelError::InvalidResourcePath {
                     path: id.to_string(),
@@ -2350,9 +2459,9 @@ fn ensure_valid_body(body: &AnnotationBody) -> Result<(), AnnotationModelError> 
             }
             if let Some(format) = &body.format {
                 let matches = match body_type {
-                    AnnotationBodyType::Image => format.has_top_level_type(mime::IMAGE),
-                    AnnotationBodyType::Audio => format.has_top_level_type(mime::AUDIO),
-                    AnnotationBodyType::Video => format.has_top_level_type(mime::VIDEO),
+                    AnnotationBodyType::Image => format.has_top_level_type("image"),
+                    AnnotationBodyType::Audio => format.has_top_level_type("audio"),
+                    AnnotationBodyType::Video => format.has_top_level_type("video"),
                     AnnotationBodyType::TextualBody => unreachable!(),
                 };
                 if !matches {
@@ -2372,12 +2481,12 @@ fn ensure_valid_generator(generator: &AnnotationGenerator) -> Result<(), Annotat
         .id
         .as_deref()
         .ok_or(AnnotationModelError::MissingField {
-            field: "generator id",
+            field: AnnotationField::GeneratorId,
         })?;
-    require_valid_id(id, "generator id")?;
+    require_valid_id(id, AnnotationField::GeneratorId)?;
     if generator.generator_type.as_deref() != Some("Software") {
         return Err(AnnotationModelError::InvalidField {
-            field: "generator type",
+            field: AnnotationField::GeneratorType,
             value: generator.generator_type.clone().unwrap_or_default(),
         });
     }
@@ -2385,21 +2494,21 @@ fn ensure_valid_generator(generator: &AnnotationGenerator) -> Result<(), Annotat
         .name
         .as_deref()
         .ok_or(AnnotationModelError::MissingField {
-            field: "generator name",
+            field: AnnotationField::GeneratorName,
         })?;
-    require_non_empty(name, "generator name")?;
+    require_non_empty(name, AnnotationField::GeneratorName)?;
     if let Some(homepage) = &generator.homepage {
-        require_absolute_url(homepage, "generator homepage")?;
+        require_absolute_url(homepage, AnnotationField::GeneratorHomepage)?;
     }
     Ok(())
 }
 
 fn ensure_valid_about(about: &AnnotationAbout) -> Result<(), AnnotationModelError> {
     if let Some(format) = &about.format {
-        require_media_type(format, "about format")?;
+        require_media_type(format, AnnotationField::AboutFormat)?;
     }
     if let Some(date) = &about.date {
-        require_year(date, "about date")?;
+        require_year(date, AnnotationField::AboutDate)?;
     }
     for value in about
         .title
@@ -2407,7 +2516,7 @@ fn ensure_valid_about(about: &AnnotationAbout) -> Result<(), AnnotationModelErro
         .chain(about.publisher.iter())
         .chain(about.creators.iter())
     {
-        validate_typed_localizable_text(value, "about localized text")?;
+        validate_typed_localizable_text(value)?;
     }
     Ok(())
 }
@@ -2431,6 +2540,16 @@ fn ensure_valid_refinements(selectors: &[AnnotationSelector]) -> Result<(), Anno
     ensure_valid_selector_tree(selectors, 2, true)
 }
 
+fn require_valid_fragment_value(value: &str) -> Result<(), AnnotationModelError> {
+    if resolution::decode_fragment_selector_value(value).is_none() {
+        return Err(AnnotationModelError::InvalidField {
+            field: AnnotationField::FragmentSelectorValue,
+            value: value.to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn ensure_valid_selector_tree(
     selectors: &[AnnotationSelector],
     starting_depth: usize,
@@ -2448,7 +2567,11 @@ fn ensure_valid_selector_tree(
         }
         match selector {
             AnnotationSelector::Fragment(selector) => {
-                require_non_empty(selector.value(), "fragment selector value")?;
+                let value = selector.value().ok_or(AnnotationModelError::MissingField {
+                    field: AnnotationField::FragmentSelectorValue,
+                })?;
+                require_non_empty(value, AnnotationField::FragmentSelectorValue)?;
+                require_valid_fragment_value(value)?;
                 pending.extend(
                     selector
                         .refined_by()
@@ -2457,7 +2580,10 @@ fn ensure_valid_selector_tree(
                 );
             }
             AnnotationSelector::Css(selector) => {
-                require_non_empty(selector.value(), "CSS selector value")?;
+                let value = selector.value().ok_or(AnnotationModelError::MissingField {
+                    field: AnnotationField::CssSelectorValue,
+                })?;
+                require_non_empty(value, AnnotationField::CssSelectorValue)?;
                 pending.extend(
                     selector
                         .refined_by()
@@ -2468,12 +2594,12 @@ fn ensure_valid_selector_tree(
             AnnotationSelector::TextPosition(selector) => {
                 let (Some(start), Some(end)) = (selector.start(), selector.end()) else {
                     return Err(AnnotationModelError::MissingField {
-                        field: "text position selector range",
+                        field: AnnotationField::TextPositionSelectorRange,
                     });
                 };
-                if start >= end {
+                if start > end {
                     return Err(AnnotationModelError::InvalidField {
-                        field: "text position selector range",
+                        field: AnnotationField::TextPositionSelectorRange,
                         value: format!("{start}..{end}"),
                     });
                 }
@@ -2487,13 +2613,13 @@ fn ensure_valid_selector_tree(
             AnnotationSelector::Unknown(selector) => {
                 if is_refinement {
                     return Err(AnnotationModelError::InvalidField {
-                        field: "refinedBy selector type",
+                        field: AnnotationField::RefinedBySelectorType,
                         value: "unknown selector".to_string(),
                     });
                 }
                 if selector.selector_type().and_then(Value::as_str).is_none() {
                     return Err(AnnotationModelError::MissingField {
-                        field: "selector type",
+                        field: AnnotationField::SelectorType,
                     });
                 }
             }
@@ -2553,7 +2679,7 @@ mod tests {
 
         assert!(matches!(
             AnnotationSet::from_json_value(Value::Null),
-            Err(AnnotationError::ExpectedObject { .. })
+            Err(AnnotationError::ExpectedSetObject)
         ));
         assert!(matches!(
             AnnotationSet::parse_json("{"),
@@ -2565,9 +2691,43 @@ mod tests {
     fn non_object_annotation_set_is_a_structural_error() {
         assert!(matches!(
             AnnotationSet::from_json_value(serde_json::json!([])),
-            Err(AnnotationError::ExpectedObject {
-                kind: "annotation set"
-            })
+            Err(AnnotationError::ExpectedSetObject)
+        ));
+    }
+
+    #[test]
+    fn target_json_round_trips_unknown_members_and_large_offsets() {
+        let target = AnnotationTarget::parse_json(
+            r#"{
+                "source":"chapter.xhtml",
+                "selector":[{
+                    "type":"TextPositionSelector",
+                    "start":9007199254740993,
+                    "end":18446744073709551615,
+                    "x-selector":{"kept":true}
+                }],
+                "x-target":[1,2,3]
+            }"#,
+        )
+        .unwrap();
+
+        let AnnotationSelector::TextPosition(position) = &target.selectors()[0] else {
+            panic!("expected text position selector");
+        };
+        assert_eq!(position.start(), Some(9_007_199_254_740_993));
+        assert_eq!(position.end(), Some(u64::MAX));
+
+        let output: Value = serde_json::from_str(&target.to_json_string().unwrap()).unwrap();
+        assert_eq!(output["x-target"], serde_json::json!([1, 2, 3]));
+        assert_eq!(output[SELECTOR][0]["x-selector"]["kept"], true);
+        assert_eq!(output[SELECTOR][0][START], 9_007_199_254_740_993_u64);
+        assert_eq!(output[SELECTOR][0][END], u64::MAX);
+
+        let reparsed = AnnotationTarget::parse_json(&target.to_json_string().unwrap()).unwrap();
+        assert_eq!(reparsed, target);
+        assert!(matches!(
+            AnnotationTarget::parse_json("[]"),
+            Err(AnnotationError::ExpectedTargetObject)
         ));
     }
 
@@ -2590,7 +2750,7 @@ mod tests {
             panic!("expected fragment selector");
         };
         assert!(fragment.value.is_none());
-        assert_eq!(fragment.value(), "");
+        assert_eq!(fragment.value(), None);
         assert_eq!(fragment.extra()[VALUE], 4);
         assert_eq!(fragment.to_value()[VALUE], 4);
 
@@ -2630,14 +2790,14 @@ mod tests {
             )
             .unwrap();
             let error = AnnotationTarget::builder()
-                .source(parsed.source().to_string())
+                .source(parsed.source().unwrap().to_string())
                 .selectors(parsed.selectors().to_vec())
                 .build()
                 .unwrap_err();
             assert!(matches!(
                 error,
                 AnnotationModelError::MissingField {
-                    field: "selector type"
+                    field: AnnotationField::SelectorType
                 }
             ));
         }
@@ -2649,7 +2809,7 @@ mod tests {
         .unwrap();
         assert!(
             AnnotationTarget::builder()
-                .source(parsed.source().to_string())
+                .source(parsed.source().unwrap().to_string())
                 .selectors(parsed.selectors().to_vec())
                 .build()
                 .is_ok()
@@ -2971,7 +3131,8 @@ mod tests {
                 .build()
                 .unwrap_err(),
             TextPositionSelector::builder()
-                .range(TextRange::new(0, 1).unwrap())
+                .start(0)
+                .end(1)
                 .refined_by(vec![at_limit])
                 .build()
                 .unwrap_err(),
@@ -2983,6 +3144,26 @@ mod tests {
                 }
             ));
         }
+    }
+
+    #[test]
+    fn typed_fragment_selectors_reject_malformed_values() {
+        for value in ["literal%", "%FF", "#one", "one#two"] {
+            assert!(
+                FragmentSelector::builder()
+                    .value(value.to_string())
+                    .build()
+                    .is_err(),
+                "{value:?}"
+            );
+        }
+
+        assert!(
+            FragmentSelector::builder()
+                .value("one%23two".to_string())
+                .build()
+                .is_ok()
+        );
     }
 
     #[test]
@@ -3058,7 +3239,8 @@ mod tests {
         );
         assert!(
             TextPositionSelector::builder()
-                .range(TextRange::new(0, 1).unwrap())
+                .start(0)
+                .end(1)
                 .refined_by(vec![unknown])
                 .build()
                 .is_err()
@@ -3299,9 +3481,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             set.items()[0].target().unwrap().source(),
-            "https://example.com/chapter.xhtml"
+            Some("https://example.com/chapter.xhtml")
         );
-        assert_eq!(set.items()[1].target().unwrap().source(), "#fragment");
+        assert_eq!(set.items()[1].target().unwrap().source(), Some("#fragment"));
     }
 
     fn created_at() -> OffsetDateTime {
@@ -3328,9 +3510,9 @@ mod tests {
 
     #[test]
     fn typed_builders_create_canonical_annotation_json() {
-        let range = TextRange::new(4, 19).unwrap();
         let refinement = TextPositionSelector::builder()
-            .range(range)
+            .start(4)
+            .end(19)
             .build()
             .unwrap();
         let selector = CssSelector::builder()
@@ -3345,18 +3527,15 @@ mod tests {
             .name(LocalizableText::from("Reader"))
             .build()
             .unwrap();
-        let body = AnnotationBody::builder()
-            .body_type(AnnotationBodyType::TextualBody)
-            .value(LocalizableText::localized(
-                "j'adore !",
-                Some("fr".to_string()),
-                None,
-            ))
-            .color(AnnotationColor::Blue)
-            .highlight(AnnotationHighlight::Underline)
-            .tags(vec!["teacher".to_string()])
-            .build()
-            .unwrap();
+        let body = AnnotationBody::text(LocalizableText::localized(
+            "j'adore !",
+            Some("fr".to_string()),
+            None,
+        ))
+        .unwrap()
+        .with_color(AnnotationColor::Blue)
+        .with_highlight(AnnotationHighlight::Underline)
+        .with_tags(vec!["teacher".to_string()]);
         let annotation = Annotation::builder()
             .id("urn:uuid:annotation".to_string())
             .created(created_at())
@@ -3411,17 +3590,17 @@ mod tests {
             CssSelector::builder().value(String::new()).build(),
             Err(AnnotationModelError::EmptyField { .. })
         ));
-        for (body_type, format) in [
-            (AnnotationBodyType::Image, "audio/mpeg"),
-            (AnnotationBodyType::Audio, "video/webm"),
-            (AnnotationBodyType::Video, "image/png"),
+        for (media_type, format) in [
+            (MediaBodyType::Image, "audio/mpeg"),
+            (MediaBodyType::Audio, "video/webm"),
+            (MediaBodyType::Video, "image/png"),
         ] {
             assert!(matches!(
-                AnnotationBody::builder()
-                    .body_type(body_type)
-                    .id("resource.bin".to_string())
-                    .format(MediaType::new(format).unwrap())
-                    .build(),
+                AnnotationBody::media(
+                    media_type,
+                    "resource.bin",
+                    Some(MediaType::new(format).unwrap())
+                ),
                 Err(AnnotationModelError::BodyFormatMismatch { .. })
             ));
         }
@@ -3479,25 +3658,34 @@ mod tests {
     }
 
     #[test]
-    fn body_fields_that_do_not_apply_are_omitted_from_recovered_model() {
-        for (body, field) in [
+    fn body_fields_that_do_not_apply_are_preserved_but_untyped() {
+        for (body, field, retained) in [
             (
                 serde_json::json!({"type":"TextualBody","value":"note","id":"wrong.mp3"}),
-                "/items/0/body/id",
+                "/body/id",
+                Value::String("wrong.mp3".to_string()),
             ),
             (
                 serde_json::json!({"type":"Audio","id":"voice.mp3","value":"wrong"}),
-                "/items/0/body/value",
+                "/body/value",
+                Value::String("wrong".to_string()),
             ),
         ] {
             let mut value = strict_set();
             value[ITEMS][0][BODY] = body;
             let set = AnnotationSet::from_json_value(value).unwrap();
-            let pointer = field.strip_prefix("/items/0").unwrap();
-            assert!(
-                set.to_value()[ITEMS][0].pointer(pointer).is_none(),
+            let body = set.items()[0].body().unwrap();
+            match body.body_type() {
+                Some(AnnotationBodyType::TextualBody) => assert!(body.id().is_none(), "{field}"),
+                _ => assert!(body.value().is_none(), "{field}"),
+            }
+            assert_eq!(
+                set.to_value()[ITEMS][0].pointer(field),
+                Some(&retained),
                 "{field}"
             );
+            let reparsed = AnnotationSet::parse_json(&set.to_json_string().unwrap()).unwrap();
+            assert_eq!(reparsed.items()[0].body(), set.items()[0].body(), "{field}");
         }
     }
 
@@ -3656,21 +3844,28 @@ mod tests {
         let AnnotationSelector::Fragment(fragment) = selector else {
             panic!("expected fragment selector");
         };
-        assert_eq!(fragment.value(), "");
+        assert_eq!(fragment.value(), Some(""));
         assert_eq!(fragment.extra()["x"], 1);
         let AnnotationSelector::Css(css) = &selectors[1] else {
             panic!("expected CSS selector");
         };
-        assert_eq!(css.value(), "");
+        assert_eq!(css.value(), Some(""));
         let AnnotationSelector::TextPosition(position) = &selectors[2] else {
             panic!("expected text position selector");
         };
         assert_eq!((position.start(), position.end()), (Some(4), Some(4)));
 
-        let empty = TextRange::new(4, 4).unwrap();
         assert!(
             TextPositionSelector::builder()
-                .range(empty)
+                .start(4)
+                .end(4)
+                .build()
+                .is_ok()
+        );
+        assert!(
+            TextPositionSelector::builder()
+                .start(5)
+                .end(4)
                 .build()
                 .is_err()
         );
@@ -3703,7 +3898,9 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             error,
-            AnnotationModelError::MissingField { field: "id" }
+            AnnotationModelError::MissingField {
+                field: AnnotationField::Id
+            }
         ));
 
         let annotation = Annotation::from_value(serde_json::json!({
@@ -3738,7 +3935,9 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             error,
-            AnnotationModelError::MissingField { field: "body type" }
+            AnnotationModelError::MissingField {
+                field: AnnotationField::BodyType
+            }
         ));
     }
 }

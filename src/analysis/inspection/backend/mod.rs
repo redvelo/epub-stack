@@ -1,4 +1,4 @@
-use super::{FontFormat, InspectionKind, RasterImageFormat, ResourceInspection, Svg};
+use super::{FontFormat, InspectionData, RasterImageFormat, ResourceInspection, SvgImage};
 use crate::analysis::AnalysisIssue;
 use crate::content::extraction::svg::{SvgScan, scan as scan_svg};
 use crate::media_type::{MediaContainer, MediaType, MediaTypeClassification};
@@ -42,7 +42,7 @@ impl Detection {
 }
 
 pub(crate) struct InspectionResult {
-    pub(crate) facts: ResourceInspection,
+    pub(crate) facts: Option<ResourceInspection>,
     pub(crate) issue: Option<AnalysisIssue>,
 }
 
@@ -60,25 +60,32 @@ pub(crate) fn inspect(
         .as_ref()
         .and_then(|value| detected_media_type(value.format));
     let (inspection, issue) = match format {
-        Some(DetectedFormat::Raster(format)) => raster::inspect(bytes, format, complete),
-        Some(DetectedFormat::Svg) => inspect_svg(
+        Some(DetectedFormat::Raster(format)) => some(raster::inspect(bytes, format, complete)),
+        Some(DetectedFormat::Svg) => some(inspect_svg(
             detected
                 .and_then(|value| value.svg)
                 .unwrap_or_else(|| scan_svg(bytes)),
             complete,
-        ),
-        Some(DetectedFormat::Font(format)) => font::inspect(bytes, format, complete),
+        )),
+        Some(DetectedFormat::Font(format)) => some(font::inspect(bytes, format, complete)),
         Some(DetectedFormat::WebVtt) => text::inspect_webvtt(bytes, complete),
-        Some(DetectedFormat::Media(container)) => media::inspect(bytes, container, complete),
-        None if matches!(declared, Some(MediaTypeClassification::GenericText)) => {
-            (InspectionKind::Text(text::inspect(bytes, complete)), None)
-        }
-        None => (InspectionKind::Binary, None),
+        Some(DetectedFormat::Media(container)) => some(media::inspect(bytes, container, complete)),
+        None if matches!(declared, Some(MediaTypeClassification::GenericText)) => (
+            Some(InspectionData::Text(text::inspect(bytes, complete))),
+            None,
+        ),
+        None => (Some(InspectionData::Binary), None),
     };
     InspectionResult {
-        facts: ResourceInspection::new(detected_media_type, inspection),
+        facts: inspection.map(|data| ResourceInspection::new(detected_media_type, data)),
         issue,
     }
+}
+
+fn some(
+    (data, issue): (InspectionData, Option<AnalysisIssue>),
+) -> (Option<InspectionData>, Option<AnalysisIssue>) {
+    (Some(data), issue)
 }
 
 fn declared_format(classification: MediaTypeClassification) -> Option<DetectedFormat> {
@@ -120,11 +127,11 @@ fn detected_media_type(format: DetectedFormat) -> Option<MediaType> {
     MediaType::new(media_type)
 }
 
-fn inspect_svg(scan: SvgScan, complete: bool) -> (InspectionKind, Option<AnalysisIssue>) {
+fn inspect_svg(scan: SvgScan, complete: bool) -> (InspectionData, Option<AnalysisIssue>) {
     let issue = (scan.is_malformed() || (complete && (!scan.is_svg() || !scan.root_closed())))
         .then_some(AnalysisIssue::Malformed);
     (
-        InspectionKind::SvgImage(Svg::new(
+        InspectionData::Svg(SvgImage::new(
             scan.width().map(str::to_owned),
             scan.height().map(str::to_owned),
             scan.view_box().map(str::to_owned),
@@ -147,7 +154,7 @@ mod tests {
         ] {
             let result = inspect(bytes, None, detect(bytes), true);
             assert_eq!(result.issue, None);
-            let InspectionKind::SvgImage(svg) = result.facts.kind() else {
+            let Some(InspectionData::Svg(svg)) = result.facts.as_ref().map(ResourceInspection::data) else {
                 panic!()
             };
             assert_eq!(svg.width(), Some("10"));
@@ -169,7 +176,8 @@ Line two</desc>
 </svg>"#;
         let result = inspect(bytes, None, detect(bytes), true);
         assert_eq!(result.issue, None);
-        let InspectionKind::SvgImage(svg) = result.facts.kind() else {
+        let Some(InspectionData::Svg(svg)) = result.facts.as_ref().map(ResourceInspection::data)
+        else {
             panic!()
         };
         assert_eq!(svg.title(), Some("First\nmiddle\nlast"));

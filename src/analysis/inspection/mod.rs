@@ -1,22 +1,53 @@
 //! Resource inspection results for images, media, fonts, tracks, and text.
 //!
-//! Applications receive image dimensions, audio and video tracks, font names, WebVTT cue counts,
-//! and text encodings decoded from resource bytes. Results contain only the fields exposed by
-//! these models, not the inspected byte stream or a complete codec or container representation.
-//! Availability and whole-publication coverage are reported by [`super::AnalysisOutcome`] and
-//! [`super::coverage::Coverage`].
+//! [`InspectionData`] contains image dimensions, audio/video tracks, font names, WebVTT cue
+//! counts, and text encodings decoded from bytes. Check [`super::AnalysisOutcome`] for availability.
+//! Bytes that do not conform to their detected format produce a partial result with
+//! [`super::AnalysisIssue::Malformed`].
+//!
+//! Read image formats and audio/video container types from resource bytes.
+//!
+//! ```
+//! use epub_stack::{EpubZip, analysis::inspection::InspectionData};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let book = EpubZip::open("fixtures/real/alice-in-wonderland.epub")?.default_rendition()?;
+//! let analysis = book.analyze();
+//!
+//! for resource in analysis.analyzed_resources() {
+//!     if let Some(inspection) = resource.inspection().value() {
+//!         let address = resource.resource().address();
+//!
+//!         match inspection.data() {
+//!             InspectionData::RasterImage(image) => {
+//!                 println!("{}: {:?}", address.display_value(), image.format());
+//!             }
+//!             InspectionData::Media(media) => {
+//!                 println!("{}: {:?}", address.display_value(), media.container());
+//!             }
+//!             _ => {}
+//!         }
+//!     }
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Image dimensions are available through `width()` and `height()`; `media.tracks()` exposes
+//! track details such as codecs, sample rates, and channel counts when available.
 
 mod backend;
 
 pub(crate) use backend::{DetectedFormat, Detection, detect, inspect};
 
+pub use crate::media_type::MediaContainer;
 use crate::media_type::MediaType;
 
 /// A detected media type and the image, media, font, or text details decoded from bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceInspection {
     detected_media_type: Option<MediaType>,
-    kind: InspectionKind,
+    data: InspectionData,
 }
 
 impl ResourceInspection {
@@ -27,26 +58,26 @@ impl ResourceInspection {
 
     /// Returns decoded details selected from the detected format, or from the declared media type
     /// when byte detection produced no format.
-    pub fn kind(&self) -> &InspectionKind {
-        &self.kind
+    pub fn data(&self) -> &InspectionData {
+        &self.data
     }
 
     #[allow(dead_code)]
-    pub(crate) fn new(detected_media_type: Option<MediaType>, kind: InspectionKind) -> Self {
+    pub(crate) fn new(detected_media_type: Option<MediaType>, data: InspectionData) -> Self {
         Self {
             detected_media_type,
-            kind,
+            data,
         }
     }
 }
 
 /// The supported byte-level inspection result for a resource.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InspectionKind {
+pub enum InspectionData {
     /// Metadata decoded from a supported raster image encoding.
     RasterImage(RasterImage),
     /// Metadata recovered from an SVG root element.
-    SvgImage(Svg),
+    Svg(SvgImage),
     /// Container and track metadata from audio or video bytes.
     Media(Media),
     /// Naming and shape metadata from a supported font encoding.
@@ -65,7 +96,7 @@ pub struct RasterImage {
     format: RasterImageFormat,
     width: Option<u32>,
     height: Option<u32>,
-    color_type: Option<String>,
+    color_type: Option<RasterColorModel>,
     bit_depth: Option<u8>,
     has_alpha: Option<bool>,
     animated: Option<bool>,
@@ -88,9 +119,9 @@ impl RasterImage {
         self.height
     }
 
-    /// Returns an encoding-specific color model when available.
-    pub fn color_type(&self) -> Option<&str> {
-        self.color_type.as_deref()
+    /// Returns the encoded color model when available.
+    pub fn color_model(&self) -> Option<RasterColorModel> {
+        self.color_type
     }
 
     /// Returns bits per sample or channel when available.
@@ -118,7 +149,7 @@ impl RasterImage {
         format: RasterImageFormat,
         width: Option<u32>,
         height: Option<u32>,
-        color_type: Option<String>,
+        color_type: Option<RasterColorModel>,
         bit_depth: Option<u8>,
         has_alpha: Option<bool>,
         animated: Option<bool>,
@@ -135,6 +166,27 @@ impl RasterImage {
             has_icc_profile,
         }
     }
+}
+
+/// The color model declared by a raster image header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RasterColorModel {
+    /// Single-channel grayscale.
+    Grayscale,
+    /// Grayscale with alpha.
+    GrayscaleAlpha,
+    /// Red, green, and blue channels.
+    Rgb,
+    /// Red, green, and blue channels with alpha.
+    Rgba,
+    /// Palette indices.
+    Indexed,
+    /// Luma and chroma channels.
+    YCbCr,
+    /// Cyan, magenta, yellow, and key channels.
+    Cmyk,
+    /// Cyan, magenta, yellow, and key channels with alpha.
+    CmykAlpha,
 }
 
 /// A recognized raster image encoding.
@@ -156,7 +208,7 @@ pub enum RasterImageFormat {
 
 /// Intrinsic size and accessible naming recovered from an SVG root.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Svg {
+pub struct SvgImage {
     width: Option<String>,
     height: Option<String>,
     view_box: Option<String>,
@@ -164,7 +216,7 @@ pub struct Svg {
     description: Option<String>,
 }
 
-impl Svg {
+impl SvgImage {
     /// Returns the authored root `width` value.
     pub fn width(&self) -> Option<&str> {
         self.width.as_deref()
@@ -211,15 +263,15 @@ impl Svg {
 /// Container-level media metadata and its inspected tracks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Media {
-    container: String,
+    container: MediaContainer,
     duration: Option<MediaDuration>,
     tracks: Vec<MediaTrack>,
 }
 
 impl Media {
-    /// Returns the detected container name.
-    pub fn container(&self) -> &str {
-        &self.container
+    /// Returns the detected container format.
+    pub fn container(&self) -> MediaContainer {
+        self.container
     }
 
     /// Returns container-level duration when available.
@@ -234,7 +286,7 @@ impl Media {
 
     #[allow(dead_code)]
     pub(crate) fn new(
-        container: String,
+        container: MediaContainer,
         duration: Option<MediaDuration>,
         tracks: Vec<MediaTrack>,
     ) -> Self {
@@ -249,7 +301,7 @@ impl Media {
 /// Metadata recovered for one media-container track.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaTrack {
-    kind: MediaTrackKind,
+    role: MediaTrackRole,
     codec: Option<String>,
     language: Option<String>,
     duration: Option<MediaDuration>,
@@ -261,8 +313,8 @@ pub struct MediaTrack {
 
 impl MediaTrack {
     /// Returns the track's broad media role.
-    pub fn kind(&self) -> MediaTrackKind {
-        self.kind
+    pub fn role(&self) -> MediaTrackRole {
+        self.role
     }
 
     /// Returns the container-reported codec name when available.
@@ -302,7 +354,7 @@ impl MediaTrack {
 
     #[allow(clippy::too_many_arguments, dead_code)]
     pub(crate) fn new(
-        kind: MediaTrackKind,
+        role: MediaTrackRole,
         codec: Option<String>,
         language: Option<String>,
         duration: Option<MediaDuration>,
@@ -312,7 +364,7 @@ impl MediaTrack {
         height: Option<u32>,
     ) -> Self {
         Self {
-            kind,
+            role,
             codec,
             language,
             duration,
@@ -326,7 +378,7 @@ impl MediaTrack {
 
 /// The role of a track in its media container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MediaTrackKind {
+pub enum MediaTrackRole {
     /// An audio track.
     Audio,
     /// A video track.
@@ -430,27 +482,23 @@ pub enum FontFormat {
     Woff2,
 }
 
-/// Bounded syntax and cue-count facts for a WebVTT resource.
+/// Cue-count facts for a completely read WebVTT resource.
+///
+/// Invalid WebVTT syntax is reported as a partial result with
+/// [`AnalysisIssue::Malformed`](crate::analysis::AnalysisIssue::Malformed).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebVtt {
-    valid: Option<bool>,
-    cue_count: Option<u64>,
+    cue_count: u64,
 }
 
 impl WebVtt {
-    /// Returns bounded syntax validity, or `None` when it could not be determined.
-    pub fn valid(&self) -> Option<bool> {
-        self.valid
-    }
-
-    /// Returns the number of parsed cues when available.
-    pub fn cue_count(&self) -> Option<u64> {
+    /// Returns the number of parsed cues.
+    pub fn cue_count(&self) -> u64 {
         self.cue_count
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn new(valid: Option<bool>, cue_count: Option<u64>) -> Self {
-        Self { valid, cue_count }
+    pub(crate) fn new(cue_count: u64) -> Self {
+        Self { cue_count }
     }
 }
 
