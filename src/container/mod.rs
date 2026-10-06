@@ -4,6 +4,7 @@
 //! reads and export but do not modify the source archive.
 
 mod document;
+pub(crate) mod encryption;
 mod epub_zip;
 mod error;
 mod export;
