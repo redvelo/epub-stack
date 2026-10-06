@@ -269,9 +269,9 @@ impl ItemRef {
 
     /// Reports whether this itemref carries the horizontal centering token.
     pub fn align_x_center(&self) -> bool {
-        self.properties.iter().any(|token| {
-            token.known_value() == Some(KnownSpineProperty::RenditionAlignXCenter)
-        })
+        self.properties
+            .iter()
+            .any(|token| token.known_value() == Some(KnownSpineProperty::RenditionAlignXCenter))
     }
 
     fn projected<T>(&self, project: impl Fn(KnownSpineProperty) -> Option<T>) -> Option<T> {

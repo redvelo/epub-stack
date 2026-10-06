@@ -2081,10 +2081,13 @@ mod tests {
 
     #[test]
     fn horizontal_centering_is_declared_by_either_the_itemref_or_the_package() {
-        for (metadata, declared) in [("", [false, true, false]), (
-            r#"<meta property="rendition:align-x-center" />"#,
-            [true, true, true],
-        )] {
+        for (metadata, declared) in [
+            ("", [false, true, false]),
+            (
+                r#"<meta property="rendition:align-x-center" />"#,
+                [true, true, true],
+            ),
+        ] {
             let package = parse_package(&format!(
                 r##"<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
                 <metadata>{metadata}</metadata>
