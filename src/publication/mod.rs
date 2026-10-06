@@ -39,6 +39,9 @@ use crate::{
 };
 use crate::{
     analysis::{AnalysisLimits, PublicationAnalysis},
+    container::encryption::{
+        ENCRYPTION_PATH, MAX_ENCRYPTION_BYTES, Obfuscations, parse_obfuscations,
+    },
     container::{ExportError, export_provider},
     edit::{EditError, StructuralResourceKind},
     navigation::{
@@ -250,6 +253,7 @@ pub struct Epub<R: ResourceProvider> {
     pub(crate) open_limits: EpubOpenLimits,
     pub(crate) provider_index: ProviderIndex,
     pub(crate) resource_changes: ResourceChanges,
+    pub(crate) obfuscations: Obfuscations,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -381,6 +385,7 @@ impl Epub<MemoryResourceProvider> {
             open_limits,
             provider_index,
             resource_changes: ResourceChanges::new(),
+            obfuscations: Obfuscations::new(),
         })
     }
 }
@@ -517,19 +522,23 @@ impl<R: ResourceProvider> Epub<R> {
                 }
             }
 
+            let obfuscations = read_obfuscations(&provider, &package);
+
             Ok((
                 package,
                 navigation,
                 navigation_loading,
                 resources,
                 provider_index,
+                obfuscations,
             ))
         })();
 
-        let (package, navigation, navigation_loading, resources, provider_index) = match prepared {
-            Ok(prepared) => prepared,
-            Err(error) => return Err(EpubOpenError::new(error, provider)),
-        };
+        let (package, navigation, navigation_loading, resources, provider_index, obfuscations) =
+            match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => return Err(EpubOpenError::new(error, provider)),
+            };
 
         Ok(Self {
             container: provider,
@@ -540,6 +549,7 @@ impl<R: ResourceProvider> Epub<R> {
             open_limits,
             provider_index,
             resource_changes: ResourceChanges::new(),
+            obfuscations,
         })
     }
 
@@ -620,7 +630,14 @@ impl<R: ResourceProvider> Epub<R> {
         path: &EpubPath,
         read: impl FnOnce(&mut dyn Read) -> T,
     ) -> std::result::Result<T, ResourceReadError> {
-        read_committed(&self.container, &self.resource_changes, path, read)
+        match self.obfuscations.get(path) {
+            // An edit replaces the stored bytes, so only the container's own are obfuscated.
+            Some(obfuscation) if self.resource_changes.entry(path).is_none() => self
+                .container
+                .read_with(path, |reader| read(&mut obfuscation.reader(reader)))
+                .map_err(Into::into),
+            _ => read_committed(&self.container, &self.resource_changes, path, read),
+        }
     }
 
     /// Reports whether the committed provider view has bytes at `path`.
@@ -852,6 +869,23 @@ pub(crate) fn invalid_navigation_href_error(item: &ManifestItem) -> EditError {
     }
 }
 
+/// Reads `META-INF/encryption.xml`, when the container has one, as the obfuscations it
+/// declares for this rendition's identifier.
+fn read_obfuscations<R: ResourceProvider>(provider: &R, package: &Package) -> Obfuscations {
+    let Ok(path) = EpubPath::new(ENCRYPTION_PATH) else {
+        return Obfuscations::new();
+    };
+    let identifier = package.unique_identifier().map(EpubString::as_str);
+    provider
+        .read_with(&path, |reader| {
+            parse_obfuscations(
+                std::io::BufReader::new(reader.take(MAX_ENCRYPTION_BYTES)),
+                identifier,
+            )
+        })
+        .unwrap_or_default()
+}
+
 pub(crate) fn read_committed<R: ResourceProvider, T>(
     provider: &R,
     changes: &ResourceChanges,
@@ -896,6 +930,7 @@ mod test {
     use crate::container::EpubZip;
     use crate::media_overlay::SmilFacts;
     use crate::resource::provider::{MemoryResourceProvider, ProviderReadError, ResourceProvider};
+    use sha1::Digest as _;
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::io::{Cursor, Read, Write};
@@ -1411,6 +1446,82 @@ mod test {
             ),
         ])
         .unwrap()
+    }
+
+    /// OCF font obfuscation is an encoding of the container, so a committed read yields
+    /// the font the publication meant; a wrong identifier leaves the stored bytes alone.
+    #[test]
+    fn committed_reads_undo_declared_font_obfuscation() {
+        const IDENTIFIER: &str = "urn:uuid:01234567-89ab-cdef-0123-456789abcdef";
+        let package = format!(
+            r#"<package xmlns="http://www.idpf.org/2007/opf" xmlns:dc="http://purl.org/dc/elements/1.1/" version="3.0" unique-identifier="uid">
+  <metadata><dc:title>T</dc:title><dc:identifier id="uid">{IDENTIFIER}</dc:identifier><dc:language>en</dc:language></metadata>
+  <manifest>
+    <item id="chap" href="chapter.xhtml" media-type="application/xhtml+xml"/>
+    <item id="font" href="fonts/body.otf" media-type="font/otf"/>
+  </manifest>
+  <spine><itemref idref="chap"/></spine>
+</package>"#
+        );
+        let encryption = r#"<?xml version="1.0" encoding="UTF-8"?>
+<encryption xmlns="urn:oasis:names:tc:opendocument:xmlns:container" xmlns:enc="http://www.w3.org/2001/04/xmlenc#">
+  <enc:EncryptedData>
+    <enc:EncryptionMethod Algorithm="http://www.idpf.org/2008/embedding"/>
+    <enc:CipherData><enc:CipherReference URI="EPUB/fonts/body.otf"/></enc:CipherData>
+  </enc:EncryptedData>
+</encryption>"#;
+        let font: Vec<u8> = (0..1100_u32).map(|index| index as u8).collect();
+        let key = sha1::Sha1::digest(IDENTIFIER.as_bytes()).to_vec();
+        let mut stored = font.clone();
+        for (index, byte) in stored.iter_mut().take(1040).enumerate() {
+            *byte ^= key[index % key.len()];
+        }
+
+        let entries = |encryption: &str| {
+            MemoryResourceProvider::from_entries([
+                ("EPUB/package.opf", package.as_bytes().to_vec()),
+                (
+                    "EPUB/chapter.xhtml",
+                    b"<html><body>C</body></html>".to_vec(),
+                ),
+                ("EPUB/fonts/body.otf", stored.clone()),
+                ("META-INF/encryption.xml", encryption.as_bytes().to_vec()),
+            ])
+            .unwrap()
+        };
+        let path = EpubPath::new("EPUB/fonts/body.otf").unwrap();
+        let package_path = EpubPath::new("EPUB/package.opf").unwrap();
+
+        let epub = Epub::from_provider(entries(encryption), package_path.clone()).unwrap();
+        assert_eq!(epub.bytes(&path).unwrap(), font);
+
+        // Read through a bounded reader as a host serving a range would.
+        let head = epub
+            .read_with(&path, |reader| {
+                let mut head = Vec::new();
+                reader.take(16).read_to_end(&mut head).unwrap();
+                head
+            })
+            .unwrap();
+        assert_eq!(head, font[..16]);
+
+        // An algorithm this crate cannot undo leaves the resource exactly as stored.
+        let other = encryption.replace(
+            "http://www.idpf.org/2008/embedding",
+            "http://www.w3.org/2001/04/xmlenc#aes256-cbc",
+        );
+        let encrypted = Epub::from_provider(entries(&other), package_path.clone()).unwrap();
+        assert_eq!(encrypted.bytes(&path).unwrap(), stored);
+
+        // An edit replaces the stored bytes, so what it committed is what is read back.
+        let mut epub = Epub::from_provider(entries(encryption), package_path).unwrap();
+        epub.edit()
+            .upsert_resource(path.clone(), b"replaced".to_vec())
+            .unwrap()
+            .preview()
+            .unwrap()
+            .commit();
+        assert_eq!(epub.bytes(&path).unwrap(), b"replaced");
     }
 
     #[test]

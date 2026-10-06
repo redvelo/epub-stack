@@ -134,6 +134,7 @@ pub mod annotation;
 pub mod cfi;
 pub mod container;
 pub mod content;
+pub mod css;
 pub mod edit;
 pub mod media_overlay;
 mod media_type;

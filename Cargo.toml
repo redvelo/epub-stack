@@ -28,6 +28,7 @@ broken_intra_doc_links = "deny"
 [dependencies]
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 percent-encoding = "2.3.2"
+sha1 = "0.10.6"
 thiserror = "2.0.21"
 encoding_rs = "0.8.42"
 nom = "8.0.0"
