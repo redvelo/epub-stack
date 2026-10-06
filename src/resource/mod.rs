@@ -2080,6 +2080,46 @@ mod tests {
     }
 
     #[test]
+    fn horizontal_centering_is_declared_by_either_the_itemref_or_the_package() {
+        for (metadata, declared) in [("", [false, true, false]), (
+            r#"<meta property="rendition:align-x-center" />"#,
+            [true, true, true],
+        )] {
+            let package = parse_package(&format!(
+                r##"<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+                <metadata>{metadata}</metadata>
+                <manifest>
+                    <item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml" />
+                </manifest>
+                <spine>
+                    <itemref idref="chapter" />
+                    <itemref idref="chapter" properties="rendition:align-x-center" />
+                    <itemref idref="chapter" properties="rendition:align-x-centre" />
+                </spine>
+            </package>"##
+            ));
+            let provider = provider_index(["EPUB/package.opf", "EPUB/chapter.xhtml"]);
+            let index = index(&package, &provider);
+            let entries = index.reading_order().collect::<Vec<_>>();
+            assert_eq!(
+                entries
+                    .iter()
+                    .map(|entry| entry.presentation().align_x_center())
+                    .collect::<Vec<_>>(),
+                declared,
+            );
+            assert_eq!(
+                entries[2]
+                    .properties()
+                    .iter()
+                    .map(SpinePropertyToken::as_str)
+                    .collect::<Vec<_>>(),
+                vec!["rendition:align-x-centre"]
+            );
+        }
+    }
+
+    #[test]
     fn unrecognized_itemref_tokens_do_not_override_publication_rendition_metadata() {
         let package = parse_package(
             r##"<package xmlns="http://www.idpf.org/2007/opf" version="3.0">

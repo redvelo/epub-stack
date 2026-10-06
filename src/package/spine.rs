@@ -267,6 +267,13 @@ impl ItemRef {
         self.projected(KnownSpineProperty::page_spread)
     }
 
+    /// Reports whether this itemref carries the horizontal centering token.
+    pub fn align_x_center(&self) -> bool {
+        self.properties.iter().any(|token| {
+            token.known_value() == Some(KnownSpineProperty::RenditionAlignXCenter)
+        })
+    }
+
     fn projected<T>(&self, project: impl Fn(KnownSpineProperty) -> Option<T>) -> Option<T> {
         self.properties
             .iter()
@@ -289,6 +296,13 @@ pub type SpinePropertyToken = crate::vocab::VocabToken<KnownSpineProperty>;
 #[strum(serialize_all = "kebab-case", ascii_case_insensitive)]
 /// A recognized EPUB spine `properties` token.
 pub enum KnownSpineProperty {
+    #[strum(
+        serialize = "rendition:align-x-center",
+        to_string = "rendition:align-x-center"
+    )]
+    #[cfg_attr(feature = "serde", serde(rename = "rendition:align-x-center"))]
+    /// Centers each rendered page on the horizontal axis.
+    RenditionAlignXCenter,
     #[strum(serialize = "rendition:layout-pre-paginated")]
     #[cfg_attr(feature = "serde", serde(rename = "rendition:layout-pre-paginated"))]
     /// Overrides a spine item to use a pre-paginated layout.

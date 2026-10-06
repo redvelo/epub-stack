@@ -138,6 +138,7 @@ pub struct ReadingOrderPresentation {
     spread: RenditionSetting<RenditionSpread>,
     page_spread: RenditionSetting<PageSpread>,
     page_progression_direction: Option<PageProgressionDirection>,
+    align_x_center: bool,
 }
 
 impl ReadingOrderPresentation {
@@ -169,6 +170,14 @@ impl ReadingOrderPresentation {
     /// Returns the spine-wide authored page progression direction, preserving `default`.
     pub fn page_progression_direction(&self) -> Option<PageProgressionDirection> {
         self.page_progression_direction
+    }
+
+    /// Reports whether horizontal centering is declared for this occurrence.
+    ///
+    /// The property carries no value, so an itemref token cannot turn off a package-wide
+    /// declaration; either declaration site turns it on.
+    pub fn align_x_center(&self) -> bool {
+        self.align_x_center
     }
 
     pub(crate) fn of(package: &Package, itemref: &ItemRef) -> Self {
@@ -207,6 +216,12 @@ impl ReadingOrderPresentation {
                 &["rendition:page-spread-", "page-spread-"],
             )),
             page_progression_direction: package.spine().page_progression_direction(),
+            align_x_center: itemref.align_x_center()
+                || package.metadata().meta().iter().any(|meta| {
+                    meta.refines().is_none()
+                        && meta.property().and_then(|token| token.known_value())
+                            == Some(KnownMetaProperty::RenditionAlignXCenter)
+                }),
         }
     }
 }
