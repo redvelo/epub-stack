@@ -15,7 +15,7 @@ name = "epub-stack"
 readme = "README.md"
 repository = "https://github.com/redvelo/epub-stack"
 rust-version = "1.93"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 
 [features]
