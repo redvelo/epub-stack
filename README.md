@@ -12,7 +12,7 @@ systems, ebook management tools, annotation sync servers and editors on typed mo
 
 ```toml
 [dependencies]
-epub-stack = "0.2"
+epub-stack = "0.3"
 ```
 
 ## Why `epub-stack`
