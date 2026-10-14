@@ -8,7 +8,7 @@ categories = [
   "wasm",
 ]
 documentation = "https://docs.rs/epub-stack/"
-exclude = [".github/**", ".gitignore", "fixtures/**"]
+exclude = [".github/**", ".gitignore", "fixtures/**", "rust-toolchain.toml"]
 keywords = ["epub", "ebook", "ereader", "epub3", "publishing"]
 license = "Apache-2.0 OR MIT"
 name = "epub-stack"
